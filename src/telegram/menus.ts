@@ -17,13 +17,29 @@ export function mainMenu() {
   ]);
 }
 
+// Tapping a wallet now opens its detail view (walletDetailMenu) instead of
+// removing it directly, since there's a home needed for the Auto/Copy Mint
+// participation toggles. The suffix is an at-a-glance summary of which
+// watchers this wallet currently participates in.
 export function walletsMenu(wallets: WalletRecord[]) {
-  const rows = wallets.map((w) => [
-    Markup.button.callback(`🗑 ${w.label} (${maskAddress(w.address)})`, `wallet:remove:${w.address}`),
-  ]);
+  const rows = wallets.map((w) => {
+    const flags = `${w.includeInAutoMint === false ? "" : "🎯"}${w.includeInCopyMint === false ? "" : "👀"}` || "—";
+    return [Markup.button.callback(`${w.label} (${maskAddress(w.address)}) [${flags}]`, `wallet:manage:${w.address}`)];
+  });
   rows.push([Markup.button.callback("➕ Add wallet", "wallet:add")]);
   rows.push([Markup.button.callback("⬅ Back", "menu:main")]);
   return Markup.inlineKeyboard(rows);
+}
+
+export function walletDetailMenu(wallet: WalletRecord) {
+  const autoOn = wallet.includeInAutoMint !== false;
+  const copyOn = wallet.includeInCopyMint !== false;
+  return Markup.inlineKeyboard([
+    [Markup.button.callback(`🎯 Auto Mint: ${autoOn ? "✅ ON" : "⛔ OFF"}`, `wallet:toggle:auto:${wallet.address}`)],
+    [Markup.button.callback(`👀 Copy Mint: ${copyOn ? "✅ ON" : "⛔ OFF"}`, `wallet:toggle:copy:${wallet.address}`)],
+    [Markup.button.callback("🗑 Remove wallet", `wallet:remove:${wallet.address}`)],
+    [Markup.button.callback("⬅ Back", "menu:wallets")],
+  ]);
 }
 
 export function copyMenu(enabled: boolean, targets: CopyTarget[]) {

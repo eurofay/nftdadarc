@@ -165,6 +165,12 @@ process (your own always-on machine, a VPS, wherever) so you interact with it
 from Telegram instead of a terminal:
 
 - **Wallets** — add/remove from a chat, list shows masked addresses only.
+  Tap a wallet to manage it: toggle whether it participates in **Auto Mint**
+  and **Copy Mint** independently (both default on for a newly added
+  wallet). Everything else — `/mint`, Scheduled Mint, Fund Wallets — still
+  lets you pick wallets ad hoc each time; these two toggles are specifically
+  for the "uses every wallet automatically" watchers, so you can run either
+  on a subset instead of your whole pool.
 - **Settings** — chain, gas ceiling/tip, gas limit, quantity caps — all editable
   via inline buttons.
 - **`/mint <link-or-address> <quantity> [wallet label(s)]`** — one-off manual

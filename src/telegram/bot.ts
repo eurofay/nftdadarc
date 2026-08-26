@@ -13,6 +13,7 @@ import { TelegramStore, WalletRecord } from "./store";
 import {
   mainMenu,
   walletsMenu,
+  walletDetailMenu,
   copyMenu,
   autoMenu,
   settingsMenu,
@@ -180,7 +181,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
   bot.action("menu:main", (ctx) => ctx.editMessageText("Choose an action:", mainMenu()));
 
   bot.action("menu:wallets", (ctx) =>
-    ctx.editMessageText("Wallets (tap to remove):", walletsMenu(store.listWallets()))
+    ctx.editMessageText("Wallets — tap one to manage it. [🎯 Auto] [👀 Copy]:", walletsMenu(store.listWallets()))
   );
 
   bot.action("menu:settings", (ctx) =>
@@ -190,6 +191,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
   bot.action("menu:auto", (ctx) =>
     ctx.editMessageText(
       `Auto free-mint watcher: ${runningAuto.size > 0 ? `🟢 running on ${[...runningAuto.keys()].join(", ")}` : "🔴 stopped"}\n` +
+        `Wallets enabled: ${store.listWalletsFor("auto").length}/${store.listWallets().length} (toggle per wallet in Wallets)\n` +
         "Detects any SeaDrop drop going live at price 0 and mints the max per wallet — no confirmation. " +
         "Runs on one or more chains at once — set which ones in Settings → Auto-mint chains.",
       autoMenu(runningAuto.size > 0)
@@ -199,6 +201,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
   bot.action("menu:copy", (ctx) =>
     ctx.editMessageText(
       `Copy-mint watcher: ${runningCopy ? "🟢 running" : "🔴 stopped"}\n` +
+        `Wallets enabled: ${store.listWalletsFor("copy").length}/${store.listWallets().length} (toggle per wallet in Wallets)\n` +
         "Copies any mintPublic call from a watched wallet, using your own wallets.",
       copyMenu(runningCopy !== null, store.listCopyTargets())
     )
@@ -260,7 +263,27 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
   bot.action(/^wallet:remove:(.+)$/, (ctx) => {
     const address = ctx.match[1];
     store.removeWallet(address);
-    return ctx.editMessageText("Wallets (tap to remove):", walletsMenu(store.listWallets()));
+    return ctx.editMessageText("Wallets — tap one to manage it. [🎯 Auto] [👀 Copy]:", walletsMenu(store.listWallets()));
+  });
+
+  bot.action(/^wallet:manage:(.+)$/, (ctx) => {
+    const wallet = store.listWallets().find((w) => w.address.toLowerCase() === ctx.match[1].toLowerCase());
+    if (!wallet) return ctx.answerCbQuery("That wallet no longer exists.", { show_alert: true });
+    return ctx.editMessageText(`${wallet.label} (${maskAddress(wallet.address)})`, walletDetailMenu(wallet));
+  });
+
+  bot.action(/^wallet:toggle:(auto|copy):(.+)$/, (ctx) => {
+    const feature = ctx.match[1] as "auto" | "copy";
+    const address = ctx.match[2];
+    try {
+      const wallet = store.listWallets().find((w) => w.address.toLowerCase() === address.toLowerCase());
+      if (!wallet) return ctx.answerCbQuery("That wallet no longer exists.", { show_alert: true });
+      const currentlyOn = feature === "auto" ? wallet.includeInAutoMint !== false : wallet.includeInCopyMint !== false;
+      const updated = store.setWalletInclusion(address, feature, !currentlyOn);
+      return ctx.editMessageText(`${updated.label} (${maskAddress(updated.address)})`, walletDetailMenu(updated));
+    } catch (err: any) {
+      return ctx.answerCbQuery(err.message, { show_alert: true });
+    }
   });
 
   // ── Copy-mint watchlist ──────────────────────────────────────────────
@@ -283,9 +306,11 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
   function startCopy(chatId: number): { ok: true } | { ok: false; reason: string } {
     if (runningCopy) return { ok: true }; // already running
     const targets = store.listCopyTargets();
-    const wallets = store.listWallets();
+    const wallets = store.listWalletsFor("copy");
     if (targets.length === 0) return { ok: false, reason: "Add a wallet to watch first." };
-    if (wallets.length === 0) return { ok: false, reason: "Add a wallet to mint from first." };
+    if (wallets.length === 0) {
+      return { ok: false, reason: "No wallets enabled for Copy Mint — enable at least one in Wallets." };
+    }
 
     const settings = store.getSettings();
     const chain = resolveChain(settings.chainKey)!;
@@ -295,7 +320,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
     const promise = runCopyMintWatcher({
       chain,
       rpcUrls: urls,
-      walletKeys: store.getDecryptedKeys(),
+      walletKeys: wallets.map((w) => store.getDecryptedKey(w.address)),
       watchTargets: targets.map((t) => t.address),
       maxFeePerGas: gweiToWei(settings.maxFeeGwei),
       maxPriorityFee: gweiToWei(settings.priorityGwei),
@@ -359,8 +384,10 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
   // same "one watcher per chain, prefixed logger" shape as the CLI's
   // comma-separated AUTO_CHAIN.
   function startAuto(chatId: number): { ok: true } | { ok: false; reason: string } {
-    const wallets = store.listWallets();
-    if (wallets.length === 0) return { ok: false, reason: "Add a wallet first." };
+    const wallets = store.listWalletsFor("auto");
+    if (wallets.length === 0) {
+      return { ok: false, reason: "No wallets enabled for Auto Mint — enable at least one in Wallets." };
+    }
 
     const settings = store.getSettings();
     const chainKeys = settings.autoChainKeys?.length ? settings.autoChainKeys : [settings.chainKey];
@@ -376,7 +403,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
       const promise = runAutoMintWatcher({
         chain,
         rpcUrls: urls,
-        walletKeys: store.getDecryptedKeys(),
+        walletKeys: wallets.map((w) => store.getDecryptedKey(w.address)),
         maxFeePerGas: gweiToWei(settings.maxFeeGwei),
         maxPriorityFee: gweiToWei(settings.priorityGwei),
         gasLimit: settings.gasLimit,

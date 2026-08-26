@@ -12,6 +12,13 @@ export interface WalletRecord {
   address: string;
   encryptedKey: string;
   addedAt: number;
+  // Per-wallet opt-in for the two "use every added wallet" watchers. Default
+  // true when unset, so existing wallets keep today's behavior until someone
+  // deliberately excludes one — named to avoid colliding with
+  // BotSettings.copyMintEnabled, which means "is the watcher currently
+  // running", a different concept from "does this wallet participate".
+  includeInAutoMint?: boolean;
+  includeInCopyMint?: boolean;
 }
 
 export interface CopyTarget {
@@ -117,6 +124,16 @@ export class TelegramStore {
     return [...this.data.wallets];
   }
 
+  // Flips includeInAutoMint / includeInCopyMint for one wallet.
+  setWalletInclusion(address: string, feature: "auto" | "copy", included: boolean): WalletRecord {
+    const record = this.data.wallets.find((w) => w.address.toLowerCase() === address.toLowerCase());
+    if (!record) throw new Error(`No wallet stored for ${address}.`);
+    if (feature === "auto") record.includeInAutoMint = included;
+    else record.includeInCopyMint = included;
+    this.save();
+    return record;
+  }
+
   // Decrypted only at the point of use (signing), never logged or displayed.
   getDecryptedKeys(): string[] {
     return this.data.wallets.map((w) => decrypt(w.encryptedKey, this.passphrase));
@@ -126,6 +143,17 @@ export class TelegramStore {
     const record = this.data.wallets.find((w) => w.address.toLowerCase() === address.toLowerCase());
     if (!record) throw new Error(`No wallet stored for ${address}.`);
     return decrypt(record.encryptedKey, this.passphrase);
+  }
+
+  // Wallets opted into a given watcher — unset defaults to true, so existing
+  // wallets keep today's "every wallet participates" behavior unchanged.
+  listWalletsFor(feature: "auto" | "copy"): WalletRecord[] {
+    const flag = feature === "auto" ? "includeInAutoMint" : "includeInCopyMint";
+    return this.data.wallets.filter((w) => w[flag] !== false);
+  }
+
+  getDecryptedKeysFor(feature: "auto" | "copy"): string[] {
+    return this.listWalletsFor(feature).map((w) => decrypt(w.encryptedKey, this.passphrase));
   }
 
   // ── Copy-mint watchlist ──────────────────────────────────────────────

@@ -97,6 +97,50 @@ describe("TelegramStore wallets", () => {
     const store2 = new TelegramStore(tmpFile, "wrong-pass");
     expect(() => store2.getDecryptedKeys()).toThrow();
   });
+
+  it("includes every wallet in auto/copy mint by default, unset until told otherwise", () => {
+    const store = freshStore();
+    store.addWallet("a", TEST_KEY_1);
+    store.addWallet("b", TEST_KEY_2);
+    expect(store.listWalletsFor("auto")).toHaveLength(2);
+    expect(store.listWalletsFor("copy")).toHaveLength(2);
+    expect(store.getDecryptedKeysFor("auto")).toEqual([TEST_KEY_1, TEST_KEY_2]);
+  });
+
+  it("excludes a wallet from auto mint only, leaving copy mint untouched", () => {
+    const store = freshStore();
+    const a = store.addWallet("a", TEST_KEY_1);
+    store.addWallet("b", TEST_KEY_2);
+    store.setWalletInclusion(a.address, "auto", false);
+
+    expect(store.listWalletsFor("auto")).toHaveLength(1);
+    expect(store.listWalletsFor("auto")[0].label).toBe("b");
+    expect(store.getDecryptedKeysFor("auto")).toEqual([TEST_KEY_2]);
+
+    expect(store.listWalletsFor("copy")).toHaveLength(2); // untouched
+  });
+
+  it("can be toggled back on after being excluded", () => {
+    const store = freshStore();
+    const a = store.addWallet("a", TEST_KEY_1);
+    store.setWalletInclusion(a.address, "copy", false);
+    expect(store.listWalletsFor("copy")).toHaveLength(0);
+    store.setWalletInclusion(a.address, "copy", true);
+    expect(store.listWalletsFor("copy")).toHaveLength(1);
+  });
+
+  it("setWalletInclusion throws for an address with no stored wallet", () => {
+    const store = freshStore();
+    expect(() => store.setWalletInclusion("0x000000000000000000000000000000000000ff", "auto", false)).toThrow();
+  });
+
+  it("persists per-wallet inclusion across a fresh instance", () => {
+    const store1 = freshStore();
+    const a = store1.addWallet("a", TEST_KEY_1);
+    store1.setWalletInclusion(a.address, "auto", false);
+    const store2 = new TelegramStore(tmpFile, "test-pass");
+    expect(store2.listWalletsFor("auto")).toHaveLength(0);
+  });
 });
 
 describe("TelegramStore copy-mint watchlist", () => {
