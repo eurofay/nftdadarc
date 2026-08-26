@@ -167,8 +167,21 @@ from Telegram instead of a terminal:
 - **Wallets** — add/remove from a chat, list shows masked addresses only.
 - **Settings** — chain, gas ceiling/tip, gas limit, quantity caps — all editable
   via inline buttons.
-- **`/mint <link-or-address> <quantity>`** — one-off manual mint, same engine
-  as the wizard.
+- **`/mint <link-or-address> <quantity> [wallet label(s)]`** — one-off manual
+  mint, same engine as the wizard. Fires immediately with no confirmation —
+  the fast path for "it's already live, fire now." Quantity is automatically
+  capped at the drop's real max per wallet if you ask for more than it allows
+  (told about it, never just left to revert). The optional third argument
+  narrows which wallet(s) fire — a label, an address, or a comma-separated
+  list — instead of every added wallet; skip it to use them all.
+- **Scheduled Mint** — the same engine, but menu-driven for setting something
+  up ahead of time instead of firing on the spot: paste the target, pick
+  which wallet(s) from your pool via a checklist, pick a quantity (capped the
+  same way), then pick when — fire immediately, wait for the drop's own
+  on-chain start time, or a custom `HH:MM` IST. Confirms before doing
+  anything. Once confirmed it pre-signs and waits internally exactly like
+  the CLI's "wait for stage," so the bot stays fully responsive to
+  everything else while it waits.
 - **Auto mint** — start/stop the [free-mint watcher](#step-5--auto-mode-unattended-free-mint-watcher)
   from a button instead of a terminal flag. Settings → **Auto-mint chains** lets
   you multi-select several chains to watch at once (e.g. Robinhood + Ethereum

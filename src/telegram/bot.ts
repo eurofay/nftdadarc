@@ -8,7 +8,7 @@
 import { Telegraf, Markup, Context } from "telegraf";
 import { message } from "telegraf/filters";
 import { isAddress, JsonRpcProvider, formatEther, parseEther } from "ethers";
-import { TelegramStore } from "./store";
+import { TelegramStore, WalletRecord } from "./store";
 import {
   mainMenu,
   walletsMenu,
@@ -20,6 +20,9 @@ import {
   fundSourceMenu,
   fundTargetsMenu,
   fundConfirmMenu,
+  schedWalletsMenu,
+  schedTimingMenu,
+  schedConfirmMenu,
   maskAddress,
 } from "./menus";
 import { resolveChain } from "../chains";
@@ -32,12 +35,26 @@ import { runAutoMintWatcher } from "../auto-mint";
 import { runCopyMintWatcher } from "../copy-mint";
 import { batchTransfer, estimateBatchCost } from "../fund-transfer";
 import { createLogger, withPrefix, LogSink } from "../logger";
+import { istTimeToDate, toIST } from "../time-format";
 
 interface SessionData {
-  step?: "awaiting_wallet_key" | "awaiting_copy_target" | "awaiting_fund_amount" | `awaiting_setting:${string}`;
+  step?:
+    | "awaiting_wallet_key"
+    | "awaiting_copy_target"
+    | "awaiting_fund_amount"
+    | "awaiting_sched_link"
+    | "awaiting_sched_quantity"
+    | "awaiting_sched_custom_time"
+    | `awaiting_setting:${string}`;
   fundSource?: string;
   fundTargets?: string[]; // lowercased addresses
   fundAmountWei?: string; // bigint as string — kept out of the type so session stays plain-JSON-shaped
+  schedContract?: string;
+  schedWallets?: string[]; // lowercased addresses
+  schedQuantity?: number;
+  schedDropMax?: number;
+  schedStartTime?: number; // on-chain drop start, unix seconds
+  schedTargetStartMs?: number | "now"; // chosen fire time, pending confirmation
 }
 interface BotContext extends Context {
   session: SessionData;
@@ -50,6 +67,31 @@ interface RunningWatcher {
 
 function gweiToWei(gwei: number): bigint {
   return BigInt(Math.round(gwei * 1e9));
+}
+
+// Shared by /mint and Scheduled Mint: turn whatever the user pasted (a raw
+// 0x address, an OpenSea link, or a bare slug) into a contract address.
+async function resolveMintTarget(link: string, chainKey: string): Promise<string> {
+  const parsed = parseNftLink(link);
+  if (parsed.kind === "address") return parsed.value;
+  const info = await resolveSlug(parsed.value, process.env.OPENSEA_API_KEY, chainKey);
+  return info.contractAddress;
+}
+
+// Matches a comma-separated list of wallet labels/addresses against the
+// stored wallets — exact address match, or case-insensitive label match.
+// Used by /mint's optional wallet filter for a fast, no-menu-tapping fire.
+export function matchWallets(wallets: WalletRecord[], filter: string): WalletRecord[] {
+  const tokens = filter.split(",").map((t) => t.trim().toLowerCase()).filter(Boolean);
+  const matched: WalletRecord[] = [];
+  for (const token of tokens) {
+    const hit = wallets.find(
+      (w) => w.address.toLowerCase() === token || w.label.toLowerCase() === token
+    );
+    if (!hit) throw new Error(`No wallet matches "${token}" — check Wallets for exact labels.`);
+    if (!matched.includes(hit)) matched.push(hit);
+  }
+  return matched;
 }
 
 // Serializes sends to one chat with a small gap between them, so a burst of
@@ -434,38 +476,50 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
   }
 
   // ── Manual one-off mint ──────────────────────────────────────────────
+  // /mint <link> <quantity> [wallet labels/addresses, comma-separated]
+  // The wallet filter is what makes this the fast path for "already live,
+  // fire now with this one wallet" — one message, no menu taps, no
+  // confirmation, so it's the fastest thing this bot can do for a
+  // genuinely contested public stage.
   bot.command("mint", async (ctx) => {
     const args = ctx.message.text.split(/\s+/).slice(1);
-    const [link, qtyRaw] = args;
-    const quantity = parseInt(qtyRaw ?? "1", 10);
-    if (!link || !Number.isFinite(quantity) || quantity <= 0) {
-      return ctx.reply("Usage: /mint <contract address, OpenSea link, or slug> <quantity>");
+    const [link, qtyRaw, walletFilter] = args;
+    const requestedQuantity = parseInt(qtyRaw ?? "1", 10);
+    if (!link || !Number.isFinite(requestedQuantity) || requestedQuantity <= 0) {
+      return ctx.reply("Usage: /mint <contract address, OpenSea link, or slug> <quantity> [wallet label(s)]");
     }
 
-    const wallets = store.listWallets();
+    const allWallets = store.listWallets();
     const settings = store.getSettings();
-    if (wallets.length === 0) return ctx.reply("Add a wallet first.");
+    if (allWallets.length === 0) return ctx.reply("Add a wallet first.");
+
+    let wallets: WalletRecord[];
+    try {
+      wallets = walletFilter ? matchWallets(allWallets, walletFilter) : allWallets;
+    } catch (err: any) {
+      return ctx.reply(`❌ ${err.message}`);
+    }
 
     const logger = createLogger(createTelegramSink(bot, ctx.chat!.id));
     try {
-      const parsed = parseNftLink(link);
-      let contract: string;
-      if (parsed.kind === "address") {
-        contract = parsed.value;
-      } else {
-        const info = await resolveSlug(parsed.value, process.env.OPENSEA_API_KEY, settings.chainKey);
-        contract = info.contractAddress;
+      const contract = await resolveMintTarget(link, settings.chainKey);
+      const { urls } = resolveRpcsForChain(settings.chainKey);
+
+      const preview = await buildLocalMintPlan(urls[0], contract, 1);
+      if (!preview) return ctx.reply("No public drop found for that contract on the configured chain.");
+      const dropMax = preview.drop.maxTotalMintableByWallet;
+      const quantity = dropMax > 0 ? Math.min(dropMax, requestedQuantity) : requestedQuantity;
+      if (quantity < requestedQuantity) {
+        await ctx.reply(`Capped to ${quantity}/wallet — this drop's real max is ${dropMax}.`);
       }
 
-      const chain = resolveChain(settings.chainKey)!;
-      const { urls } = resolveRpcsForChain(settings.chainKey);
       const plan = await buildLocalMintPlan(urls[0], contract, quantity);
       if (!plan) return ctx.reply("No public drop found for that contract on the configured chain.");
 
       await localPublicSnipe({
         nftContract: contract,
         quantity,
-        walletKeys: store.getDecryptedKeys(),
+        walletKeys: wallets.map((w) => store.getDecryptedKey(w.address)),
         rpcUrls: urls,
         maxFeePerGas: gweiToWei(settings.maxFeeGwei),
         maxPriorityFee: gweiToWei(settings.priorityGwei),
@@ -474,10 +528,134 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
         plan,
         logger,
       });
-      void chain;
     } catch (err: any) {
       await ctx.reply(`❌ ${err.message}`);
     }
+  });
+
+  // ── Scheduled mint: pick a target, wallets, quantity and a fire time ──
+  function resetSchedSession(ctx: BotContext): void {
+    ctx.session.step = undefined;
+    ctx.session.schedContract = undefined;
+    ctx.session.schedWallets = undefined;
+    ctx.session.schedQuantity = undefined;
+    ctx.session.schedDropMax = undefined;
+    ctx.session.schedStartTime = undefined;
+    ctx.session.schedTargetStartMs = undefined;
+  }
+
+  bot.action("menu:sched", (ctx) => {
+    const wallets = store.listWallets();
+    if (wallets.length === 0) return ctx.answerCbQuery("Add a wallet first.", { show_alert: true });
+    resetSchedSession(ctx);
+    ctx.session.step = "awaiting_sched_link";
+    return ctx.reply("Paste the contract address, OpenSea link, or slug.");
+  });
+
+  bot.action(/^sched:wallet:toggle:(.+)$/, (ctx) => {
+    const address = ctx.match[1].toLowerCase();
+    const selected = new Set(ctx.session.schedWallets ?? []);
+    if (selected.has(address)) selected.delete(address);
+    else selected.add(address);
+    ctx.session.schedWallets = [...selected];
+    return ctx.editMessageText("Mint FROM which wallet(s)? Tap to select, then Done.", schedWalletsMenu(store.listWallets(), selected));
+  });
+
+  bot.action("sched:wallets:done", (ctx) => {
+    if (!ctx.session.schedWallets || ctx.session.schedWallets.length === 0) {
+      return ctx.answerCbQuery("Select at least one wallet.", { show_alert: true });
+    }
+    ctx.session.step = "awaiting_sched_quantity";
+    const max = ctx.session.schedDropMax ?? 0;
+    return ctx.reply(`How many per wallet? (drop's real max is ${max > 0 ? max : "unspecified"} — you'll never exceed it)`);
+  });
+
+  bot.action("sched:cancel", (ctx) => {
+    resetSchedSession(ctx);
+    return ctx.editMessageText("Cancelled.", mainMenu());
+  });
+
+  async function fireScheduled(ctx: BotContext, targetStart: Date | null): Promise<void> {
+    const { schedContract, schedWallets, schedQuantity } = ctx.session;
+    if (!schedContract || !schedWallets?.length || !schedQuantity) {
+      await ctx.answerCbQuery("That request expired — start over from Scheduled Mint.", { show_alert: true });
+      return;
+    }
+    resetSchedSession(ctx);
+    await ctx.answerCbQuery(targetStart ? "Scheduled." : "Firing...");
+    await ctx.editMessageText(
+      targetStart ? `Scheduled for ${toIST(targetStart)} IST — status below when it fires.` : "Firing — status below."
+    );
+
+    const settings = store.getSettings();
+    const { urls } = resolveRpcsForChain(settings.chainKey);
+    const logger = createLogger(createTelegramSink(bot, ctx.chat!.id));
+    try {
+      const plan = await buildLocalMintPlan(urls[0], schedContract, schedQuantity);
+      if (!plan) {
+        logger.errorBold("Drop is no longer resolvable on-chain — nothing fired.");
+        return;
+      }
+      // localPublicSnipe itself waits for targetStart internally (same
+      // engine the CLI's "wait for stage" uses) — awaiting it here just
+      // means this promise resolves whenever it eventually fires, which
+      // can be a long time from now. That's fine: Node doesn't block on a
+      // pending await, so the bot keeps handling everything else meanwhile.
+      await localPublicSnipe({
+        nftContract: schedContract,
+        quantity: schedQuantity,
+        walletKeys: schedWallets.map((addr) => store.getDecryptedKey(addr)),
+        rpcUrls: urls,
+        maxFeePerGas: gweiToWei(settings.maxFeeGwei),
+        maxPriorityFee: gweiToWei(settings.priorityGwei),
+        gasLimit: settings.gasLimit,
+        targetStart,
+        plan,
+        logger,
+      });
+    } catch (err: any) {
+      logger.errorBold(`Scheduled mint failed: ${err.message}`);
+    }
+  }
+
+  // Picking a time doesn't fire anything yet — it stages the choice and
+  // shows a confirm step, same "always confirm before a deliberate one-off
+  // action" rule Fund Wallets follows. A scheduled fire might not happen
+  // for hours, so getting one detail wrong here is expensive to not catch.
+  function confirmSummary(ctx: BotContext): string {
+    const { schedContract, schedWallets, schedQuantity, schedTargetStartMs } = ctx.session;
+    const walletCount = schedWallets?.length ?? 0;
+    const when =
+      schedTargetStartMs === "now"
+        ? "now"
+        : schedTargetStartMs
+          ? `${toIST(new Date(schedTargetStartMs))} IST`
+          : "?";
+    return (
+      `Mint ${schedQuantity}/wallet from ${schedContract} using ${walletCount} wallet(s)?\n` +
+      `Fires: ${when}`
+    );
+  }
+
+  bot.action("sched:timing:now", (ctx) => {
+    ctx.session.schedTargetStartMs = "now";
+    return ctx.editMessageText(confirmSummary(ctx), schedConfirmMenu());
+  });
+  bot.action("sched:timing:wait", (ctx) => {
+    const startTime = ctx.session.schedStartTime;
+    if (!startTime) return ctx.answerCbQuery("That request expired — start over.", { show_alert: true });
+    ctx.session.schedTargetStartMs = startTime * 1000;
+    return ctx.editMessageText(confirmSummary(ctx), schedConfirmMenu());
+  });
+  bot.action("sched:timing:custom", (ctx) => {
+    ctx.session.step = "awaiting_sched_custom_time";
+    return ctx.reply("Send the time (HH:MM, 24-hour IST, today):");
+  });
+
+  bot.action("sched:confirm", (ctx) => {
+    const at = ctx.session.schedTargetStartMs;
+    if (!at) return ctx.answerCbQuery("That request expired — start over from Scheduled Mint.", { show_alert: true });
+    return fireScheduled(ctx, at === "now" ? null : new Date(at));
   });
 
   // ── Text handler: services whatever multi-step flow is in progress ───
@@ -509,6 +687,63 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
         await ctx.reply(`❌ ${err.message}`);
       }
       return;
+    }
+
+    if (step === "awaiting_sched_link") {
+      ctx.session.step = undefined;
+      const link = ctx.message.text.trim();
+      const settings = store.getSettings();
+      try {
+        const contract = await resolveMintTarget(link, settings.chainKey);
+        const { urls } = resolveRpcsForChain(settings.chainKey);
+        const preview = await buildLocalMintPlan(urls[0], contract, 1);
+        if (!preview) return ctx.reply("No public drop found for that contract on the configured chain.");
+
+        ctx.session.schedContract = contract;
+        ctx.session.schedDropMax = preview.drop.maxTotalMintableByWallet;
+        ctx.session.schedStartTime = preview.drop.startTime;
+
+        const live = preview.drop.startTime * 1000 <= Date.now();
+        await ctx.reply(
+          `${contract}\n` +
+            `Price: ${formatEther(preview.drop.mintPrice)} ${resolveChain(settings.chainKey)!.nativeSymbol}\n` +
+            `Max per wallet: ${preview.drop.maxTotalMintableByWallet || "unspecified"}\n` +
+            `Stage: ${live ? "already live" : `opens ${toIST(new Date(preview.drop.startTime * 1000))} IST`}`
+        );
+        await ctx.reply("Mint FROM which wallet(s)? Tap to select, then Done.", schedWalletsMenu(store.listWallets(), new Set()));
+      } catch (err: any) {
+        await ctx.reply(`❌ ${err.message}`);
+      }
+      return;
+    }
+
+    if (step === "awaiting_sched_quantity") {
+      ctx.session.step = undefined;
+      const requested = parseInt(ctx.message.text.trim(), 10);
+      if (!Number.isFinite(requested) || requested <= 0) return ctx.reply("That's not a valid quantity.");
+      const dropMax = ctx.session.schedDropMax ?? 0;
+      const quantity = dropMax > 0 ? Math.min(dropMax, requested) : requested;
+      ctx.session.schedQuantity = quantity;
+      if (quantity < requested) await ctx.reply(`Capped to ${quantity}/wallet — this drop's real max is ${dropMax}.`);
+
+      const startsInFuture = (ctx.session.schedStartTime ?? 0) * 1000 > Date.now();
+      return ctx.reply("When should it fire?", schedTimingMenu(startsInFuture));
+    }
+
+    if (step === "awaiting_sched_custom_time") {
+      ctx.session.step = undefined;
+      let targetStart: Date;
+      try {
+        targetStart = istTimeToDate(ctx.message.text.trim());
+      } catch (err: any) {
+        return ctx.reply(`❌ ${err.message}`);
+      }
+      const startTime = ctx.session.schedStartTime ?? 0;
+      if (targetStart.getTime() < startTime * 1000) {
+        await ctx.reply(`⚠️ That's before the stage opens (${toIST(new Date(startTime * 1000))} IST) — it will revert if fired that early.`);
+      }
+      ctx.session.schedTargetStartMs = targetStart.getTime();
+      return ctx.reply(confirmSummary(ctx), schedConfirmMenu());
     }
 
     if (step === "awaiting_fund_amount") {

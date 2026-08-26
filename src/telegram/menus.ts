@@ -12,7 +12,8 @@ export function mainMenu() {
   return Markup.inlineKeyboard([
     [Markup.button.callback("💼 Wallets", "menu:wallets"), Markup.button.callback("⚙️ Settings", "menu:settings")],
     [Markup.button.callback("🎯 Auto Mint", "menu:auto"), Markup.button.callback("👀 Copy Mint", "menu:copy")],
-    [Markup.button.callback("💸 Fund Wallets", "menu:fund"), Markup.button.callback("📊 Status", "menu:status")],
+    [Markup.button.callback("💸 Fund Wallets", "menu:fund"), Markup.button.callback("⏰ Scheduled Mint", "menu:sched")],
+    [Markup.button.callback("📊 Status", "menu:status")],
   ]);
 }
 
@@ -105,5 +106,37 @@ export function fundTargetsMenu(candidates: WalletRecord[], selected: Set<string
 export function fundConfirmMenu() {
   return Markup.inlineKeyboard([
     [Markup.button.callback("✅ Confirm", "fund:confirm"), Markup.button.callback("❌ Cancel", "fund:cancel")],
+  ]);
+}
+
+// Multi-select wallets to mint from — same toggle-and-redraw pattern as
+// fundTargetsMenu, but over the whole wallet list (nothing to exclude).
+export function schedWalletsMenu(wallets: WalletRecord[], selected: Set<string>) {
+  const rows = wallets.map((w) => {
+    const checked = selected.has(w.address.toLowerCase());
+    return [
+      Markup.button.callback(
+        `${checked ? "✅" : "⬜"} ${w.label} (${maskAddress(w.address)})`,
+        `sched:wallet:toggle:${w.address}`
+      ),
+    ];
+  });
+  rows.push([Markup.button.callback(`➡️ Done (${selected.size} selected)`, "sched:wallets:done")]);
+  rows.push([Markup.button.callback("❌ Cancel", "sched:cancel")]);
+  return Markup.inlineKeyboard(rows);
+}
+
+export function schedTimingMenu(startsInFuture: boolean) {
+  const rows = startsInFuture
+    ? [[Markup.button.callback("⏳ Wait for the stage", "sched:timing:wait")]]
+    : [[Markup.button.callback("🚀 Fire now", "sched:timing:now")]];
+  rows.push([Markup.button.callback("✏️ Custom time (HH:MM IST)", "sched:timing:custom")]);
+  rows.push([Markup.button.callback("❌ Cancel", "sched:cancel")]);
+  return Markup.inlineKeyboard(rows);
+}
+
+export function schedConfirmMenu() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback("✅ Confirm", "sched:confirm"), Markup.button.callback("❌ Cancel", "sched:cancel")],
   ]);
 }
