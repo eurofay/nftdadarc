@@ -34,16 +34,22 @@ async function main(): Promise<void> {
   process.once("SIGINT", () => bot.stop("SIGINT"));
   process.once("SIGTERM", () => bot.stop("SIGTERM"));
 
-  try {
-    await bot.launch();
-  } catch (err: any) {
-    console.error(`Failed to start: ${err.description || err.message}`);
-    if (err.response?.error_code === 401) {
-      console.error("That's an invalid bot token — check TELEGRAM_BOT_TOKEN against what @BotFather gave you.");
-    }
-    process.exit(1);
-  }
-  console.log(`Telegram bot running. Only replies to owner id ${ownerId} in a private chat.`);
+  // launch()'s own promise only resolves after stop() is called — it never
+  // resolves while long-polling is active — so "started successfully" has
+  // to come from the onLaunch callback, not an awaited return. The promise
+  // still rejects on a genuine startup failure (bad token, network), which
+  // is what the catch below is for.
+  bot
+    .launch(() => {
+      console.log(`Telegram bot running. Only replies to owner id ${ownerId} in a private chat.`);
+    })
+    .catch((err: any) => {
+      console.error(`Failed to start: ${err.description || err.message}`);
+      if (err.response?.error_code === 401) {
+        console.error("That's an invalid bot token — check TELEGRAM_BOT_TOKEN against what @BotFather gave you.");
+      }
+      process.exit(1);
+    });
 }
 
 void main();
