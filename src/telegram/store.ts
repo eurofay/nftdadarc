@@ -21,12 +21,18 @@ export interface CopyTarget {
 }
 
 export interface BotSettings {
-  chainKey: string;
+  chainKey: string; // the single chain used by /mint, Fund Wallets, and Copy Mint
   maxFeeGwei: number;
   priorityGwei: number;
   gasLimit: number;
   autoEnabled: boolean;
   autoMaxQuantity?: number;
+  // Which chain(s) Auto Mint watches — independent of chainKey, since this
+  // is the one feature that makes sense to run on several chains at once
+  // (one runAutoMintWatcher instance per chain, same as CLI's AUTO_CHAIN
+  // comma-list). Empty/unset means "just chainKey", so existing setups
+  // don't change behavior until this is deliberately turned into a list.
+  autoChainKeys?: string[];
   copyMintEnabled: boolean;
   // Copy-mint isn't restricted to free drops, so this is the one guardrail
   // against blindly following a watched wallet into an expensive mint.

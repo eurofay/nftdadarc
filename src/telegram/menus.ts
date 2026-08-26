@@ -43,8 +43,11 @@ export function autoMenu(enabled: boolean) {
 }
 
 export function settingsMenu(s: BotSettings) {
+  const autoChainsLabel =
+    s.autoChainKeys && s.autoChainKeys.length > 0 ? s.autoChainKeys.join(", ") : `${s.chainKey} (default)`;
   return Markup.inlineKeyboard([
     [Markup.button.callback(`Chain: ${s.chainKey}`, "setting:chain")],
+    [Markup.button.callback(`Auto-mint chains: ${autoChainsLabel}`, "setting:autoChains")],
     [Markup.button.callback(`Max fee: ${s.maxFeeGwei} gwei`, "setting:maxFeeGwei")],
     [Markup.button.callback(`Priority fee: ${s.priorityGwei} gwei`, "setting:priorityGwei")],
     [Markup.button.callback(`Gas limit: ${s.gasLimit}`, "setting:gasLimit")],
@@ -58,6 +61,18 @@ export function chainPickerMenu() {
   return Markup.inlineKeyboard(CHAINS.map((c) => [Markup.button.callback(c.name, `setting:chain:${c.key}`)]).concat([
     [Markup.button.callback("⬅ Back", "menu:settings")],
   ]));
+}
+
+// Multi-select for which chain(s) Auto Mint watches. Saves on every tap —
+// unlike the Fund Wallets flow this isn't a one-shot action with a confirm
+// step, it's an ongoing setting, so there's nothing to "cancel".
+export function autoChainsMenu(selected: Set<string>) {
+  const rows = CHAINS.map((c) => {
+    const checked = selected.has(c.key);
+    return [Markup.button.callback(`${checked ? "✅" : "⬜"} ${c.name}`, `setting:autoChains:toggle:${c.key}`)];
+  });
+  rows.push([Markup.button.callback("⬅ Back", "menu:settings")]);
+  return Markup.inlineKeyboard(rows);
 }
 
 // Pick the ONE wallet to send from.

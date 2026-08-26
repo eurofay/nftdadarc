@@ -16,6 +16,7 @@ import {
   autoMenu,
   settingsMenu,
   chainPickerMenu,
+  autoChainsMenu,
   fundSourceMenu,
   fundTargetsMenu,
   fundConfirmMenu,
@@ -30,7 +31,7 @@ import { localPublicSnipe } from "../local-mint";
 import { runAutoMintWatcher } from "../auto-mint";
 import { runCopyMintWatcher } from "../copy-mint";
 import { batchTransfer, estimateBatchCost } from "../fund-transfer";
-import { createLogger, LogSink } from "../logger";
+import { createLogger, withPrefix, LogSink } from "../logger";
 
 interface SessionData {
   step?: "awaiting_wallet_key" | "awaiting_copy_target" | "awaiting_fund_amount" | `awaiting_setting:${string}`;
@@ -91,7 +92,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
     return next();
   });
 
-  let runningAuto: RunningWatcher | null = null;
+  const runningAuto = new Map<string, RunningWatcher>(); // keyed by chain key — one watcher per chain
   let runningCopy: RunningWatcher | null = null;
 
   // ── Menu navigation ──────────────────────────────────────────────────
@@ -108,9 +109,10 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
 
   bot.action("menu:auto", (ctx) =>
     ctx.editMessageText(
-      `Auto free-mint watcher: ${runningAuto ? "🟢 running" : "🔴 stopped"}\n` +
-        "Detects any SeaDrop drop going live at price 0 and mints the max per wallet — no confirmation.",
-      autoMenu(runningAuto !== null)
+      `Auto free-mint watcher: ${runningAuto.size > 0 ? `🟢 running on ${[...runningAuto.keys()].join(", ")}` : "🔴 stopped"}\n` +
+        "Detects any SeaDrop drop going live at price 0 and mints the max per wallet — no confirmation. " +
+        "Runs on one or more chains at once — set which ones in Settings → Auto-mint chains.",
+      autoMenu(runningAuto.size > 0)
     )
   );
 
@@ -157,7 +159,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
     await ctx.editMessageText(
       `Chain: ${settings.chainKey}\n` +
         `Wallets: ${wallets.length}${balances}\n` +
-        `Auto mint: ${runningAuto ? "running" : "stopped"}\n` +
+        `Auto mint: ${runningAuto.size > 0 ? `running on ${[...runningAuto.keys()].join(", ")}` : "stopped"}\n` +
         `Copy mint: ${runningCopy ? "running" : "stopped"} (watching ${store.listCopyTargets().length})`,
       mainMenu()
     );
@@ -234,20 +236,27 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
   });
 
   // ── Auto free-mint watcher ───────────────────────────────────────────
-  bot.action("auto:toggle", async (ctx) => {
-    if (runningAuto) {
-      runningAuto.stopSignal.stopped = true;
-      runningAuto = null;
-      await ctx.answerCbQuery("Stopping...");
-    } else {
-      const wallets = store.listWallets();
-      const settings = store.getSettings();
-      if (wallets.length === 0) return ctx.answerCbQuery("Add a wallet first.", { show_alert: true });
+  // Pulled out of the toggle action so start-up can resume it too, without
+  // a tap, whenever settings.autoEnabled says it was left running. Runs one
+  // runAutoMintWatcher per chain in settings.autoChainKeys (or just
+  // chainKey if that list is empty), each independently start/stoppable —
+  // same "one watcher per chain, prefixed logger" shape as the CLI's
+  // comma-separated AUTO_CHAIN.
+  function startAuto(chatId: number): { ok: true } | { ok: false; reason: string } {
+    const wallets = store.listWallets();
+    if (wallets.length === 0) return { ok: false, reason: "Add a wallet first." };
 
-      const chain = resolveChain(settings.chainKey)!;
-      const { urls } = resolveRpcsForChain(settings.chainKey);
+    const settings = store.getSettings();
+    const chainKeys = settings.autoChainKeys?.length ? settings.autoChainKeys : [settings.chainKey];
+
+    for (const key of chainKeys) {
+      if (runningAuto.has(key)) continue; // already running on this chain
+      const chain = resolveChain(key);
+      if (!chain) continue; // shouldn't happen — chosen from CHAINS via buttons
+
+      const { urls } = resolveRpcsForChain(key);
       const stopSignal = { stopped: false };
-      const logger = createLogger(createTelegramSink(bot, ctx.chat!.id));
+      const logger = withPrefix(key, createLogger(createTelegramSink(bot, chatId)));
       const promise = runAutoMintWatcher({
         chain,
         rpcUrls: urls,
@@ -262,14 +271,53 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
         logger,
         stopSignal,
       }).catch((err) => logger.errorBold(`Auto-mint watcher crashed: ${err.message}`));
-      runningAuto = { stopSignal, promise };
+      runningAuto.set(key, { stopSignal, promise });
+    }
+    store.updateSettings({ autoEnabled: true });
+    return { ok: true };
+  }
+
+  function stopAuto(): void {
+    for (const watcher of runningAuto.values()) watcher.stopSignal.stopped = true;
+    runningAuto.clear();
+    store.updateSettings({ autoEnabled: false });
+  }
+
+  bot.action("auto:toggle", async (ctx) => {
+    if (runningAuto.size > 0) {
+      stopAuto();
+      await ctx.answerCbQuery("Stopping...");
+    } else {
+      const result = startAuto(ctx.chat!.id);
+      if (!result.ok) return ctx.answerCbQuery(result.reason, { show_alert: true });
       await ctx.answerCbQuery("Started.");
     }
     return ctx.editMessageText(
-      `Auto free-mint watcher: ${runningAuto ? "🟢 running" : "🔴 stopped"}`,
-      autoMenu(runningAuto !== null)
+      `Auto free-mint watcher: ${runningAuto.size > 0 ? `🟢 running on ${[...runningAuto.keys()].join(", ")}` : "🔴 stopped"}`,
+      autoMenu(runningAuto.size > 0)
     );
   });
+
+  // Resume automatically on every bot start if it was left "on" — so a
+  // restart (redeploy, crash-and-relaunch, reboot) doesn't silently turn
+  // auto-mint off until someone notices and taps the button again. Never
+  // let this stop the bot itself from starting — worst case, auto-mint
+  // just stays off and the owner can turn it back on from the menu.
+  if (store.getSettings().autoEnabled) {
+    try {
+      const result = startAuto(ownerId);
+      if (result.ok) {
+        bot.telegram
+          .sendMessage(ownerId, `🟢 Auto free-mint watcher resumed on ${[...runningAuto.keys()].join(", ")} (was on before restart).`)
+          .catch(() => {});
+      } else {
+        store.updateSettings({ autoEnabled: false });
+      }
+    } catch (err: any) {
+      store.updateSettings({ autoEnabled: false });
+      console.error(`Could not resume auto-mint on startup: ${err.message}`);
+    }
+  }
 
   // ── Fund wallets: send native currency from one wallet to several ─────
   bot.action(/^fund:source:(.+)$/, (ctx) => {
@@ -346,6 +394,24 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
   bot.action(/^setting:chain:(.+)$/, (ctx) => {
     store.updateSettings({ chainKey: ctx.match[1] });
     return ctx.editMessageText("Settings:", settingsMenu(store.getSettings()));
+  });
+
+  bot.action("setting:autoChains", (ctx) =>
+    ctx.editMessageText(
+      "Which chain(s) should Auto Mint watch? Select none to just use the default Chain above.",
+      autoChainsMenu(new Set(store.getSettings().autoChainKeys ?? []))
+    )
+  );
+  bot.action(/^setting:autoChains:toggle:(.+)$/, (ctx) => {
+    const key = ctx.match[1];
+    const selected = new Set(store.getSettings().autoChainKeys ?? []);
+    if (selected.has(key)) selected.delete(key);
+    else selected.add(key);
+    store.updateSettings({ autoChainKeys: selected.size > 0 ? [...selected] : undefined });
+    return ctx.editMessageText(
+      "Which chain(s) should Auto Mint watch? Select none to just use the default Chain above.",
+      autoChainsMenu(selected)
+    );
   });
 
   const NUMERIC_SETTINGS = ["maxFeeGwei", "priorityGwei", "gasLimit", "autoMaxQuantity", "copyMintMaxPriceEth"] as const;

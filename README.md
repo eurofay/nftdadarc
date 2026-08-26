@@ -170,7 +170,16 @@ from Telegram instead of a terminal:
 - **`/mint <link-or-address> <quantity>`** — one-off manual mint, same engine
   as the wizard.
 - **Auto mint** — start/stop the [free-mint watcher](#step-5--auto-mode-unattended-free-mint-watcher)
-  from a button instead of a terminal flag.
+  from a button instead of a terminal flag. Settings → **Auto-mint chains** lets
+  you multi-select several chains to watch at once (e.g. Robinhood + Ethereum
+  together) — one watcher per chain, same as the CLI's comma-separated
+  `AUTO_CHAIN`. And it's genuinely "always on": turning it on persists that
+  choice, so if the bot process restarts (redeploy, crash-and-relaunch,
+  reboot) it resumes automatically on whichever chains were running, with no
+  tap needed. That's the bot staying in the state you left it — it does *not*
+  make the bot survive an actual crash by itself; for that you need a process
+  supervisor (e.g. `pm2 start dist/telegram-bot.js --name mint-bot && pm2 save`,
+  or a Windows service) keeping the Node process itself alive.
 - **Copy mint** — watch one or more wallets, and copy any `mintPublic` call
   they make using your own wallets. Unlike auto mode this isn't restricted to
   free drops (the point is following a wallet's judgment, paid or not), so a
