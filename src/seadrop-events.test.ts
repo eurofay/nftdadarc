@@ -48,6 +48,21 @@ afterEach(async () => {
   mock = undefined;
 });
 
+// A real node only returns logs whose block falls inside the requested
+// range, and scanPublicDropUpdates now walks in small (default 10-block)
+// chunks — so the mock has to filter per-call the way a real one would,
+// or a log would come back once per chunk instead of once.
+function logsInRange(logs: ReturnType<typeof encodeLog>[]) {
+  return (params: any[]) => {
+    const from = parseInt(params[0].fromBlock, 16);
+    const to = parseInt(params[0].toBlock, 16);
+    return logs.filter((l) => {
+      const bn = parseInt(l.blockNumber, 16);
+      return bn >= from && bn <= to;
+    });
+  };
+}
+
 describe("scanPublicDropUpdates (against a real mock RPC node)", () => {
   it("decodes a free-mint sighting from a real ABI-encoded log", async () => {
     const log = encodeLog(
@@ -57,7 +72,7 @@ describe("scanPublicDropUpdates (against a real mock RPC node)", () => {
     );
     mock = await startMockRpc({
       eth_chainId: () => "0x2105",
-      eth_getLogs: () => [log],
+      eth_getLogs: logsInRange([log]),
     });
 
     const sightings = await scanPublicDropUpdates(mock.url, 1, 100);
@@ -73,7 +88,7 @@ describe("scanPublicDropUpdates (against a real mock RPC node)", () => {
     const logB = encodeLog(NFT_B, { mintPrice: 1_000_000_000_000_000n, startTime: 1, endTime: 0, maxTotalMintableByWallet: 2, feeBps: 250, restrictFeeRecipients: true }, 11);
     mock = await startMockRpc({
       eth_chainId: () => "0x2105",
-      eth_getLogs: () => [logA, logB],
+      eth_getLogs: logsInRange([logA, logB]),
     });
 
     const sightings = await scanPublicDropUpdates(mock.url, 1, 100);
@@ -98,12 +113,27 @@ describe("scanPublicDropUpdates (against a real mock RPC node)", () => {
       },
     });
 
-    // 5000-block span should be split into multiple <=2000-block chunks.
-    await scanPublicDropUpdates(mock.url, 1, 5000);
-    expect(seenRanges.length).toBeGreaterThan(1);
+    // Default chunk is 10 blocks (Alchemy's free-tier eth_getLogs cap), so a
+    // 45-block span should take 5 calls, none spanning more than 10 blocks.
+    await scanPublicDropUpdates(mock.url, 1, 45);
+    expect(seenRanges.length).toBe(5);
     for (const r of seenRanges) {
       const span = parseInt(r.to, 16) - parseInt(r.from, 16) + 1;
-      expect(span).toBeLessThanOrEqual(2000);
+      expect(span).toBeLessThanOrEqual(10);
     }
+  });
+
+  it("honors a caller-supplied chunk size for providers with a larger eth_getLogs limit", async () => {
+    let seenRanges: { from: string; to: string }[] = [];
+    mock = await startMockRpc({
+      eth_chainId: () => "0x2105",
+      eth_getLogs: (params) => {
+        seenRanges.push({ from: params[0].fromBlock, to: params[0].toBlock });
+        return [];
+      },
+    });
+
+    await scanPublicDropUpdates(mock.url, 1, 45, 50);
+    expect(seenRanges).toHaveLength(1);
   });
 });

@@ -30,6 +30,7 @@ export interface AutoMintOpts {
   maxQuantityPerWallet?: number; // caps "max per wallet" if a drop's cap is absurdly high
   maxMintsPerRun?: number; // stop after this many distinct collections auto-fired
   openseaApiKey?: string;
+  logChunkBlocks?: number; // eth_getLogs range per call — see seadrop-events.ts
 }
 
 function nowSec(): number {
@@ -81,7 +82,7 @@ export async function runAutoMintWatcher(opts: AutoMintOpts): Promise<void> {
     if (latest > lastScanned) {
       let sightings: DropSighting[] = [];
       try {
-        sightings = await scanPublicDropUpdates(rpcUrls[0], lastScanned + 1, latest);
+        sightings = await scanPublicDropUpdates(rpcUrls[0], lastScanned + 1, latest, opts.logChunkBlocks);
       } catch (err: any) {
         console.log(chalk.red(`  ⚠ log scan failed: ${err.message} — retrying next tick`));
       }

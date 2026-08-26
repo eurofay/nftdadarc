@@ -28,21 +28,28 @@ export interface DropSighting {
   blockNumber: number;
 }
 
-// Most providers cap eth_getLogs to a few thousand blocks per call, so a wide
-// range is walked in chunks rather than requested in one shot.
-const CHUNK_BLOCKS = 2000;
+// Providers cap how many blocks eth_getLogs can span in one call, so a wide
+// range is walked in chunks rather than requested in one shot. This defaults
+// small on purpose: Alchemy's free tier — the provider this repo's .env.example
+// recommends — allows only 10 blocks per call. A too-large chunk doesn't
+// degrade gracefully, it just errors on every call, so "safe everywhere" beats
+// "fast on a plan the caller might not have." Raise it via the chunkBlocks
+// param (AUTO_LOG_CHUNK_BLOCKS at the CLI layer) if your provider allows more —
+// it only affects catch-up speed after downtime, not steady-state polling.
+const DEFAULT_CHUNK_BLOCKS = 10;
 
 export async function scanPublicDropUpdates(
   rpcUrl: string,
   fromBlock: number,
-  toBlock: number
+  toBlock: number,
+  chunkBlocks: number = DEFAULT_CHUNK_BLOCKS
 ): Promise<DropSighting[]> {
   if (fromBlock > toBlock) return [];
   const provider = new JsonRpcProvider(rpcUrl);
   const sightings: DropSighting[] = [];
 
-  for (let start = fromBlock; start <= toBlock; start += CHUNK_BLOCKS) {
-    const end = Math.min(start + CHUNK_BLOCKS - 1, toBlock);
+  for (let start = fromBlock; start <= toBlock; start += chunkBlocks) {
+    const end = Math.min(start + chunkBlocks - 1, toBlock);
     const logs = await provider.getLogs({
       address: SEADROP_ADDRESS,
       topics: [TOPIC],

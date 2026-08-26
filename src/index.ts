@@ -63,6 +63,9 @@ async function runAuto(): Promise<void> {
   const maxMintsPerRun = process.env.AUTO_MAX_MINTS_PER_RUN
     ? parseInt(process.env.AUTO_MAX_MINTS_PER_RUN, 10)
     : undefined;
+  const logChunkBlocks = process.env.AUTO_LOG_CHUNK_BLOCKS
+    ? parseInt(process.env.AUTO_LOG_CHUNK_BLOCKS, 10)
+    : undefined;
 
   await runAutoMintWatcher({
     chain,
@@ -75,6 +78,7 @@ async function runAuto(): Promise<void> {
     maxQuantityPerWallet,
     maxMintsPerRun,
     openseaApiKey: process.env.OPENSEA_API_KEY,
+    logChunkBlocks,
   });
 }
 

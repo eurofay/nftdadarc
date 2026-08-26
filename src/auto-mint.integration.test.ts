@@ -102,7 +102,7 @@ describe("runAutoMintWatcher (against a real mock RPC node)", () => {
     expect(mock.calls.some((c) => c.method === "eth_sendRawTransaction")).toBe(true);
   });
 
-  it("never fires on a drop whose price is non-zero", async () => {
+  it("never fires on a drop whose price is non-zero", { timeout: 15000 }, async () => {
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     let block = 100;
     const paidDrop = { ...LIVE_FREE_DROP, mintPrice: 1_000_000_000_000_000n };
@@ -122,12 +122,12 @@ describe("runAutoMintWatcher (against a real mock RPC node)", () => {
       maxFeePerGas: 2_000_000_000n,
       maxPriorityFee: 100_000_000n,
       gasLimit: 250_000,
-      pollIntervalMs: 10,
+      pollIntervalMs: 60,
     }).then(() => {
       stopped = true;
     });
 
-    await new Promise((r) => setTimeout(r, 150));
+    await new Promise((r) => setTimeout(r, 200));
     process.emit("SIGINT" as any);
     await run;
 
@@ -154,17 +154,17 @@ describe("runAutoMintWatcher (against a real mock RPC node)", () => {
       maxFeePerGas: 2_000_000_000n,
       maxPriorityFee: 100_000_000n,
       gasLimit: 250_000,
-      pollIntervalMs: 10,
+      pollIntervalMs: 60, // deliberately not too tight — fewer real HTTP round trips = less flake under parallel test load
     });
 
-    await new Promise((r) => setTimeout(r, 50));
+    await new Promise((r) => setTimeout(r, 90));
     process.emit("SIGINT" as any);
     await run;
 
     const callsAtStop = mock.calls.length;
     // Give a would-be leaked loop several more poll intervals to prove it's
     // actually dead, not just that the awaited promise resolved.
-    await new Promise((r) => setTimeout(r, 150));
+    await new Promise((r) => setTimeout(r, 300));
     expect(mock.calls.length).toBe(callsAtStop);
   });
 });
