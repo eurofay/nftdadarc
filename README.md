@@ -113,6 +113,47 @@ Two things to get right if you're leaving it running:
 
 ---
 
+## Step 5 — Auto mode: unattended free-mint watcher
+
+```bash
+npm start -- --auto
+```
+
+Instead of minting one collection you point it at, this watches the whole
+chain and mints **any** SeaDrop collection the moment its public stage goes
+live at `mintPrice = 0` — fully autonomous, no `Fire?` prompt.
+
+Discovery is entirely on-chain: every SeaDrop collection shares one singleton
+contract, and that contract emits an event with the full stage (price,
+window, per-wallet cap) whenever any project configures its public drop.
+Watching that one contract's event log is a complete, real-time feed of
+every SeaDrop drop on the chain — no OpenSea dependency, and it can't be
+spoofed by an unrelated contract. `OPENSEA_API_KEY` is optionally used to
+label sightings with a collection name in the log, nothing more.
+
+Because nothing prompts, everything comes from `.env` (see the `AUTO_*`
+block in `.env.example`):
+
+| Variable | What it does |
+|---|---|
+| `AUTO_WALLET_KEYS` | Comma-separated private keys. **Required.** |
+| `AUTO_CHAIN` | Which chain to watch (defaults to `CHAIN`, then `base`). |
+| `AUTO_POLL_MS` | How often to check for new blocks. Default 4000. |
+| `AUTO_MAX_QUANTITY` | Optional cap if you don't want the literal per-wallet max. |
+| `AUTO_MAX_MINTS_PER_RUN` | Optional cap on distinct collections auto-fired before it stops itself. |
+
+Every fire re-reads the drop on-chain immediately before signing — the event
+only proves a stage *was* configured; if the price or window has changed by
+the time it's checked, it skips rather than trusts stale data. `Ctrl+C` stops
+it cleanly and prints how many collections it fired on.
+
+**This is meaningfully riskier than the wizard**, not because "free" mints
+cost ETH — they don't — but because it spends gas automatically, with no
+review, on every SeaDrop drop matching the filter, including low-quality or
+spam collections a human would skip. See Security below before running it.
+
+---
+
 ## Understanding gas
 
 Three different numbers, and mixing them up is the most common way to lose a mint:
@@ -173,6 +214,10 @@ code changes needed.
 
 - Private keys are pasted at run time, kept in memory, and **never written to
   disk or transmitted anywhere** except as a locally-signed transaction.
+  **Exception: auto mode** ([Step 5](#step-5--auto-mode-unattended-free-mint-watcher))
+  has no prompt to paste a key into, so `AUTO_WALLET_KEYS` has to live in
+  `.env` on disk. Use a wallet dedicated to that mode only, funded with just
+  what you're willing to lose to gas on unattended, unreviewed mints.
 - `.env`, `wallets/` and `*.key` are all git-ignored.
 - Use dedicated hot wallets funded with only what you intend to spend.
 - Read [`src/local-mint.ts`](src/local-mint.ts) if you want to verify exactly what

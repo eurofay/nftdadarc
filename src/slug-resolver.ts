@@ -65,3 +65,26 @@ export async function resolveSlug(
 export function isSlug(input: string): boolean {
   return !input.startsWith("0x");
 }
+
+// Best-effort reverse lookup: contract address -> OpenSea collection name.
+// Used only to enrich logs for the auto-mint watcher, never to gate a mint —
+// so any failure (no key, rate limit, unlisted contract) returns null rather
+// than throwing. The on-chain event is always the source of truth.
+export async function openseaContractInfo(
+  chain: string,
+  address: string,
+  apiKey?: string
+): Promise<{ name: string; slug: string } | null> {
+  if (!apiKey) return null;
+  try {
+    const res = await fetch(`https://api.opensea.io/api/v2/chain/${chain}/contract/${address}`, {
+      headers: { accept: "application/json", "x-api-key": apiKey },
+    });
+    if (!res.ok) return null;
+    const json = (await res.json()) as any;
+    if (!json.collection) return null;
+    return { name: json.name || json.collection, slug: json.collection };
+  } catch {
+    return null;
+  }
+}
