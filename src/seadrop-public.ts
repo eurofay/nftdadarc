@@ -10,7 +10,8 @@
 // server-produced signature bound to one wallet, so that path still needs
 // OpenSea and there is no local equivalent.
 
-import { Contract, Interface, JsonRpcProvider } from "ethers";
+import { Contract, Interface } from "ethers";
+import { createProvider } from "./rpc-provider";
 
 export const SEADROP_ADDRESS = "0x00005EA00Ac477B1030CE78506496e8C2dE24bf5";
 
@@ -51,7 +52,7 @@ export async function fetchPublicDrop(
   rpcUrl: string,
   nftContract: string
 ): Promise<PublicDrop | null> {
-  const provider = new JsonRpcProvider(rpcUrl);
+  const provider = createProvider(rpcUrl);
   const seadrop = new Contract(SEADROP_ADDRESS, PUBLIC_ABI, provider);
 
   try {
@@ -81,7 +82,7 @@ export async function resolveFeeRecipient(
   nftContract: string,
   restricted: boolean
 ): Promise<{ address: string; source: string } | null> {
-  const provider = new JsonRpcProvider(rpcUrl);
+  const provider = createProvider(rpcUrl);
   const seadrop = new Contract(SEADROP_ADDRESS, PUBLIC_ABI, provider);
 
   let allowed: string[] = [];

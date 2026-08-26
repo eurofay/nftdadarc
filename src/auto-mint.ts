@@ -11,13 +11,13 @@
 // indexed yet and can't be fed a spoofed sighting. OpenSea is used only as an
 // optional, non-blocking enrichment for readable logs.
 
-import { JsonRpcProvider } from "ethers";
 import { buildLocalMintPlan } from "./seadrop-public";
 import { scanPublicDropUpdates, DropSighting } from "./seadrop-events";
 import { localPublicSnipe } from "./local-mint";
 import { openseaContractInfo } from "./slug-resolver";
 import { ChainProfile } from "./chains";
 import { defaultLogger, Logger } from "./logger";
+import { createProvider } from "./rpc-provider";
 
 export interface AutoMintOpts {
   chain: ChainProfile;
@@ -51,7 +51,7 @@ function isLive(drop: DropSighting["drop"]): boolean {
 export async function runAutoMintWatcher(opts: AutoMintOpts): Promise<void> {
   const { chain, rpcUrls, walletKeys, maxFeePerGas, maxPriorityFee, gasLimit, pollIntervalMs } = opts;
   const log = opts.logger ?? defaultLogger;
-  const provider = new JsonRpcProvider(rpcUrls[0]);
+  const provider = createProvider(rpcUrls[0]);
 
   log.title("\n── AUTO FREE-MINT WATCHER ──");
   log.info(`  Chain:    ${chain.name} (${chain.chainId})`);

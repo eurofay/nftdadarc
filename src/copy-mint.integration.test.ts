@@ -122,7 +122,9 @@ async function setUp(quantityPerWallet: number | undefined) {
     quantityPerWallet,
   });
 
-  await new Promise((r) => setTimeout(r, 400));
+  // Needs enough ticks to clear the 2-block reorg-safety margin the watcher
+  // now applies before it'll even attempt its first scan.
+  await new Promise((r) => setTimeout(r, 1500));
   process.emit("SIGINT" as any);
   await run;
   logSpy.mockRestore();
@@ -131,17 +133,17 @@ async function setUp(quantityPerWallet: number | undefined) {
 }
 
 describe("runCopyMintWatcher quantity cap (regression: was quantityPerWallet ?? max, now Math.min)", () => {
-  it("fills in the drop's smaller max when your chosen cap is higher", async () => {
+  it("fills in the drop's smaller max when your chosen cap is higher", { timeout: 15000 }, async () => {
     const { sentQuantities } = await setUp(10); // chose 10, drop only allows 3
     expect(sentQuantities).toEqual([3n]);
   });
 
-  it("respects your smaller cap when it's under the drop's max", async () => {
+  it("respects your smaller cap when it's under the drop's max", { timeout: 15000 }, async () => {
     const { sentQuantities } = await setUp(2); // chose 2, drop allows 3
     expect(sentQuantities).toEqual([2n]);
   });
 
-  it("uses the drop's true max when no cap is set at all", async () => {
+  it("uses the drop's true max when no cap is set at all", { timeout: 15000 }, async () => {
     const { sentQuantities } = await setUp(undefined);
     expect(sentQuantities).toEqual([3n]);
   });

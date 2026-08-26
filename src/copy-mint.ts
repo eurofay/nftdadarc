@@ -15,9 +15,9 @@
 // mints — so maxPriceEth is the one guardrail against blindly following it
 // into an expensive mint.
 
-import { JsonRpcProvider } from "ethers";
 import { buildLocalMintPlan, decodeMintPublic, SEADROP_ADDRESS } from "./seadrop-public";
 import { localPublicSnipe } from "./local-mint";
+import { createProvider } from "./rpc-provider";
 import { ChainProfile } from "./chains";
 import { defaultLogger, Logger } from "./logger";
 
@@ -40,7 +40,7 @@ export async function scanWatchedMints(
   watchTargets: string[]
 ): Promise<WatchedMint[]> {
   if (fromBlock > toBlock || watchTargets.length === 0) return [];
-  const provider = new JsonRpcProvider(rpcUrl);
+  const provider = createProvider(rpcUrl);
   const targets = new Set(watchTargets.map((a) => a.toLowerCase()));
   const found: WatchedMint[] = [];
 
@@ -92,7 +92,7 @@ export interface CopyMintOpts {
 export async function runCopyMintWatcher(opts: CopyMintOpts): Promise<void> {
   const { chain, rpcUrls, walletKeys, watchTargets, maxFeePerGas, maxPriorityFee, gasLimit, pollIntervalMs } = opts;
   const log = opts.logger ?? defaultLogger;
-  const provider = new JsonRpcProvider(rpcUrls[0]);
+  const provider = createProvider(rpcUrls[0]);
 
   log.title("\n── COPY-MINT WATCHER ──");
   log.info(`  Chain:    ${chain.name} (${chain.chainId})`);
@@ -112,16 +112,22 @@ export async function runCopyMintWatcher(opts: CopyMintOpts): Promise<void> {
     await new Promise((r) => setTimeout(r, pollIntervalMs));
     if (signal.stopped) break;
 
-    const latest = await provider.getBlockNumber();
+    // Same defensive margin as auto-mint.ts: a load-balanced RPC's backend
+    // nodes can briefly disagree on the head, so staying a couple of blocks
+    // behind the reported tip avoids asking a lagging node for a block it
+    // doesn't have yet.
+    const latest = (await provider.getBlockNumber()) - 2;
     if (latest <= lastScanned) continue;
 
     let sightings: WatchedMint[] = [];
     try {
       sightings = await scanWatchedMints(rpcUrls[0], lastScanned + 1, latest, watchTargets);
+      // Only mark this range scanned on success — advancing it on failure
+      // would silently skip it forever despite the "retrying" log below.
+      lastScanned = latest;
     } catch (err: any) {
       log.error(`  ⚠ block scan failed: ${err.message} — retrying next tick`);
     }
-    lastScanned = latest;
 
     for (const sighting of sightings) {
       if (copied.has(sighting.nftContract.toLowerCase())) continue;

@@ -8,9 +8,10 @@
 // TransactionResponse.wait(), which demands a fully-formed receipt object
 // (logsBloom, cumulativeGasUsed, blockHash, ...) from every provider.
 
-import { JsonRpcProvider, Wallet, formatEther, TransactionResponse } from "ethers";
+import { Wallet, formatEther, TransactionResponse } from "ethers";
 import { waitForReceipt } from "./rpc-blast";
 import { defaultLogger, Logger } from "./logger";
+import { createProvider } from "./rpc-provider";
 
 const TRANSFER_GAS_LIMIT = 21_000n;
 
@@ -41,7 +42,7 @@ export function estimateBatchCost(targetCount: number, amountWei: bigint, maxFee
 export async function batchTransfer(opts: BatchTransferOpts): Promise<TransferOutcome[]> {
   const { rpcUrl, sourceKey, targets, amountWei, maxFeePerGas, maxPriorityFee } = opts;
   const log = opts.logger ?? defaultLogger;
-  const provider = new JsonRpcProvider(rpcUrl);
+  const provider = createProvider(rpcUrl);
   const wallet = new Wallet(sourceKey, provider);
 
   log.title("\n── BATCH FUND TRANSFER ──");

@@ -7,7 +7,8 @@
 // Nothing is written to disk: pasted keys live in memory for the run only.
 
 import chalk from "chalk";
-import { JsonRpcProvider, Wallet, formatEther, getAddress, isAddress } from "ethers";
+import { Wallet, formatEther, getAddress, isAddress, JsonRpcProvider } from "ethers";
+import { createProvider } from "./rpc-provider";
 import { CHAINS, ChainProfile, resolveChain } from "./chains";
 import { parseNftLink } from "./nft-link";
 import { resolveSlug } from "./slug-resolver";
@@ -129,7 +130,7 @@ export async function runWizard(): Promise<void> {
   }
 
   // ── 7. Gas ────────────────────────────────────────────────────────────
-  const provider = new JsonRpcProvider(rpcUrls[0]);
+  const provider = createProvider(rpcUrls[0]);
   console.log(chalk.bold.white("\nGas"));
   const baseFeeGwei = await currentBaseFeeGwei(provider);
   if (baseFeeGwei !== null) {

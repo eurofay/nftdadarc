@@ -7,13 +7,14 @@
 // until the API hands over calldata roughly a second after the stage starts.
 
 import { performance } from "perf_hooks";
-import { JsonRpcProvider, Wallet, formatEther } from "ethers";
+import { Wallet, formatEther } from "ethers";
 import { blastToAll, parseRpcEndpoints, prepareBlast, waitForReceipt, PreparedBlast } from "./rpc-blast";
 import { warmConnections } from "./connection-warmer";
 import { waitForMintTime } from "./timer";
 import { explorerTx } from "./chains";
 import { LocalMintPlan } from "./seadrop-public";
 import { defaultLogger, Logger } from "./logger";
+import { createProvider } from "./rpc-provider";
 
 export interface LocalSnipeOpts {
   nftContract: string;
@@ -35,7 +36,7 @@ export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<void> {
   } = opts;
   const log = opts.logger ?? defaultLogger;
 
-  const provider = new JsonRpcProvider(rpcUrls[0]);
+  const provider = createProvider(rpcUrls[0]);
   const endpoints = parseRpcEndpoints(rpcUrls);
   const wallets = walletKeys.map((k) => new Wallet(k, provider));
 

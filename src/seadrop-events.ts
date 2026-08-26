@@ -12,8 +12,9 @@
 // Event signature verified against ProjectOpenSea/seadrop's
 // SeaDropErrorsAndEvents.sol / SeaDropStructs.sol.
 
-import { Interface, JsonRpcProvider } from "ethers";
+import { Interface } from "ethers";
 import { PublicDrop, SEADROP_ADDRESS } from "./seadrop-public";
+import { createProvider } from "./rpc-provider";
 
 const EVENTS_ABI = [
   "event PublicDropUpdated(address indexed nftContract, tuple(uint80 mintPrice, uint48 startTime, uint48 endTime, uint16 maxTotalMintableByWallet, uint16 feeBps, bool restrictFeeRecipients) publicDrop)",
@@ -45,7 +46,7 @@ export async function scanPublicDropUpdates(
   chunkBlocks: number = DEFAULT_CHUNK_BLOCKS
 ): Promise<DropSighting[]> {
   if (fromBlock > toBlock) return [];
-  const provider = new JsonRpcProvider(rpcUrl);
+  const provider = createProvider(rpcUrl);
   const sightings: DropSighting[] = [];
 
   for (let start = fromBlock; start <= toBlock; start += chunkBlocks) {

@@ -7,7 +7,8 @@
 
 import { Telegraf, Markup, Context } from "telegraf";
 import { message } from "telegraf/filters";
-import { isAddress, JsonRpcProvider, formatEther, parseEther } from "ethers";
+import { isAddress, formatEther, parseEther } from "ethers";
+import { createProvider } from "../rpc-provider";
 import { TelegramStore, WalletRecord } from "./store";
 import {
   mainMenu,
@@ -118,7 +119,7 @@ async function previewMint(
   maxFeePerGas: bigint,
   mintValueWei: bigint
 ): Promise<string> {
-  const provider = new JsonRpcProvider(rpcUrl);
+  const provider = createProvider(rpcUrl);
   const lines = await Promise.all(
     wallets.map(async (w) => {
       const balance = await provider.getBalance(w.address).catch(() => null);
@@ -223,7 +224,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
     if (chain && wallets.length > 0) {
       try {
         const { urls } = resolveRpcsForChain(settings.chainKey);
-        const provider = new JsonRpcProvider(urls[0]);
+        const provider = createProvider(urls[0]);
         const results = await Promise.all(
           wallets.map(async (w) => {
             const bal = await provider.getBalance(w.address).catch(() => null);
