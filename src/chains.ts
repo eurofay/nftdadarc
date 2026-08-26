@@ -1,17 +1,16 @@
 // Chain registry — everything chain-specific lives here so adding a new
 // network is a single entry instead of hunting for hardcoded values.
 //
-// `key` is the identifier used in three places, and they must match:
-//   1. the OpenSea GraphQL `chain` field (opensea-api.ts)
-//   2. the `--chain` CLI option
-//   3. the `CHAIN` env var
+// `key` is the identifier used in two places, and they must match:
+//   1. the OpenSea REST v2 `chain` field (slug-resolver.ts)
+//   2. the `CHAIN` env var (also the wizard's chain-picker default)
 //
 // OpenSea confirmed support for Robinhood Chain (opensea.io/discover/chain/robinhood),
 // so the existing OpenSea-based mint flow works on it unchanged — only the RPC
 // (in .env) and the explorer links (resolved here) differ from Base.
 
 export interface ChainProfile {
-  key: string;          // OpenSea id + --chain value + CHAIN env value
+  key: string;          // OpenSea REST v2 chain id + CHAIN env value
   chainId: number;      // EVM network chain id
   name: string;         // human label
   explorer: string;     // block explorer base URL, NO trailing slash
@@ -74,7 +73,7 @@ export const CHAINS: ChainProfile[] = [
 const DEFAULT_EXPLORER = "https://basescan.org";
 
 // Resolve a chain by its numeric chainId (from the live network) or by its
-// string key (--chain / CHAIN). Returns undefined for unknown chains.
+// string key (the wizard's picker, or CHAIN). Returns undefined for unknown chains.
 export function resolveChain(
   idOrKey: string | number | bigint | null | undefined
 ): ChainProfile | undefined {
