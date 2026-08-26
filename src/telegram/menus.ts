@@ -53,6 +53,7 @@ export function settingsMenu(s: BotSettings) {
     [Markup.button.callback(`Gas limit: ${s.gasLimit}`, "setting:gasLimit")],
     [Markup.button.callback(`Auto max qty: ${s.autoMaxQuantity ?? "unlimited (true max)"}`, "setting:autoMaxQuantity")],
     [Markup.button.callback(`Copy-mint price cap: ${s.copyMintMaxPriceEth} ETH`, "setting:copyMintMaxPriceEth")],
+    [Markup.button.callback(`Copy-mint max qty: ${s.copyMintMaxQuantity ?? "unlimited (true max)"}`, "setting:copyMintMaxQuantity")],
     [Markup.button.callback("⬅ Back", "menu:main")],
   ]);
 }

@@ -37,6 +37,11 @@ export interface BotSettings {
   // Copy-mint isn't restricted to free drops, so this is the one guardrail
   // against blindly following a watched wallet into an expensive mint.
   copyMintMaxPriceEth: number;
+  // Caps quantity per wallet the same way autoMaxQuantity does for Auto
+  // Mint — capped at whichever is smaller, this or the drop's own max, so
+  // a huge per-wallet allowance (e.g. 4000) doesn't burn far more gas than
+  // intended just because nothing here says otherwise.
+  copyMintMaxQuantity?: number;
 }
 
 interface StoreData {

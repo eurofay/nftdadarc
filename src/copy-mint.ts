@@ -142,7 +142,13 @@ export async function runCopyMintWatcher(opts: CopyMintOpts): Promise<void> {
         continue;
       }
 
-      const quantity = opts.quantityPerWallet ?? drop.drop.maxTotalMintableByWallet;
+      // Cap at whichever is smaller — the drop's own per-wallet max, or your
+      // chosen cap. Using quantityPerWallet outright when it's above the
+      // drop's real max would revert on-chain (SeaDrop enforces that limit
+      // itself) instead of just minting what's actually available.
+      const quantity = opts.quantityPerWallet
+        ? Math.min(drop.drop.maxTotalMintableByWallet, opts.quantityPerWallet)
+        : drop.drop.maxTotalMintableByWallet;
       const plan = await buildLocalMintPlan(rpcUrls[0], sighting.nftContract, quantity);
       if (!plan) {
         log.error("     ✗ Skipped — drop no longer resolvable at the intended quantity.");

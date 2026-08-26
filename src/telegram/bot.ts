@@ -223,6 +223,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
         gasLimit: settings.gasLimit,
         pollIntervalMs: 4000,
         maxPriceEth: settings.copyMintMaxPriceEth,
+        quantityPerWallet: settings.copyMintMaxQuantity,
         logger,
         stopSignal,
       }).catch((err) => logger.errorBold(`Copy-mint watcher crashed: ${err.message}`));
@@ -414,11 +415,21 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
     );
   });
 
-  const NUMERIC_SETTINGS = ["maxFeeGwei", "priorityGwei", "gasLimit", "autoMaxQuantity", "copyMintMaxPriceEth"] as const;
+  const NUMERIC_SETTINGS = [
+    "maxFeeGwei",
+    "priorityGwei",
+    "gasLimit",
+    "autoMaxQuantity",
+    "copyMintMaxPriceEth",
+    "copyMintMaxQuantity",
+  ] as const;
+  // Both quantity caps are optional — clearable back to "unlimited" (the
+  // drop's own true max-per-wallet) rather than needing some magic number.
+  const CLEARABLE = new Set(["autoMaxQuantity", "copyMintMaxQuantity"]);
   for (const field of NUMERIC_SETTINGS) {
     bot.action(`setting:${field}`, (ctx) => {
       ctx.session.step = `awaiting_setting:${field}`;
-      return ctx.reply(`Send the new value for ${field}${field === "autoMaxQuantity" ? " (or \"clear\" for unlimited)" : ""}:`);
+      return ctx.reply(`Send the new value for ${field}${CLEARABLE.has(field) ? " (or \"clear\" for unlimited)" : ""}:`);
     });
   }
 
@@ -531,9 +542,13 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
       ctx.session.step = undefined;
       const raw = ctx.message.text.trim();
 
-      if (field === "autoMaxQuantity" && raw.toLowerCase() === "clear") {
-        store.updateSettings({ autoMaxQuantity: undefined });
-        return ctx.reply("Cleared — auto mint will use each drop's true max per wallet.");
+      if (CLEARABLE.has(field) && raw.toLowerCase() === "clear") {
+        store.updateSettings({ [field]: undefined } as any);
+        return ctx.reply(
+          field === "autoMaxQuantity"
+            ? "Cleared — auto mint will use each drop's true max per wallet."
+            : "Cleared — copy mint will use each drop's true max per wallet."
+        );
       }
 
       const value = Number(raw);

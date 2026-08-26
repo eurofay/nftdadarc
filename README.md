@@ -183,11 +183,19 @@ from Telegram instead of a terminal:
 - **Copy mint** — watch one or more wallets, and copy any `mintPublic` call
   they make using your own wallets. Unlike auto mode this isn't restricted to
   free drops (the point is following a wallet's judgment, paid or not), so a
-  `copyMintMaxPriceEth` cap in Settings is the one guardrail against blindly
+  `copyMintMaxPriceEth` cap in Settings is one guardrail against blindly
   following it into an expensive mint. It never replays the watched wallet's
   raw transaction — it treats their mint as a signal, then independently
   rebuilds the plan from fresh on-chain state via the same `buildLocalMintPlan`
   everything else uses.
+- **Quantity caps** — "free" still costs gas, and gas scales with how many
+  tokens you mint (a drop's stated per-wallet max can be huge — 4000+ isn't
+  unusual). Settings has a max-quantity cap for both **Auto max qty** (Auto
+  Mint) and **Copy-mint max qty** (Copy Mint): set either to a number and
+  every mint uses whichever is smaller — your cap, or the drop's real max —
+  so a drop allowing only 3 still mints 3 even if your cap is 10, and a
+  drop allowing 4000 mints only your cap. Leave it blank/"clear" it for
+  "unlimited" (the drop's true max, no cap at all).
 - **Fund Wallets** — batch-send native currency from one wallet you pick to
   several others you've already added, e.g. topping up sniper wallets before
   a multi-wallet mint. Pick the source, multi-select targets, enter an amount
