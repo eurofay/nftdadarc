@@ -181,7 +181,11 @@ from Telegram instead of a terminal:
   on-chain start time, or a custom `HH:MM` IST. Confirms before doing
   anything. Once confirmed it pre-signs and waits internally exactly like
   the CLI's "wait for stage," so the bot stays fully responsive to
-  everything else while it waits.
+  everything else while it waits. At the confirm step, **🧪 Dry Run** checks
+  the drop still resolves and shows every selected wallet's balance against
+  what it actually needs (`gasLimit × maxFee + mint value` — what a node
+  reserves upfront, not what's actually spent) — without signing or sending
+  anything. `/mint` takes the same `--dry` flag.
 - **Auto mint** — start/stop the [free-mint watcher](#step-5--auto-mode-unattended-free-mint-watcher)
   from a button instead of a terminal flag. Settings → **Auto-mint chains** lets
   you multi-select several chains to watch at once (e.g. Robinhood + Ethereum

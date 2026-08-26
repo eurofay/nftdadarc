@@ -94,6 +94,43 @@ export function matchWallets(wallets: WalletRecord[], filter: string): WalletRec
   return matched;
 }
 
+// A node reserves gasLimit × maxFee + the mint's own value upfront and
+// rejects the tx outright if a wallet falls short — regardless of the far
+// smaller amount actually spent. Same formula the CLI wizard already uses.
+export function checkAffordability(
+  balanceWei: bigint | null,
+  gasLimit: number,
+  maxFeePerGas: bigint,
+  mintValueWei: bigint
+): { requiredWei: bigint; affordable: boolean | null } {
+  const requiredWei = BigInt(gasLimit) * maxFeePerGas + mintValueWei;
+  return { requiredWei, affordable: balanceWei === null ? null : balanceWei >= requiredWei };
+}
+
+// Shared by /mint's --dry flag and Scheduled Mint's Dry Run button: resolves
+// balances and affordability for the selected wallets without ever signing
+// or broadcasting anything.
+async function previewMint(
+  rpcUrl: string,
+  symbol: string,
+  wallets: WalletRecord[],
+  gasLimit: number,
+  maxFeePerGas: bigint,
+  mintValueWei: bigint
+): Promise<string> {
+  const provider = new JsonRpcProvider(rpcUrl);
+  const lines = await Promise.all(
+    wallets.map(async (w) => {
+      const balance = await provider.getBalance(w.address).catch(() => null);
+      const { requiredWei, affordable } = checkAffordability(balance, gasLimit, maxFeePerGas, mintValueWei);
+      const balStr = balance === null ? "balance unavailable" : `${formatEther(balance)} ${symbol}`;
+      const mark = affordable === null ? "?" : affordable ? "✓" : `✗ needs ${formatEther(requiredWei)} ${symbol}`;
+      return `  ${w.label}: ${balStr} ${mark}`;
+    })
+  );
+  return lines.join("\n");
+}
+
 // Serializes sends to one chat with a small gap between them, so a burst of
 // headline events (a mint firing, then its result) can't trip Telegram's
 // flood limits the way blasting every line unthrottled would.
@@ -482,11 +519,13 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
   // confirmation, so it's the fastest thing this bot can do for a
   // genuinely contested public stage.
   bot.command("mint", async (ctx) => {
-    const args = ctx.message.text.split(/\s+/).slice(1);
+    const rawArgs = ctx.message.text.split(/\s+/).slice(1);
+    const dryRun = rawArgs.includes("--dry");
+    const args = rawArgs.filter((a) => a !== "--dry");
     const [link, qtyRaw, walletFilter] = args;
     const requestedQuantity = parseInt(qtyRaw ?? "1", 10);
     if (!link || !Number.isFinite(requestedQuantity) || requestedQuantity <= 0) {
-      return ctx.reply("Usage: /mint <contract address, OpenSea link, or slug> <quantity> [wallet label(s)]");
+      return ctx.reply("Usage: /mint <contract address, OpenSea link, or slug> <quantity> [wallet label(s)] [--dry]");
     }
 
     const allWallets = store.listWallets();
@@ -515,6 +554,24 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
 
       const plan = await buildLocalMintPlan(urls[0], contract, quantity);
       if (!plan) return ctx.reply("No public drop found for that contract on the configured chain.");
+
+      if (dryRun) {
+        const chain = resolveChain(settings.chainKey)!;
+        const perWallet = await previewMint(
+          urls[0],
+          chain.nativeSymbol,
+          wallets,
+          settings.gasLimit,
+          gweiToWei(settings.maxFeeGwei),
+          plan.value
+        );
+        return ctx.reply(
+          `🧪 DRY RUN — nothing was signed or sent.\n` +
+            `${contract}\n` +
+            `Price: ${formatEther(plan.drop.mintPrice)} × ${quantity} = ${formatEther(plan.value)} ${chain.nativeSymbol} per wallet\n\n` +
+            perWallet
+        );
+      }
 
       await localPublicSnipe({
         nftContract: contract,
@@ -656,6 +713,42 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
     const at = ctx.session.schedTargetStartMs;
     if (!at) return ctx.answerCbQuery("That request expired — start over from Scheduled Mint.", { show_alert: true });
     return fireScheduled(ctx, at === "now" ? null : new Date(at));
+  });
+
+  // Validates everything (drop still resolvable, wallet balances) without
+  // ever signing or broadcasting — session stays intact, so Confirm/Cancel
+  // still work exactly as before right after.
+  bot.action("sched:dryrun", async (ctx) => {
+    const { schedContract, schedWallets, schedQuantity } = ctx.session;
+    if (!schedContract || !schedWallets?.length || !schedQuantity) {
+      return ctx.answerCbQuery("That request expired — start over from Scheduled Mint.", { show_alert: true });
+    }
+    await ctx.answerCbQuery("Checking...");
+    const settings = store.getSettings();
+    const chain = resolveChain(settings.chainKey)!;
+    const { urls } = resolveRpcsForChain(settings.chainKey);
+    try {
+      const plan = await buildLocalMintPlan(urls[0], schedContract, schedQuantity);
+      if (!plan) return ctx.reply("🧪 DRY RUN: drop is not currently resolvable on-chain — a real fire would fail.");
+
+      const wallets = store.listWallets().filter((w) => schedWallets.includes(w.address.toLowerCase()));
+      const perWallet = await previewMint(
+        urls[0],
+        chain.nativeSymbol,
+        wallets,
+        settings.gasLimit,
+        gweiToWei(settings.maxFeeGwei),
+        plan.value
+      );
+      await ctx.reply(
+        `🧪 DRY RUN — nothing was signed or sent.\n` +
+          `${schedContract}\n` +
+          `Price: ${formatEther(plan.drop.mintPrice)} × ${schedQuantity} = ${formatEther(plan.value)} ${chain.nativeSymbol} per wallet\n\n` +
+          perWallet
+      );
+    } catch (err: any) {
+      await ctx.reply(`❌ ${err.message}`);
+    }
   });
 
   // ── Text handler: services whatever multi-step flow is in progress ───

@@ -137,6 +137,7 @@ export function schedTimingMenu(startsInFuture: boolean) {
 
 export function schedConfirmMenu() {
   return Markup.inlineKeyboard([
+    [Markup.button.callback("🧪 Dry Run", "sched:dryrun")],
     [Markup.button.callback("✅ Confirm", "sched:confirm"), Markup.button.callback("❌ Cancel", "sched:cancel")],
   ]);
 }
