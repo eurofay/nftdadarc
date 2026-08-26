@@ -56,3 +56,23 @@ export function createLogger(sink?: LogSink): Logger {
 }
 
 export const defaultLogger: Logger = createLogger();
+
+// Prefixes every line with a label — e.g. running --auto against several
+// chains at once in one process, where interleaved output would otherwise
+// be unreadable without saying which chain each line is about.
+export function withPrefix(label: string, base: Logger = defaultLogger): Logger {
+  const wrap = (fn: (msg: string) => void) => (msg: string) => fn(`[${label}] ${msg}`);
+  return {
+    raw: wrap(base.raw),
+    title: wrap(base.title),
+    info: wrap(base.info),
+    success: wrap(base.success),
+    successBold: wrap(base.successBold),
+    warn: wrap(base.warn),
+    warnBold: wrap(base.warnBold),
+    error: wrap(base.error),
+    errorBold: wrap(base.errorBold),
+    highlight: wrap(base.highlight),
+    done: wrap(base.done),
+  };
+}

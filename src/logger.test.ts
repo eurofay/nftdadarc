@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { createLogger } from "./logger";
+import { createLogger, withPrefix } from "./logger";
 
 describe("createLogger", () => {
   afterEach(() => {
@@ -61,5 +61,43 @@ describe("createLogger", () => {
     log.errorBold("plain text");
     expect(forwarded[0]).toBe("plain text");
     expect(forwarded[0]).not.toMatch(/\x1b\[/);
+  });
+});
+
+describe("withPrefix", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("prepends the label to every method's output", () => {
+    const forwarded: string[] = [];
+    const base = createLogger((msg) => forwarded.push(msg));
+    const log = withPrefix("robinhood", base);
+
+    log.title("watching");
+    log.errorBold("failed");
+    log.done("stopped");
+
+    expect(forwarded).toEqual(["[robinhood] watching", "[robinhood] failed", "[robinhood] stopped"]);
+  });
+
+  it("keeps the quiet tiers quiet — prefixing doesn't change what's forwarded", () => {
+    const forwarded: string[] = [];
+    const base = createLogger((msg) => forwarded.push(msg));
+    const log = withPrefix("ethereum", base);
+
+    log.info("routine");
+    log.highlight("routine sighting");
+
+    expect(forwarded).toEqual([]);
+  });
+
+  it("distinguishes concurrent chains printing to the same console", () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    withPrefix("robinhood").title("running");
+    withPrefix("ethereum").title("running");
+
+    expect(logSpy.mock.calls[0][0]).toContain("[robinhood]");
+    expect(logSpy.mock.calls[1][0]).toContain("[ethereum]");
   });
 });
