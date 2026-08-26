@@ -12,7 +12,7 @@ export function mainMenu() {
   return Markup.inlineKeyboard([
     [Markup.button.callback("💼 Wallets", "menu:wallets"), Markup.button.callback("⚙️ Settings", "menu:settings")],
     [Markup.button.callback("🎯 Auto Mint", "menu:auto"), Markup.button.callback("👀 Copy Mint", "menu:copy")],
-    [Markup.button.callback("📊 Status", "menu:status")],
+    [Markup.button.callback("💸 Fund Wallets", "menu:fund"), Markup.button.callback("📊 Status", "menu:status")],
   ]);
 }
 
@@ -58,4 +58,36 @@ export function chainPickerMenu() {
   return Markup.inlineKeyboard(CHAINS.map((c) => [Markup.button.callback(c.name, `setting:chain:${c.key}`)]).concat([
     [Markup.button.callback("⬅ Back", "menu:settings")],
   ]));
+}
+
+// Pick the ONE wallet to send from.
+export function fundSourceMenu(wallets: WalletRecord[]) {
+  const rows = wallets.map((w) => [
+    Markup.button.callback(`${w.label} (${maskAddress(w.address)})`, `fund:source:${w.address}`),
+  ]);
+  rows.push([Markup.button.callback("⬅ Back", "menu:main")]);
+  return Markup.inlineKeyboard(rows);
+}
+
+// Multi-select targets, excluding whichever wallet is the source. Selected
+// ones show a checkmark; tapping toggles membership.
+export function fundTargetsMenu(candidates: WalletRecord[], selected: Set<string>) {
+  const rows = candidates.map((w) => {
+    const checked = selected.has(w.address.toLowerCase());
+    return [
+      Markup.button.callback(
+        `${checked ? "✅" : "⬜"} ${w.label} (${maskAddress(w.address)})`,
+        `fund:target:toggle:${w.address}`
+      ),
+    ];
+  });
+  rows.push([Markup.button.callback(`➡️ Done (${selected.size} selected)`, "fund:targets:done")]);
+  rows.push([Markup.button.callback("❌ Cancel", "fund:cancel")]);
+  return Markup.inlineKeyboard(rows);
+}
+
+export function fundConfirmMenu() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback("✅ Confirm", "fund:confirm"), Markup.button.callback("❌ Cancel", "fund:cancel")],
+  ]);
 }

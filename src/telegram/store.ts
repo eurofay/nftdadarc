@@ -111,6 +111,12 @@ export class TelegramStore {
     return this.data.wallets.map((w) => decrypt(w.encryptedKey, this.passphrase));
   }
 
+  getDecryptedKey(address: string): string {
+    const record = this.data.wallets.find((w) => w.address.toLowerCase() === address.toLowerCase());
+    if (!record) throw new Error(`No wallet stored for ${address}.`);
+    return decrypt(record.encryptedKey, this.passphrase);
+  }
+
   // ── Copy-mint watchlist ──────────────────────────────────────────────
   addCopyTarget(label: string, address: string): CopyTarget {
     if (this.data.copyTargets.some((t) => t.address.toLowerCase() === address.toLowerCase())) {

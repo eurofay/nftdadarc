@@ -7,9 +7,20 @@
 
 import { Telegraf, Markup, Context } from "telegraf";
 import { message } from "telegraf/filters";
-import { isAddress, JsonRpcProvider, formatEther } from "ethers";
+import { isAddress, JsonRpcProvider, formatEther, parseEther } from "ethers";
 import { TelegramStore } from "./store";
-import { mainMenu, walletsMenu, copyMenu, autoMenu, settingsMenu, chainPickerMenu, maskAddress } from "./menus";
+import {
+  mainMenu,
+  walletsMenu,
+  copyMenu,
+  autoMenu,
+  settingsMenu,
+  chainPickerMenu,
+  fundSourceMenu,
+  fundTargetsMenu,
+  fundConfirmMenu,
+  maskAddress,
+} from "./menus";
 import { resolveChain } from "../chains";
 import { resolveRpcsForChain } from "../rpc-resolver";
 import { parseNftLink } from "../nft-link";
@@ -18,10 +29,14 @@ import { buildLocalMintPlan } from "../seadrop-public";
 import { localPublicSnipe } from "../local-mint";
 import { runAutoMintWatcher } from "../auto-mint";
 import { runCopyMintWatcher } from "../copy-mint";
+import { batchTransfer, estimateBatchCost } from "../fund-transfer";
 import { createLogger, LogSink } from "../logger";
 
 interface SessionData {
-  step?: "awaiting_wallet_key" | "awaiting_copy_target" | `awaiting_setting:${string}`;
+  step?: "awaiting_wallet_key" | "awaiting_copy_target" | "awaiting_fund_amount" | `awaiting_setting:${string}`;
+  fundSource?: string;
+  fundTargets?: string[]; // lowercased addresses
+  fundAmountWei?: string; // bigint as string — kept out of the type so session stays plain-JSON-shaped
 }
 interface BotContext extends Context {
   session: SessionData;
@@ -106,6 +121,18 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
       copyMenu(runningCopy !== null, store.listCopyTargets())
     )
   );
+
+  bot.action("menu:fund", (ctx) => {
+    const wallets = store.listWallets();
+    if (wallets.length < 2) {
+      return ctx.answerCbQuery("Add at least two wallets first — one to send from, one to receive.", {
+        show_alert: true,
+      });
+    }
+    ctx.session.fundSource = undefined;
+    ctx.session.fundTargets = undefined;
+    return ctx.editMessageText("Send FROM which wallet?", fundSourceMenu(wallets));
+  });
 
   bot.action("menu:status", async (ctx) => {
     const settings = store.getSettings();
@@ -244,6 +271,76 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
     );
   });
 
+  // ── Fund wallets: send native currency from one wallet to several ─────
+  bot.action(/^fund:source:(.+)$/, (ctx) => {
+    const source = ctx.match[1];
+    ctx.session.fundSource = source;
+    ctx.session.fundTargets = [];
+    const candidates = store.listWallets().filter((w) => w.address.toLowerCase() !== source.toLowerCase());
+    return ctx.editMessageText("Send TO which wallet(s)? Tap to select, then Done.", fundTargetsMenu(candidates, new Set()));
+  });
+
+  bot.action(/^fund:target:toggle:(.+)$/, (ctx) => {
+    const address = ctx.match[1].toLowerCase();
+    const targets = new Set(ctx.session.fundTargets ?? []);
+    if (targets.has(address)) targets.delete(address);
+    else targets.add(address);
+    ctx.session.fundTargets = [...targets];
+
+    const candidates = store
+      .listWallets()
+      .filter((w) => w.address.toLowerCase() !== (ctx.session.fundSource ?? "").toLowerCase());
+    return ctx.editMessageText("Send TO which wallet(s)? Tap to select, then Done.", fundTargetsMenu(candidates, targets));
+  });
+
+  bot.action("fund:targets:done", (ctx) => {
+    if (!ctx.session.fundTargets || ctx.session.fundTargets.length === 0) {
+      return ctx.answerCbQuery("Select at least one wallet.", { show_alert: true });
+    }
+    const settings = store.getSettings();
+    const chain = resolveChain(settings.chainKey)!;
+    ctx.session.step = "awaiting_fund_amount";
+    return ctx.reply(`How much ${chain.nativeSymbol} to send to EACH of the ${ctx.session.fundTargets.length} selected wallet(s)?`);
+  });
+
+  bot.action("fund:cancel", (ctx) => {
+    ctx.session.step = undefined;
+    ctx.session.fundSource = undefined;
+    ctx.session.fundTargets = undefined;
+    ctx.session.fundAmountWei = undefined;
+    return ctx.editMessageText("Cancelled.", mainMenu());
+  });
+
+  bot.action("fund:confirm", async (ctx) => {
+    const { fundSource, fundTargets, fundAmountWei } = ctx.session;
+    if (!fundSource || !fundTargets?.length || !fundAmountWei) {
+      return ctx.answerCbQuery("That request expired — start over from Fund Wallets.", { show_alert: true });
+    }
+    ctx.session.step = undefined;
+    ctx.session.fundSource = undefined;
+    ctx.session.fundTargets = undefined;
+    ctx.session.fundAmountWei = undefined;
+    await ctx.answerCbQuery("Sending...");
+    await ctx.editMessageText("Sending — status below.");
+
+    const settings = store.getSettings();
+    const { urls } = resolveRpcsForChain(settings.chainKey);
+    const logger = createLogger(createTelegramSink(bot, ctx.chat!.id));
+    try {
+      await batchTransfer({
+        rpcUrl: urls[0],
+        sourceKey: store.getDecryptedKey(fundSource),
+        targets: fundTargets,
+        amountWei: BigInt(fundAmountWei),
+        maxFeePerGas: gweiToWei(settings.maxFeeGwei),
+        maxPriorityFee: gweiToWei(settings.priorityGwei),
+        logger,
+      });
+    } catch (err: any) {
+      logger.errorBold(`Batch transfer failed: ${err.message}`);
+    }
+  });
+
   // ── Settings ─────────────────────────────────────────────────────────
   bot.action("setting:chain", (ctx) => ctx.editMessageText("Pick a chain:", chainPickerMenu()));
   bot.action(/^setting:chain:(.+)$/, (ctx) => {
@@ -335,6 +432,32 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
         await ctx.reply(`❌ ${err.message}`);
       }
       return;
+    }
+
+    if (step === "awaiting_fund_amount") {
+      ctx.session.step = undefined;
+      const targets = ctx.session.fundTargets ?? [];
+      const source = ctx.session.fundSource;
+      if (!source || targets.length === 0) return ctx.reply("That request expired — start over from Fund Wallets.");
+
+      let amountWei: bigint;
+      try {
+        amountWei = parseEther(ctx.message.text.trim());
+        if (amountWei <= 0n) throw new Error("must be greater than 0");
+      } catch {
+        return ctx.reply("That's not a valid amount. Send a plain number, e.g. 0.01");
+      }
+      ctx.session.fundAmountWei = amountWei.toString();
+
+      const settings = store.getSettings();
+      const chain = resolveChain(settings.chainKey)!;
+      const worstCase = estimateBatchCost(targets.length, amountWei, gweiToWei(settings.maxFeeGwei));
+      const sourceLabel = store.listWallets().find((w) => w.address.toLowerCase() === source.toLowerCase())?.label ?? source;
+      return ctx.reply(
+        `Send ${formatEther(amountWei)} ${chain.nativeSymbol} from ${sourceLabel} to ${targets.length} wallet(s)?\n` +
+          `Worst-case total (including gas): ${formatEther(worstCase)} ${chain.nativeSymbol}`,
+        fundConfirmMenu()
+      );
     }
 
     if (step.startsWith("awaiting_setting:")) {

@@ -51,6 +51,19 @@ describe("TelegramStore wallets", () => {
     expect(decrypted).toContain(TEST_KEY_2);
   });
 
+  it("decrypts a single wallet's key by address", () => {
+    const store = freshStore();
+    const rec = store.addWallet("a", TEST_KEY_1);
+    store.addWallet("b", TEST_KEY_2);
+    expect(store.getDecryptedKey(rec.address)).toBe(TEST_KEY_1);
+    expect(store.getDecryptedKey(rec.address.toUpperCase())).toBe(TEST_KEY_1); // case-insensitive
+  });
+
+  it("throws for an address with no stored wallet", () => {
+    const store = freshStore();
+    expect(() => store.getDecryptedKey("0x000000000000000000000000000000000000ff")).toThrow();
+  });
+
   it("never stores the plaintext key in the persisted record", () => {
     const store = freshStore();
     store.addWallet("main", TEST_KEY_1);

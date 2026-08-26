@@ -179,6 +179,12 @@ from Telegram instead of a terminal:
   raw transaction — it treats their mint as a signal, then independently
   rebuilds the plan from fresh on-chain state via the same `buildLocalMintPlan`
   everything else uses.
+- **Fund Wallets** — batch-send native currency from one wallet you pick to
+  several others you've already added, e.g. topping up sniper wallets before
+  a multi-wallet mint. Pick the source, multi-select targets, enter an amount
+  per wallet, confirm — unlike auto/copy mint this always asks for
+  confirmation first, since it's a deliberate one-off action rather than
+  something time-critical.
 
 **Setup** (see the `TELEGRAM_*` / `WALLET_ENCRYPTION_KEY` block in
 `.env.example`): create a bot with [@BotFather](https://t.me/BotFather), get
