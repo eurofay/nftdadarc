@@ -277,37 +277,54 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
     return ctx.editMessageText("Copy-mint watchlist:", copyMenu(runningCopy !== null, store.listCopyTargets()));
   });
 
+  // Pulled out of the toggle action so start-up can resume it too, without a
+  // tap, whenever settings.copyMintEnabled says it was left running — same
+  // pattern as Auto Mint's startAuto/stopAuto below.
+  function startCopy(chatId: number): { ok: true } | { ok: false; reason: string } {
+    if (runningCopy) return { ok: true }; // already running
+    const targets = store.listCopyTargets();
+    const wallets = store.listWallets();
+    if (targets.length === 0) return { ok: false, reason: "Add a wallet to watch first." };
+    if (wallets.length === 0) return { ok: false, reason: "Add a wallet to mint from first." };
+
+    const settings = store.getSettings();
+    const chain = resolveChain(settings.chainKey)!;
+    const { urls } = resolveRpcsForChain(settings.chainKey);
+    const stopSignal = { stopped: false };
+    const logger = createLogger(createTelegramSink(bot, chatId));
+    const promise = runCopyMintWatcher({
+      chain,
+      rpcUrls: urls,
+      walletKeys: store.getDecryptedKeys(),
+      watchTargets: targets.map((t) => t.address),
+      maxFeePerGas: gweiToWei(settings.maxFeeGwei),
+      maxPriorityFee: gweiToWei(settings.priorityGwei),
+      gasLimit: settings.gasLimit,
+      pollIntervalMs: 4000,
+      maxPriceEth: settings.copyMintMaxPriceEth,
+      quantityPerWallet: settings.copyMintMaxQuantity,
+      logger,
+      stopSignal,
+    }).catch((err) => logger.errorBold(`Copy-mint watcher crashed: ${err.message}`));
+    runningCopy = { stopSignal, promise };
+    store.updateSettings({ copyMintEnabled: true });
+    return { ok: true };
+  }
+
+  function stopCopy(): void {
+    if (!runningCopy) return;
+    runningCopy.stopSignal.stopped = true;
+    runningCopy = null;
+    store.updateSettings({ copyMintEnabled: false });
+  }
+
   bot.action("copy:toggle", async (ctx) => {
     if (runningCopy) {
-      runningCopy.stopSignal.stopped = true;
-      runningCopy = null;
+      stopCopy();
       await ctx.answerCbQuery("Stopping...");
     } else {
-      const targets = store.listCopyTargets();
-      const wallets = store.listWallets();
-      const settings = store.getSettings();
-      if (targets.length === 0) return ctx.answerCbQuery("Add a wallet to watch first.", { show_alert: true });
-      if (wallets.length === 0) return ctx.answerCbQuery("Add a wallet to mint from first.", { show_alert: true });
-
-      const chain = resolveChain(settings.chainKey)!;
-      const { urls } = resolveRpcsForChain(settings.chainKey);
-      const stopSignal = { stopped: false };
-      const logger = createLogger(createTelegramSink(bot, ctx.chat!.id));
-      const promise = runCopyMintWatcher({
-        chain,
-        rpcUrls: urls,
-        walletKeys: store.getDecryptedKeys(),
-        watchTargets: targets.map((t) => t.address),
-        maxFeePerGas: gweiToWei(settings.maxFeeGwei),
-        maxPriorityFee: gweiToWei(settings.priorityGwei),
-        gasLimit: settings.gasLimit,
-        pollIntervalMs: 4000,
-        maxPriceEth: settings.copyMintMaxPriceEth,
-        quantityPerWallet: settings.copyMintMaxQuantity,
-        logger,
-        stopSignal,
-      }).catch((err) => logger.errorBold(`Copy-mint watcher crashed: ${err.message}`));
-      runningCopy = { stopSignal, promise };
+      const result = startCopy(ctx.chat!.id);
+      if (!result.ok) return ctx.answerCbQuery(result.reason, { show_alert: true });
       await ctx.answerCbQuery("Started.");
     }
     return ctx.editMessageText(
@@ -315,6 +332,24 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
       copyMenu(runningCopy !== null, store.listCopyTargets())
     );
   });
+
+  // Resume automatically on every bot start if it was left "on" — same
+  // reasoning as Auto Mint: a restart shouldn't silently turn this off
+  // until someone notices and taps the button again. Never let this stop
+  // the bot itself from starting.
+  if (store.getSettings().copyMintEnabled) {
+    try {
+      const result = startCopy(ownerId);
+      if (result.ok) {
+        bot.telegram.sendMessage(ownerId, "🟢 Copy-mint watcher resumed (was on before restart).").catch(() => {});
+      } else {
+        store.updateSettings({ copyMintEnabled: false });
+      }
+    } catch (err: any) {
+      store.updateSettings({ copyMintEnabled: false });
+      console.error(`Could not resume copy-mint on startup: ${err.message}`);
+    }
+  }
 
   // ── Auto free-mint watcher ───────────────────────────────────────────
   // Pulled out of the toggle action so start-up can resume it too, without

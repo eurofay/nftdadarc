@@ -204,7 +204,8 @@ from Telegram instead of a terminal:
   following it into an expensive mint. It never replays the watched wallet's
   raw transaction — it treats their mint as a signal, then independently
   rebuilds the plan from fresh on-chain state via the same `buildLocalMintPlan`
-  everything else uses.
+  everything else uses. Persistent the same way Auto Mint is: turning it on
+  survives a bot restart and resumes automatically, no tap needed.
 - **Quantity caps** — "free" still costs gas, and gas scales with how many
   tokens you mint (a drop's stated per-wallet max can be huge — 4000+ isn't
   unusual). Settings has a max-quantity cap for both **Auto max qty** (Auto
