@@ -17,7 +17,7 @@ import { localPublicSnipe } from "./local-mint";
 import { openseaContractInfo } from "./slug-resolver";
 import { ChainProfile } from "./chains";
 import { defaultLogger, Logger } from "./logger";
-import { createProvider } from "./rpc-provider";
+import { backoffMs, createProvider } from "./rpc-provider";
 
 export interface AutoMintOpts {
   chain: ChainProfile;
@@ -64,7 +64,11 @@ export async function runAutoMintWatcher(opts: AutoMintOpts): Promise<void> {
 
   const candidates = new Map<string, DropSighting["drop"]>();
   const fired = new Set<string>();
-  let lastScanned = await provider.getBlockNumber();
+  // Established on the first successful poll rather than up front, so a
+  // failure reading the chain head is handled by the loop's own retry/backoff
+  // instead of throwing before the watcher has even started.
+  let lastScanned: number | null = null;
+  let consecutiveFailures = 0;
   let firedCount = 0;
 
   // Promise.race would only stop *awaiting* the loop, not the loop itself —
@@ -78,54 +82,76 @@ export async function runAutoMintWatcher(opts: AutoMintOpts): Promise<void> {
   });
 
   while (!signal.stopped) {
-    await new Promise((r) => setTimeout(r, pollIntervalMs));
+    await new Promise((r) => setTimeout(r, backoffMs(pollIntervalMs, consecutiveFailures)));
     if (signal.stopped) break;
 
-    // A load-balanced RPC's backend nodes can briefly disagree on the head —
-    // one reports a new block before another has caught up, and the second
-    // rejects eth_getLogs up to that block as "beyond current head". Staying
-    // a couple of blocks behind the reported tip avoids racing that lag.
-    const REORG_SAFETY_BLOCKS = 2;
-    const latest = (await provider.getBlockNumber()) - REORG_SAFETY_BLOCKS;
-    if (latest > lastScanned) {
-      let sightings: DropSighting[] = [];
-      try {
-        sightings = await scanPublicDropUpdates(rpcUrls[0], lastScanned + 1, latest, opts.logChunkBlocks);
-        // Only mark this range scanned on success — advancing it on failure
-        // would silently skip it forever despite the "retrying" log below.
+    // Everything below is wrapped: a transient RPC failure anywhere in a poll
+    // must never escape and kill the watcher. Before this, a timeout on the
+    // getBlockNumber() below propagated all the way out and the watcher was
+    // dead until the whole process restarted.
+    try {
+      // A load-balanced RPC's backend nodes can briefly disagree on the head —
+      // one reports a new block before another has caught up, and the second
+      // rejects eth_getLogs up to that block as "beyond current head". Staying
+      // a couple of blocks behind the reported tip avoids racing that lag.
+      const REORG_SAFETY_BLOCKS = 2;
+      const latest = (await provider.getBlockNumber()) - REORG_SAFETY_BLOCKS;
+
+      // First successful poll only establishes a baseline — this watches for
+      // drops configured from now on, not the entire chain's history.
+      if (lastScanned === null) {
         lastScanned = latest;
-      } catch (err: any) {
-        log.error(`  ⚠ log scan failed: ${err.message} — retrying next tick`);
-      }
-
-      for (const s of sightings) {
-        candidates.set(s.nftContract, s.drop);
-        if (s.drop.mintPrice === 0n) {
-          log.highlight(
-            `  ↳ free public drop configured: ${s.nftContract} (block ${s.blockNumber}, max/wallet ${s.drop.maxTotalMintableByWallet})`
-          );
-        }
-      }
-    }
-
-    const t = nowSec();
-    for (const [nftContract, drop] of [...candidates]) {
-      // Drop the window entirely once it's over — nothing more to check.
-      if (drop.endTime !== 0 && t > drop.endTime) {
-        candidates.delete(nftContract);
+        consecutiveFailures = 0;
         continue;
       }
-      if (fired.has(nftContract) || !isLive(drop)) continue;
 
-      fired.add(nftContract); // mark first so a slow mint doesn't get retried next tick
-      await mintCandidate(nftContract, drop.maxTotalMintableByWallet);
-      firedCount++;
+      if (latest > lastScanned) {
+        let sightings: DropSighting[] = [];
+        try {
+          sightings = await scanPublicDropUpdates(rpcUrls[0], lastScanned + 1, latest, opts.logChunkBlocks);
+          // Only mark this range scanned on success — advancing it on failure
+          // would silently skip it forever despite the "retrying" log below.
+          lastScanned = latest;
+        } catch (err: any) {
+          log.error(`  ⚠ log scan failed: ${err.message} — retrying next tick`);
+        }
 
-      if (opts.maxMintsPerRun && firedCount >= opts.maxMintsPerRun) {
-        log.done(`\n  Reached AUTO_MAX_MINTS_PER_RUN (${opts.maxMintsPerRun}) — stopping.`);
-        signal.stopped = true;
-        break;
+        for (const s of sightings) {
+          candidates.set(s.nftContract, s.drop);
+          if (s.drop.mintPrice === 0n) {
+            log.highlight(
+              `  ↳ free public drop configured: ${s.nftContract} (block ${s.blockNumber}, max/wallet ${s.drop.maxTotalMintableByWallet})`
+            );
+          }
+        }
       }
+
+      const t = nowSec();
+      for (const [nftContract, drop] of [...candidates]) {
+        // Drop the window entirely once it's over — nothing more to check.
+        if (drop.endTime !== 0 && t > drop.endTime) {
+          candidates.delete(nftContract);
+          continue;
+        }
+        if (fired.has(nftContract) || !isLive(drop)) continue;
+
+        fired.add(nftContract); // mark first so a slow mint doesn't get retried next tick
+        await mintCandidate(nftContract, drop.maxTotalMintableByWallet);
+        firedCount++;
+
+        if (opts.maxMintsPerRun && firedCount >= opts.maxMintsPerRun) {
+          log.done(`\n  Reached AUTO_MAX_MINTS_PER_RUN (${opts.maxMintsPerRun}) — stopping.`);
+          signal.stopped = true;
+          break;
+        }
+      }
+
+      consecutiveFailures = 0;
+    } catch (err: any) {
+      consecutiveFailures++;
+      log.error(
+        `  ⚠ poll failed (${consecutiveFailures}x): ${err.message} — still running, retrying with backoff`
+      );
     }
   }
 

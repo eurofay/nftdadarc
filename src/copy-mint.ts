@@ -17,7 +17,7 @@
 
 import { buildLocalMintPlan, decodeMintPublic, SEADROP_ADDRESS } from "./seadrop-public";
 import { localPublicSnipe } from "./local-mint";
-import { createProvider } from "./rpc-provider";
+import { backoffMs, createProvider } from "./rpc-provider";
 import { ChainProfile } from "./chains";
 import { defaultLogger, Logger } from "./logger";
 
@@ -101,7 +101,11 @@ export async function runCopyMintWatcher(opts: CopyMintOpts): Promise<void> {
   log.warn("  Any mintPublic call from a watched wallet is copied with your own wallets. Ctrl+C to stop.\n");
 
   const copied = new Set<string>(); // dedupe by "nftContract" so a busy source wallet doesn't trigger repeats
-  let lastScanned = await provider.getBlockNumber();
+  // Established on the first successful poll rather than up front, so a
+  // failure reading the chain head is handled by the loop's own retry/backoff
+  // instead of throwing before the watcher has even started.
+  let lastScanned: number | null = null;
+  let consecutiveFailures = 0;
 
   const signal = opts.stopSignal ?? { stopped: false };
   process.once("SIGINT", () => {
@@ -109,74 +113,99 @@ export async function runCopyMintWatcher(opts: CopyMintOpts): Promise<void> {
   });
 
   while (!signal.stopped) {
-    await new Promise((r) => setTimeout(r, pollIntervalMs));
+    await new Promise((r) => setTimeout(r, backoffMs(pollIntervalMs, consecutiveFailures)));
     if (signal.stopped) break;
 
-    // Same defensive margin as auto-mint.ts: a load-balanced RPC's backend
-    // nodes can briefly disagree on the head, so staying a couple of blocks
-    // behind the reported tip avoids asking a lagging node for a block it
-    // doesn't have yet.
-    const latest = (await provider.getBlockNumber()) - 2;
-    if (latest <= lastScanned) continue;
-
-    let sightings: WatchedMint[] = [];
+    // Everything below is wrapped: a transient RPC failure anywhere in a poll
+    // must never escape and kill the watcher. Before this, a timeout on the
+    // getBlockNumber() below propagated all the way out and the watcher was
+    // dead until the whole process restarted.
     try {
-      sightings = await scanWatchedMints(rpcUrls[0], lastScanned + 1, latest, watchTargets);
-      // Only mark this range scanned on success — advancing it on failure
-      // would silently skip it forever despite the "retrying" log below.
-      lastScanned = latest;
-    } catch (err: any) {
-      log.error(`  ⚠ block scan failed: ${err.message} — retrying next tick`);
-    }
+      // Same defensive margin as auto-mint.ts: a load-balanced RPC's backend
+      // nodes can briefly disagree on the head, so staying a couple of blocks
+      // behind the reported tip avoids asking a lagging node for a block it
+      // doesn't have yet.
+      const latest = (await provider.getBlockNumber()) - 2;
 
-    for (const sighting of sightings) {
-      if (copied.has(sighting.nftContract.toLowerCase())) continue;
-      copied.add(sighting.nftContract.toLowerCase());
-
-      log.warnBold(
-        `\n  👀 ${sighting.from} minted ${sighting.nftContract} (block ${sighting.blockNumber}) — copying`
-      );
-
-      const drop = await buildLocalMintPlan(rpcUrls[0], sighting.nftContract, 1);
-      if (!drop) {
-        log.error("     ✗ Skipped — couldn't resolve a public drop for this contract.");
-        continue;
-      }
-      const priceEth = Number(drop.drop.mintPrice) / 1e18;
-      if (priceEth > opts.maxPriceEth) {
-        log.error(`     ✗ Skipped — price ${priceEth} ETH exceeds your ${opts.maxPriceEth} ETH cap.`);
+      // First successful poll only establishes a baseline — this follows
+      // watched wallets from now on, not through the chain's history.
+      if (lastScanned === null) {
+        lastScanned = latest;
+        consecutiveFailures = 0;
         continue;
       }
 
-      // Cap at whichever is smaller — the drop's own per-wallet max, or your
-      // chosen cap. Using quantityPerWallet outright when it's above the
-      // drop's real max would revert on-chain (SeaDrop enforces that limit
-      // itself) instead of just minting what's actually available.
-      const quantity = opts.quantityPerWallet
-        ? Math.min(drop.drop.maxTotalMintableByWallet, opts.quantityPerWallet)
-        : drop.drop.maxTotalMintableByWallet;
-      const plan = await buildLocalMintPlan(rpcUrls[0], sighting.nftContract, quantity);
-      if (!plan) {
-        log.error("     ✗ Skipped — drop no longer resolvable at the intended quantity.");
+      if (latest <= lastScanned) {
+        consecutiveFailures = 0;
         continue;
       }
 
+      let sightings: WatchedMint[] = [];
       try {
-        await localPublicSnipe({
-          nftContract: sighting.nftContract,
-          quantity,
-          walletKeys,
-          rpcUrls,
-          maxFeePerGas,
-          maxPriorityFee,
-          gasLimit,
-          targetStart: null,
-          plan,
-          logger: log,
-        });
+        sightings = await scanWatchedMints(rpcUrls[0], lastScanned + 1, latest, watchTargets);
+        // Only mark this range scanned on success — advancing it on failure
+        // would silently skip it forever despite the "retrying" log below.
+        lastScanned = latest;
       } catch (err: any) {
-        log.error(`     ✗ Copy-mint attempt failed: ${err.message}`);
+        log.error(`  ⚠ block scan failed: ${err.message} — retrying next tick`);
       }
+
+      for (const sighting of sightings) {
+        if (copied.has(sighting.nftContract.toLowerCase())) continue;
+        copied.add(sighting.nftContract.toLowerCase());
+
+        log.warnBold(
+          `\n  👀 ${sighting.from} minted ${sighting.nftContract} (block ${sighting.blockNumber}) — copying`
+        );
+
+        const drop = await buildLocalMintPlan(rpcUrls[0], sighting.nftContract, 1);
+        if (!drop) {
+          log.error("     ✗ Skipped — couldn't resolve a public drop for this contract.");
+          continue;
+        }
+        const priceEth = Number(drop.drop.mintPrice) / 1e18;
+        if (priceEth > opts.maxPriceEth) {
+          log.error(`     ✗ Skipped — price ${priceEth} ETH exceeds your ${opts.maxPriceEth} ETH cap.`);
+          continue;
+        }
+
+        // Cap at whichever is smaller — the drop's own per-wallet max, or your
+        // chosen cap. Using quantityPerWallet outright when it's above the
+        // drop's real max would revert on-chain (SeaDrop enforces that limit
+        // itself) instead of just minting what's actually available.
+        const quantity = opts.quantityPerWallet
+          ? Math.min(drop.drop.maxTotalMintableByWallet, opts.quantityPerWallet)
+          : drop.drop.maxTotalMintableByWallet;
+        const plan = await buildLocalMintPlan(rpcUrls[0], sighting.nftContract, quantity);
+        if (!plan) {
+          log.error("     ✗ Skipped — drop no longer resolvable at the intended quantity.");
+          continue;
+        }
+
+        try {
+          await localPublicSnipe({
+            nftContract: sighting.nftContract,
+            quantity,
+            walletKeys,
+            rpcUrls,
+            maxFeePerGas,
+            maxPriorityFee,
+            gasLimit,
+            targetStart: null,
+            plan,
+            logger: log,
+          });
+        } catch (err: any) {
+          log.error(`     ✗ Copy-mint attempt failed: ${err.message}`);
+        }
+      }
+
+      consecutiveFailures = 0;
+    } catch (err: any) {
+      consecutiveFailures++;
+      log.error(
+        `  ⚠ poll failed (${consecutiveFailures}x): ${err.message} — still running, retrying with backoff`
+      );
     }
   }
 

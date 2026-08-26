@@ -174,6 +174,73 @@ describe("runAutoMintWatcher (against a real mock RPC node)", () => {
     expect(text).toContain("LIVE FREE MINT");
   });
 
+  it("survives an RPC failure reading the chain head and recovers, instead of crashing for good", { timeout: 20000 }, async () => {
+    // Regression test for a real crash seen in production: the
+    // getBlockNumber() call at the top of each poll sat outside the loop's
+    // try/catch, so one timeout there escaped runAutoMintWatcher entirely and
+    // the watcher was dead until the whole bot process restarted — the
+    // difference between the log's "retrying next tick" and "watcher crashed".
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    let block = 100;
+    let headCalls = 0;
+
+    mock = await startMockRpc({
+      eth_chainId: () => "0x2105",
+      eth_blockNumber: () => {
+        headCalls++;
+        // Fail the first few polls outright, the way a timing-out RPC does.
+        if (headCalls <= 3) throw new Error("request timeout");
+        return `0x${(++block).toString(16)}`;
+      },
+      eth_getLogs: () => [eventLog(NFT, LIVE_FREE_DROP, block)],
+      eth_call: (params) => {
+        const call = CALL_IFACE.parseTransaction({ data: params[0].data })!;
+        if (call.name === "getPublicDrop") {
+          const d = LIVE_FREE_DROP;
+          return CALL_IFACE.encodeFunctionResult("getPublicDrop", [
+            [d.mintPrice, d.startTime, d.endTime, d.maxTotalMintableByWallet, d.feeBps, d.restrictFeeRecipients],
+          ]);
+        }
+        return CALL_IFACE.encodeFunctionResult("getAllowedFeeRecipients", [[RECIPIENT]]);
+      },
+      eth_getTransactionCount: () => "0x0",
+      eth_sendRawTransaction: (params) => keccak256(params[0]),
+      eth_getTransactionReceipt: () => ({
+        blockNumber: "0x64",
+        transactionIndex: "0x1",
+        gasUsed: "0x5208",
+        status: "0x1",
+      }),
+    });
+
+    let settled = false;
+    const run = runAutoMintWatcher({
+      chain: CHAINS.find((c) => c.key === "base")!,
+      rpcUrls: [mock.url],
+      walletKeys: [TEST_KEY],
+      maxFeePerGas: 2_000_000_000n,
+      maxPriorityFee: 100_000_000n,
+      gasLimit: 250_000,
+      pollIntervalMs: 20,
+    }).then(() => {
+      settled = true;
+    });
+
+    await new Promise((r) => setTimeout(r, 3000));
+    // Still alive despite the failures — the whole point of the fix.
+    expect(settled).toBe(false);
+
+    process.emit("SIGINT" as any);
+    await run;
+
+    const text = logSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+    expect(text).toContain("poll failed");
+    expect(text).toContain("still running");
+    // Recovered after the failures stopped and went on to do real work.
+    expect(headCalls).toBeGreaterThan(3);
+    expect(text).toContain("LIVE FREE MINT");
+  });
+
   it("never fires on a drop whose price is non-zero", { timeout: 15000 }, async () => {
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     let block = 100;
