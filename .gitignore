@@ -11,3 +11,6 @@ dist/
 wallets/
 keys.txt
 *.key
+
+# Telegram bot's encrypted wallet/settings store — never commit
+data/

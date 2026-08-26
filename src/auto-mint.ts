@@ -11,13 +11,13 @@
 // indexed yet and can't be fed a spoofed sighting. OpenSea is used only as an
 // optional, non-blocking enrichment for readable logs.
 
-import chalk from "chalk";
 import { JsonRpcProvider } from "ethers";
 import { buildLocalMintPlan } from "./seadrop-public";
 import { scanPublicDropUpdates, DropSighting } from "./seadrop-events";
 import { localPublicSnipe } from "./local-mint";
 import { openseaContractInfo } from "./slug-resolver";
 import { ChainProfile } from "./chains";
+import { defaultLogger, Logger } from "./logger";
 
 export interface AutoMintOpts {
   chain: ChainProfile;
@@ -31,6 +31,8 @@ export interface AutoMintOpts {
   maxMintsPerRun?: number; // stop after this many distinct collections auto-fired
   openseaApiKey?: string;
   logChunkBlocks?: number; // eth_getLogs range per call — see seadrop-events.ts
+  logger?: Logger; // defaults to printing locally — the Telegram bot passes one that also forwards to a chat
+  stopSignal?: { stopped: boolean }; // lets a caller (the bot) stop the watcher without SIGINT
 }
 
 function nowSec(): number {
@@ -48,17 +50,16 @@ function isLive(drop: DropSighting["drop"]): boolean {
 
 export async function runAutoMintWatcher(opts: AutoMintOpts): Promise<void> {
   const { chain, rpcUrls, walletKeys, maxFeePerGas, maxPriorityFee, gasLimit, pollIntervalMs } = opts;
+  const log = opts.logger ?? defaultLogger;
   const provider = new JsonRpcProvider(rpcUrls[0]);
 
-  console.log(chalk.bold.magenta("\n── AUTO FREE-MINT WATCHER ──"));
-  console.log(chalk.gray(`  Chain:    ${chain.name} (${chain.chainId})`));
-  console.log(chalk.gray(`  Wallets:  ${walletKeys.length}`));
-  console.log(chalk.gray(`  Polling:  every ${pollIntervalMs}ms via ${rpcUrls[0]}`));
-  console.log(
-    chalk.yellow(
-      "  Fully autonomous: any SeaDrop drop that goes live at price 0 is minted at max-per-wallet\n" +
-        "  immediately, no confirmation. Ctrl+C to stop.\n"
-    )
+  log.title("\n── AUTO FREE-MINT WATCHER ──");
+  log.info(`  Chain:    ${chain.name} (${chain.chainId})`);
+  log.info(`  Wallets:  ${walletKeys.length}`);
+  log.info(`  Polling:  every ${pollIntervalMs}ms via ${rpcUrls[0]}`);
+  log.warn(
+    "  Fully autonomous: any SeaDrop drop that goes live at price 0 is minted at max-per-wallet\n" +
+      "  immediately, no confirmation. Ctrl+C to stop.\n"
   );
 
   const candidates = new Map<string, DropSighting["drop"]>();
@@ -68,15 +69,17 @@ export async function runAutoMintWatcher(opts: AutoMintOpts): Promise<void> {
 
   // Promise.race would only stop *awaiting* the loop, not the loop itself —
   // it would keep polling and could keep auto-firing in the background after
-  // claiming to have stopped. This flag actually ends the while loop.
-  let stopped = false;
+  // claiming to have stopped. This flag actually ends the while loop. It can
+  // be flipped either by SIGINT (CLI) or by the caller's own stopSignal
+  // object (the Telegram bot, which has no terminal to send SIGINT from).
+  const signal = opts.stopSignal ?? { stopped: false };
   process.once("SIGINT", () => {
-    stopped = true;
+    signal.stopped = true;
   });
 
-  while (!stopped) {
+  while (!signal.stopped) {
     await new Promise((r) => setTimeout(r, pollIntervalMs));
-    if (stopped) break;
+    if (signal.stopped) break;
 
     const latest = await provider.getBlockNumber();
     if (latest > lastScanned) {
@@ -84,17 +87,15 @@ export async function runAutoMintWatcher(opts: AutoMintOpts): Promise<void> {
       try {
         sightings = await scanPublicDropUpdates(rpcUrls[0], lastScanned + 1, latest, opts.logChunkBlocks);
       } catch (err: any) {
-        console.log(chalk.red(`  ⚠ log scan failed: ${err.message} — retrying next tick`));
+        log.error(`  ⚠ log scan failed: ${err.message} — retrying next tick`);
       }
       lastScanned = latest;
 
       for (const s of sightings) {
         candidates.set(s.nftContract, s.drop);
         if (s.drop.mintPrice === 0n) {
-          console.log(
-            chalk.cyan(
-              `  ↳ free public drop configured: ${s.nftContract} (block ${s.blockNumber}, max/wallet ${s.drop.maxTotalMintableByWallet})`
-            )
+          log.highlight(
+            `  ↳ free public drop configured: ${s.nftContract} (block ${s.blockNumber}, max/wallet ${s.drop.maxTotalMintableByWallet})`
           );
         }
       }
@@ -114,34 +115,34 @@ export async function runAutoMintWatcher(opts: AutoMintOpts): Promise<void> {
       firedCount++;
 
       if (opts.maxMintsPerRun && firedCount >= opts.maxMintsPerRun) {
-        console.log(chalk.bold.white(`\n  Reached AUTO_MAX_MINTS_PER_RUN (${opts.maxMintsPerRun}) — stopping.`));
-        stopped = true;
+        log.done(`\n  Reached AUTO_MAX_MINTS_PER_RUN (${opts.maxMintsPerRun}) — stopping.`);
+        signal.stopped = true;
         break;
       }
     }
   }
 
-  console.log(chalk.bold.white(`\n\n  Stopped. Auto-fired ${firedCount} collection(s) this run.`));
+  log.done(`\n\n  Stopped. Auto-fired ${firedCount} collection(s) this run.`);
 
   async function mintCandidate(nftContract: string, walletCap: number): Promise<void> {
     const quantity = opts.maxQuantityPerWallet
       ? Math.min(walletCap, opts.maxQuantityPerWallet)
       : walletCap;
 
-    console.log(chalk.bold.yellow(`\n  🎯 LIVE FREE MINT: ${nftContract} — firing ${quantity}/wallet`));
+    log.warnBold(`\n  🎯 LIVE FREE MINT: ${nftContract} — firing ${quantity}/wallet`);
 
     const info = await openseaContractInfo(chain.key, nftContract, opts.openseaApiKey);
-    console.log(chalk.gray(`     OpenSea: ${info ? `${info.name} (${info.slug})` : "not found / unverified"}`));
+    log.info(`     OpenSea: ${info ? `${info.name} (${info.slug})` : "not found / unverified"}`);
 
     // Re-read right before firing — the event only proves a drop *was*
     // configured; the chain is the only source that says it's still true now.
     const plan = await buildLocalMintPlan(rpcUrls[0], nftContract, quantity);
     if (!plan) {
-      console.log(chalk.red(`     ✗ Skipped — drop no longer resolvable on-chain (ended or restricted).`));
+      log.error(`     ✗ Skipped — drop no longer resolvable on-chain (ended or restricted).`);
       return;
     }
     if (plan.value !== 0n) {
-      console.log(chalk.red(`     ✗ Skipped — price is no longer 0 as of the latest read.`));
+      log.error(`     ✗ Skipped — price is no longer 0 as of the latest read.`);
       return;
     }
 
@@ -156,9 +157,10 @@ export async function runAutoMintWatcher(opts: AutoMintOpts): Promise<void> {
         gasLimit,
         targetStart: null,
         plan,
+        logger: log,
       });
     } catch (err: any) {
-      console.log(chalk.red(`     ✗ Auto-mint attempt failed: ${err.message}`));
+      log.error(`     ✗ Auto-mint attempt failed: ${err.message}`);
     }
   }
 }

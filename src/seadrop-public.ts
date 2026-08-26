@@ -117,6 +117,30 @@ export function encodeMintPublic(
   ]);
 }
 
+export interface DecodedMintPublic {
+  nftContract: string;
+  feeRecipient: string;
+  quantity: bigint;
+}
+
+// Used by the copy-mint watcher to read what a watched wallet is minting.
+// Returns null for anything that isn't a mintPublic call — including a
+// contract's fallback/receive or an unrelated call to the SeaDrop singleton —
+// rather than throwing, since a watcher scans arbitrary transactions.
+export function decodeMintPublic(data: string): DecodedMintPublic | null {
+  try {
+    const parsed = IFACE.parseTransaction({ data });
+    if (!parsed || parsed.name !== "mintPublic") return null;
+    return {
+      nftContract: parsed.args.nftContract,
+      feeRecipient: parsed.args.feeRecipient,
+      quantity: BigInt(parsed.args.quantity),
+    };
+  } catch {
+    return null;
+  }
+}
+
 export async function buildLocalMintPlan(
   rpcUrl: string,
   nftContract: string,

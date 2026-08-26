@@ -154,6 +154,55 @@ spam collections a human would skip. See Security below before running it.
 
 ---
 
+## Step 6 — Telegram bot: control it from anywhere
+
+```bash
+npm run bot
+```
+
+A remote control surface for everything above, running as a long-lived
+process (your own always-on machine, a VPS, wherever) so you interact with it
+from Telegram instead of a terminal:
+
+- **Wallets** — add/remove from a chat, list shows masked addresses only.
+- **Settings** — chain, gas ceiling/tip, gas limit, quantity caps — all editable
+  via inline buttons.
+- **`/mint <link-or-address> <quantity>`** — one-off manual mint, same engine
+  as the wizard.
+- **Auto mint** — start/stop the [free-mint watcher](#step-5--auto-mode-unattended-free-mint-watcher)
+  from a button instead of a terminal flag.
+- **Copy mint** — watch one or more wallets, and copy any `mintPublic` call
+  they make using your own wallets. Unlike auto mode this isn't restricted to
+  free drops (the point is following a wallet's judgment, paid or not), so a
+  `copyMintMaxPriceEth` cap in Settings is the one guardrail against blindly
+  following it into an expensive mint. It never replays the watched wallet's
+  raw transaction — it treats their mint as a signal, then independently
+  rebuilds the plan from fresh on-chain state via the same `buildLocalMintPlan`
+  everything else uses.
+
+**Setup** (see the `TELEGRAM_*` / `WALLET_ENCRYPTION_KEY` block in
+`.env.example`): create a bot with [@BotFather](https://t.me/BotFather), get
+your numeric Telegram user id from [@userinfobot](https://t.me/userinfobot),
+and generate a random `WALLET_ENCRYPTION_KEY` (`openssl rand -hex 32`) — a
+server-side secret, separate from anything Telegram sees, that encrypts
+wallet keys at rest in the bot's local store (`data/`, git-ignored).
+`TELEGRAM_OWNER_ID` is the only access control: every update from anyone else,
+or from a group chat, is silently ignored.
+
+**Read this before adding a wallet.** Wallets are added by pasting a private
+key directly into the chat. The bot deletes that message the instant it
+reads it — but Telegram is not end-to-end encrypted for bots, so the key
+still passes through Telegram's servers to get there and briefly exists in
+your own client-side chat history before the delete lands. Use a wallet
+**dedicated to this bot only**, funded with only what you're willing to
+risk if your Telegram account or the bot's server were ever compromised.
+This is a real, deliberate tradeoff for the convenience of managing wallets
+from your phone — if that tradeoff doesn't sit right with you, keep using
+`.env`-configured keys via the CLI or [auto mode](#step-5--auto-mode-unattended-free-mint-watcher)
+instead, which never puts a key through Telegram at all.
+
+---
+
 ## Understanding gas
 
 Three different numbers, and mixing them up is the most common way to lose a mint:
@@ -218,7 +267,13 @@ code changes needed.
   has no prompt to paste a key into, so `AUTO_WALLET_KEYS` has to live in
   `.env` on disk. Use a wallet dedicated to that mode only, funded with just
   what you're willing to lose to gas on unattended, unreviewed mints.
-- `.env`, `wallets/` and `*.key` are all git-ignored.
+  **Exception: the Telegram bot** ([Step 6](#step-6--telegram-bot-control-it-from-anywhere))
+  goes further still — keys are pasted directly into a Telegram chat, which
+  passes through Telegram's servers before the bot deletes the message.
+  Encrypted at rest with `WALLET_ENCRYPTION_KEY` once stored, but in transit
+  it's only as safe as your Telegram account and the bot's server. Wallet
+  dedicated to the bot only, non-negotiably.
+- `.env`, `wallets/`, `*.key` and the bot's `data/` store are all git-ignored.
 - Use dedicated hot wallets funded with only what you intend to spend.
 - Read [`src/local-mint.ts`](src/local-mint.ts) if you want to verify exactly what
   gets signed and sent — it's about 150 lines.

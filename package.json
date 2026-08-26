@@ -10,6 +10,7 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "ts-node src/index.ts",
+    "bot": "node dist/telegram-bot.js",
     "test": "vitest run"
   },
   "keywords": [
@@ -26,7 +27,8 @@
     "chalk": "^4.1.2",
     "dotenv": "^16.3.1",
     "ethers": "^6.9.0",
-    "ora": "^5.4.1"
+    "ora": "^5.4.1",
+    "telegraf": "^4.16.3"
   },
   "devDependencies": {
     "@types/node": "^20.10.0",

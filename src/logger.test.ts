@@ -1,0 +1,65 @@
+import { describe, it, expect, vi, afterEach } from "vitest";
+import { createLogger } from "./logger";
+
+describe("createLogger", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("always prints locally regardless of forwarding tier", () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const log = createLogger();
+    log.info("quiet line");
+    log.errorBold("loud line");
+    expect(logSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("forwards headline events (errorBold, successBold, warnBold, done, title) to the sink", () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const forwarded: string[] = [];
+    const log = createLogger((msg) => forwarded.push(msg));
+
+    log.title("title");
+    log.successBold("success bold");
+    log.warnBold("warn bold");
+    log.errorBold("error bold");
+    log.done("done");
+    log.success("success");
+    log.warn("warn");
+    log.error("error");
+    log.raw("raw");
+
+    expect(forwarded).toEqual([
+      "title",
+      "success bold",
+      "warn bold",
+      "error bold",
+      "done",
+      "success",
+      "warn",
+      "error",
+      "raw",
+    ]);
+  });
+
+  it("does not forward the high-volume info/highlight tiers to the sink", () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const forwarded: string[] = [];
+    const log = createLogger((msg) => forwarded.push(msg));
+
+    log.info("routine detail");
+    log.highlight("routine sighting");
+
+    expect(forwarded).toEqual([]);
+  });
+
+  it("strips ANSI color codes before forwarding to the sink", () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const forwarded: string[] = [];
+    const log = createLogger((msg) => forwarded.push(msg));
+
+    log.errorBold("plain text");
+    expect(forwarded[0]).toBe("plain text");
+    expect(forwarded[0]).not.toMatch(/\x1b\[/);
+  });
+});
