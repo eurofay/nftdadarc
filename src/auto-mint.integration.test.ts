@@ -102,6 +102,78 @@ describe("runAutoMintWatcher (against a real mock RPC node)", () => {
     expect(mock.calls.some((c) => c.method === "eth_sendRawTransaction")).toBe(true);
   });
 
+  it("retries a scan window that failed instead of silently skipping it forever", async () => {
+    // Regression test: a load-balanced RPC's backend nodes can briefly
+    // disagree on the chain head, making eth_getLogs reject a range as
+    // "beyond current head" even though it's valid moments later. The bug
+    // this guards against: advancing lastScanned even when the scan threw,
+    // which would permanently skip whatever was in that window — the
+    // "retrying next tick" log claim would have been a lie.
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    let block = 100;
+    let getLogsCalls = 0;
+    let firstAttemptFromBlock: number | null = null;
+
+    mock = await startMockRpc({
+      eth_chainId: () => "0x2105",
+      eth_blockNumber: () => `0x${(++block).toString(16)}`,
+      eth_getLogs: (params) => {
+        getLogsCalls++;
+        const from = parseInt(params[0].fromBlock, 16);
+        const to = parseInt(params[0].toBlock, 16);
+        if (getLogsCalls === 1) {
+          firstAttemptFromBlock = from;
+          throw new Error("block range extends beyond current head block");
+        }
+        // Only findable if this range still covers what the very first
+        // (failed) attempt tried to cover — i.e. lastScanned never moved.
+        if (firstAttemptFromBlock !== null && firstAttemptFromBlock >= from && firstAttemptFromBlock <= to) {
+          return [eventLog(NFT, LIVE_FREE_DROP, firstAttemptFromBlock)];
+        }
+        return [];
+      },
+      eth_call: (params) => {
+        const call = CALL_IFACE.parseTransaction({ data: params[0].data })!;
+        if (call.name === "getPublicDrop") {
+          const d = LIVE_FREE_DROP;
+          return CALL_IFACE.encodeFunctionResult("getPublicDrop", [
+            [d.mintPrice, d.startTime, d.endTime, d.maxTotalMintableByWallet, d.feeBps, d.restrictFeeRecipients],
+          ]);
+        }
+        return CALL_IFACE.encodeFunctionResult("getAllowedFeeRecipients", [[RECIPIENT]]);
+      },
+      eth_getTransactionCount: () => "0x0",
+      eth_sendRawTransaction: (params) => keccak256(params[0]),
+      eth_getTransactionReceipt: () => ({
+        blockNumber: "0x64",
+        transactionIndex: "0x1",
+        gasUsed: "0x5208",
+        status: "0x1",
+      }),
+    });
+
+    const run = runAutoMintWatcher({
+      chain: CHAINS.find((c) => c.key === "base")!,
+      rpcUrls: [mock.url],
+      walletKeys: [TEST_KEY],
+      maxFeePerGas: 2_000_000_000n,
+      maxPriorityFee: 100_000_000n,
+      gasLimit: 250_000,
+      pollIntervalMs: 30,
+    });
+
+    // Bounded wait + SIGINT rather than relying on maxMintsPerRun to end
+    // it — if the bug were present this would never fire, and this way
+    // the test fails on the assertion instead of hanging for 15s+.
+    await new Promise((r) => setTimeout(r, 1500));
+    process.emit("SIGINT" as any);
+    await run;
+
+    expect(getLogsCalls).toBeGreaterThan(1); // proves a retry actually happened
+    const text = logSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+    expect(text).toContain("LIVE FREE MINT");
+  });
+
   it("never fires on a drop whose price is non-zero", { timeout: 15000 }, async () => {
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     let block = 100;

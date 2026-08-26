@@ -81,15 +81,22 @@ export async function runAutoMintWatcher(opts: AutoMintOpts): Promise<void> {
     await new Promise((r) => setTimeout(r, pollIntervalMs));
     if (signal.stopped) break;
 
-    const latest = await provider.getBlockNumber();
+    // A load-balanced RPC's backend nodes can briefly disagree on the head —
+    // one reports a new block before another has caught up, and the second
+    // rejects eth_getLogs up to that block as "beyond current head". Staying
+    // a couple of blocks behind the reported tip avoids racing that lag.
+    const REORG_SAFETY_BLOCKS = 2;
+    const latest = (await provider.getBlockNumber()) - REORG_SAFETY_BLOCKS;
     if (latest > lastScanned) {
       let sightings: DropSighting[] = [];
       try {
         sightings = await scanPublicDropUpdates(rpcUrls[0], lastScanned + 1, latest, opts.logChunkBlocks);
+        // Only mark this range scanned on success — advancing it on failure
+        // would silently skip it forever despite the "retrying" log below.
+        lastScanned = latest;
       } catch (err: any) {
         log.error(`  ⚠ log scan failed: ${err.message} — retrying next tick`);
       }
-      lastScanned = latest;
 
       for (const s of sightings) {
         candidates.set(s.nftContract, s.drop);
