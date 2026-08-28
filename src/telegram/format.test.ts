@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { formatBatch, chunkMessage, renderBatch, TELEGRAM_LIMIT } from "./format";
+import { formatBatch, chunkMessage, renderBatch, collapseRepeats, TELEGRAM_LIMIT } from "./format";
 
 // Lifted from a real run, which is what this exists to clean up.
 const REAL_MINT_BURST = [
@@ -99,9 +99,32 @@ describe("renderBatch", () => {
   });
 
   it("splits a very long batch across messages", () => {
-    const many = Array(400).fill("[robinhood]   some reasonably long status line here");
+    // Distinct lines on purpose — identical ones are collapsed by
+    // collapseRepeats and would never reach the chunking path.
+    const many = Array.from(
+      { length: 400 },
+      (_, i) => `[robinhood]   status line ${i} with some length to it`
+    );
     const msgs = renderBatch(many);
     expect(msgs.length).toBeGreaterThan(1);
     for (const m of msgs) expect(m.length).toBeLessThanOrEqual(TELEGRAM_LIMIT);
+  });
+});
+
+describe("collapseRepeats", () => {
+  it("collapses a flapping RPC's identical retries into one line with a count", () => {
+    const err = "⚠ log scan failed: Internal error — retrying next tick";
+    const { body } = formatBatch(Array(8).fill(`[robinhood] ${err}`));
+    expect(body).toBe(`${err}  (×8)`);
+  });
+
+  it("leaves distinct lines alone", () => {
+    const { body } = formatBatch(["[x] a", "[x] b", "[x] a"]);
+    expect(body).toBe("a\nb\na");
+  });
+
+  it("only collapses consecutive repeats", () => {
+    const { body } = formatBatch(["[x] a", "[x] a", "[x] b", "[x] a"]);
+    expect(body).toBe("a  (×2)\nb\na");
   });
 });

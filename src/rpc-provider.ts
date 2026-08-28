@@ -49,6 +49,25 @@ export function clearProviderCache(): void {
   providerCache.clear();
 }
 
+// Ethers wraps a provider error together with the entire request payload.
+// For a topic-filtered getLogs that payload includes every watched address,
+// so one failure logs ~1500 characters of noise to say "Internal error".
+// This digs out the part that actually identifies the problem.
+export function describeRpcError(err: unknown): string {
+  const e = err as any;
+
+  // The node's own message, where ethers preserved it.
+  const inner = e?.error?.message ?? e?.info?.error?.message;
+  if (typeof inner === "string" && inner.trim()) return inner.trim();
+
+  // Otherwise ethers' own summary, minus its parenthesised payload dump.
+  const raw = typeof e?.shortMessage === "string" && e.shortMessage.trim()
+    ? e.shortMessage
+    : e?.message ?? String(err);
+
+  return String(raw).split(" (")[0].trim().slice(0, 200);
+}
+
 // Poll loops must never die on a transient RPC failure, but they also
 // shouldn't hammer a struggling endpoint every tick. Backs off exponentially
 // while failures persist, capped so recovery stays quick once it returns.

@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { createProvider, clearProviderCache, backoffMs, DEFAULT_RPC_TIMEOUT_MS } from "./rpc-provider";
+import { createProvider, clearProviderCache, backoffMs, describeRpcError, DEFAULT_RPC_TIMEOUT_MS } from "./rpc-provider";
 import { scanPublicDropUpdates } from "./seadrop-events";
 import { startMockRpc, MockRpc } from "./test-support/mock-rpc";
 
@@ -58,6 +58,51 @@ describe("createProvider", () => {
 
     const chainIdCalls = mock.calls.filter((c) => c.method === "eth_chainId").length;
     expect(chainIdCalls).toBe(1);
+  });
+});
+
+describe("describeRpcError", () => {
+  // Ethers embeds the whole request payload in its message. For a
+  // topic-filtered getLogs that includes every watched address, so a single
+  // failure logged ~1500 characters to convey "Internal error".
+  const wrapped = (nodeMessage: string) =>
+    Object.assign(
+      new Error(
+        `could not coalesce error (error={ "code": -32000, "message": "${nodeMessage}" }, payload={ "method": "eth_getLogs", "params": [ { "topics": [ "0xaaa", null, [ "0x111", "0x222", "0x333" ] ] } ] }, code=UNKNOWN_ERROR, version=6.17.0)`
+      ),
+      { error: { code: -32000, message: nodeMessage }, shortMessage: "could not coalesce error" }
+    );
+
+  it("extracts the node's own message from ethers' wrapper", () => {
+    expect(describeRpcError(wrapped("invalid block range params"))).toBe("invalid block range params");
+    expect(describeRpcError(wrapped("Internal error"))).toBe("Internal error");
+  });
+
+  it("drops the payload dump entirely", () => {
+    const out = describeRpcError(wrapped("Internal error"));
+    expect(out).not.toContain("payload");
+    expect(out).not.toContain("0x111");
+    expect(out.length).toBeLessThan(60);
+  });
+
+  it("handles errors carrying only a message", () => {
+    expect(describeRpcError(new Error("read ECONNRESET"))).toBe("read ECONNRESET");
+    expect(describeRpcError(new Error("request timeout (code=TIMEOUT, version=6.17.0)"))).toBe(
+      "request timeout"
+    );
+  });
+
+  it("reads the nested info.error shape ethers also uses", () => {
+    expect(describeRpcError({ info: { error: { message: "rate limited" } } })).toBe("rate limited");
+  });
+
+  it("never returns an unbounded string", () => {
+    expect(describeRpcError(new Error("x".repeat(5000))).length).toBeLessThanOrEqual(200);
+  });
+
+  it("degrades to something printable for a non-Error", () => {
+    expect(describeRpcError("plain string")).toBe("plain string");
+    expect(typeof describeRpcError(null)).toBe("string");
   });
 });
 

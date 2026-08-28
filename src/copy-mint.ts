@@ -18,9 +18,12 @@
 import { buildLocalMintPlan } from "./seadrop-public";
 import { scanSeaDropMints } from "./seadrop-events";
 import { localPublicSnipe, SnipeOutcome } from "./local-mint";
-import { backoffMs, createProvider } from "./rpc-provider";
+import { backoffMs, createProvider, describeRpcError } from "./rpc-provider";
 import { ChainProfile } from "./chains";
 import { defaultLogger, Logger } from "./logger";
+
+// See auto-mint.ts — staying near the head matters more than completeness.
+const MAX_CATCHUP_BLOCKS = 200;
 
 export interface WatchedMint {
   txHash: string;
@@ -109,6 +112,15 @@ export async function runCopyMintWatcher(opts: CopyMintOpts): Promise<void> {
         continue;
       }
 
+      // Same reasoning as auto-mint.ts: on a fast chain a backlog compounds
+      // and the watcher drifts permanently behind. Copying a mint from
+      // thousands of blocks ago is pointless anyway.
+      if (latest - lastScanned > MAX_CATCHUP_BLOCKS) {
+        const skipped = latest - lastScanned - MAX_CATCHUP_BLOCKS;
+        log.warn(`  ⏩ ${skipped} blocks behind — skipping ahead to stay near the chain head.`);
+        lastScanned = latest - MAX_CATCHUP_BLOCKS;
+      }
+
       if (latest <= lastScanned) {
         consecutiveFailures = 0;
         continue;
@@ -121,7 +133,7 @@ export async function runCopyMintWatcher(opts: CopyMintOpts): Promise<void> {
         // would silently skip it forever despite the "retrying" log below.
         lastScanned = latest;
       } catch (err: any) {
-        log.error(`  ⚠ block scan failed: ${err.message} — retrying next tick`);
+        log.error(`  ⚠ block scan failed: ${describeRpcError(err)} — retrying next tick`);
       }
 
       for (const sighting of sightings) {
@@ -180,7 +192,7 @@ export async function runCopyMintWatcher(opts: CopyMintOpts): Promise<void> {
             /* bookkeeping only */
           }
         } catch (err: any) {
-          log.error(`     ✗ Copy-mint attempt failed: ${err.message}`);
+          log.error(`     ✗ Copy-mint attempt failed: ${describeRpcError(err)}`);
         }
       }
 
@@ -188,7 +200,7 @@ export async function runCopyMintWatcher(opts: CopyMintOpts): Promise<void> {
     } catch (err: any) {
       consecutiveFailures++;
       log.error(
-        `  ⚠ poll failed (${consecutiveFailures}x): ${err.message} — still running, retrying with backoff`
+        `  ⚠ poll failed (${consecutiveFailures}x): ${describeRpcError(err)} — still running, retrying with backoff`
       );
     }
   }

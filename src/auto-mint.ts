@@ -17,7 +17,7 @@ import { localPublicSnipe, SnipeOutcome } from "./local-mint";
 import { openseaContractInfo } from "./slug-resolver";
 import { ChainProfile } from "./chains";
 import { defaultLogger, Logger } from "./logger";
-import { backoffMs, createProvider } from "./rpc-provider";
+import { backoffMs, createProvider, describeRpcError } from "./rpc-provider";
 
 export interface AutoMintOpts {
   chain: ChainProfile;
@@ -40,6 +40,10 @@ export interface AutoMintOpts {
   // and burns gas for nothing. The bot backs this with the portfolio store.
   alreadyMinted?: (nftContract: string) => boolean;
 }
+
+// Deliberately modest: this is a live-drop watcher, so falling far behind is
+// worse than missing old blocks it could no longer act on anyway.
+const MAX_CATCHUP_BLOCKS = 200;
 
 function nowSec(): number {
   return Math.floor(Date.now() / 1000);
@@ -111,6 +115,17 @@ export async function runAutoMintWatcher(opts: AutoMintOpts): Promise<void> {
         continue;
       }
 
+      // On a fast chain (Robinhood produces ~10 blocks/second) a few failed
+      // polls leave a backlog the scanner can never work off, and it drifts
+      // further behind every tick while scanning history nobody can still
+      // mint. Skip forward instead: a sniper only cares about what is live
+      // now, and staying near the head is what makes it useful.
+      if (latest - lastScanned > MAX_CATCHUP_BLOCKS) {
+        const skipped = latest - lastScanned - MAX_CATCHUP_BLOCKS;
+        log.warn(`  ⏩ ${skipped} blocks behind — skipping ahead to stay near the chain head.`);
+        lastScanned = latest - MAX_CATCHUP_BLOCKS;
+      }
+
       if (latest > lastScanned) {
         let sightings: DropSighting[] = [];
         try {
@@ -119,7 +134,7 @@ export async function runAutoMintWatcher(opts: AutoMintOpts): Promise<void> {
           // would silently skip it forever despite the "retrying" log below.
           lastScanned = latest;
         } catch (err: any) {
-          log.error(`  ⚠ log scan failed: ${err.message} — retrying next tick`);
+          log.error(`  ⚠ log scan failed: ${describeRpcError(err)} — retrying next tick`);
         }
 
         for (const s of sightings) {
@@ -161,7 +176,7 @@ export async function runAutoMintWatcher(opts: AutoMintOpts): Promise<void> {
     } catch (err: any) {
       consecutiveFailures++;
       log.error(
-        `  ⚠ poll failed (${consecutiveFailures}x): ${err.message} — still running, retrying with backoff`
+        `  ⚠ poll failed (${consecutiveFailures}x): ${describeRpcError(err)} — still running, retrying with backoff`
       );
     }
   }
@@ -209,7 +224,7 @@ export async function runAutoMintWatcher(opts: AutoMintOpts): Promise<void> {
         /* bookkeeping only */
       }
     } catch (err: any) {
-      log.error(`     ✗ Auto-mint attempt failed: ${err.message}`);
+      log.error(`     ✗ Auto-mint attempt failed: ${describeRpcError(err)}`);
     }
   }
 }

@@ -28,6 +28,20 @@ function stripPrefix(line: string): { prefix: string | null; rest: string } {
   return m ? { prefix: m[1], rest: m[2] } : { prefix: null, rest: line };
 }
 
+// A flapping RPC repeats the same failure every tick. Ten identical lines
+// say nothing more than one line and a count.
+export function collapseRepeats(lines: string[]): string[] {
+  const out: string[] = [];
+  let i = 0;
+  while (i < lines.length) {
+    let run = 1;
+    while (i + run < lines.length && lines[i + run] === lines[i]) run++;
+    out.push(run > 1 ? `${lines[i]}  (×${run})` : lines[i]);
+    i += run;
+  }
+  return out;
+}
+
 export interface FormattedBatch {
   header: string | null;
   body: string;
@@ -58,7 +72,7 @@ export function formatBatch(lines: string[]): FormattedBatch {
 
   while (out.length && out[out.length - 1].trim() === "") out.pop();
 
-  return { header: shared, body: out.join("\n").trim() };
+  return { header: shared, body: collapseRepeats(out).join("\n").trim() };
 }
 
 // Splits an over-long message on line boundaries where possible, so a batch
