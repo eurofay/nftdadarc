@@ -316,7 +316,10 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
     const chain = resolveChain(settings.chainKey)!;
     const { urls } = resolveRpcsForChain(settings.chainKey);
     const stopSignal = { stopped: false };
-    const logger = createLogger(createTelegramSink(bot, chatId));
+    // Prefixed like the auto-mint watchers are. Without this, copy-mint's
+    // output is the only unlabelled stream in the log and gets lost among
+    // the [chain]-tagged auto-mint lines running alongside it.
+    const logger = withPrefix(`copy:${settings.chainKey}`, createLogger(createTelegramSink(bot, chatId)));
     const promise = runCopyMintWatcher({
       chain,
       rpcUrls: urls,
