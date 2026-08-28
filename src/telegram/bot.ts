@@ -817,10 +817,23 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
   // Default-on: starts itself as soon as there's anything to watch. Holdings
   // are fetched asynchronously, so this can't block bot startup — and a
   // failure just leaves alerts off rather than preventing the bot from running.
+  //
+  // Always reports the outcome. "Always on" that quietly failed to start
+  // would be worse than being off, because it looks identical to working.
   if (store.getSettings().activityEnabled) {
-    void startActivity(ownerId).catch(() => {
-      /* leave alerts off; the menu can start them later */
-    });
+    void startActivity(ownerId)
+      .then((result) => {
+        const text = result.ok
+          ? `🔔 Activity alerts running — watching ${runningActivity ? "your holdings" : "nothing"} for sweeps, floor moves and offers.`
+          : `🔕 Activity alerts are ON but could not start: ${result.reason}\nThey'll start once that's resolved, or use the menu.`;
+        return bot.telegram.sendMessage(ownerId, text);
+      })
+      .catch((err: any) => {
+        console.error(`Activity alerts failed to start: ${err?.message ?? err}`);
+        bot.telegram
+          .sendMessage(ownerId, `🔕 Activity alerts could not start: ${err?.message ?? err}`)
+          .catch(() => {});
+      });
   }
 
   bot.action("menu:status", async (ctx) => {
