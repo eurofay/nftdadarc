@@ -328,6 +328,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
       pollIntervalMs: 4000,
       maxPriceEth: settings.copyMintMaxPriceEth,
       quantityPerWallet: settings.copyMintMaxQuantity,
+      logChunkBlocks: process.env.AUTO_LOG_CHUNK_BLOCKS ? parseInt(process.env.AUTO_LOG_CHUNK_BLOCKS, 10) : undefined,
       logger,
       stopSignal,
     }).catch((err) => logger.errorBold(`Copy-mint watcher crashed: ${err.message}`));

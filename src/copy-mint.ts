@@ -15,7 +15,8 @@
 // mints — so maxPriceEth is the one guardrail against blindly following it
 // into an expensive mint.
 
-import { buildLocalMintPlan, decodeMintPublic, SEADROP_ADDRESS } from "./seadrop-public";
+import { buildLocalMintPlan } from "./seadrop-public";
+import { scanSeaDropMints } from "./seadrop-events";
 import { localPublicSnipe } from "./local-mint";
 import { backoffMs, createProvider } from "./rpc-provider";
 import { ChainProfile } from "./chains";
@@ -28,50 +29,20 @@ export interface WatchedMint {
   blockNumber: number;
 }
 
-// Blocks (not events) have to be fetched individually — there's no getLogs
-// equivalent for "every tx in this range". Small concurrent batches avoid
-// both serial slowness and hammering a rate-limited free-tier RPC.
-const BLOCK_BATCH = 5;
-
 export async function scanWatchedMints(
   rpcUrl: string,
   fromBlock: number,
   toBlock: number,
-  watchTargets: string[]
+  watchTargets: string[],
+  chunkBlocks?: number
 ): Promise<WatchedMint[]> {
-  if (fromBlock > toBlock || watchTargets.length === 0) return [];
-  const provider = createProvider(rpcUrl);
-  const targets = new Set(watchTargets.map((a) => a.toLowerCase()));
-  const found: WatchedMint[] = [];
-
-  const blockNumbers: number[] = [];
-  for (let b = fromBlock; b <= toBlock; b++) blockNumbers.push(b);
-
-  for (let i = 0; i < blockNumbers.length; i += BLOCK_BATCH) {
-    const batch = blockNumbers.slice(i, i + BLOCK_BATCH);
-    const blocks = await Promise.all(batch.map((n) => provider.getBlock(n, true)));
-
-    for (const block of blocks) {
-      if (!block) continue;
-      for (const tx of block.prefetchedTransactions) {
-        if (!tx.from || !tx.to) continue;
-        if (!targets.has(tx.from.toLowerCase())) continue;
-        if (tx.to.toLowerCase() !== SEADROP_ADDRESS.toLowerCase()) continue;
-
-        const decoded = decodeMintPublic(tx.data);
-        if (!decoded) continue;
-
-        found.push({
-          txHash: tx.hash,
-          from: tx.from,
-          nftContract: decoded.nftContract,
-          blockNumber: block.number,
-        });
-      }
-    }
-  }
-
-  return found;
+  const sightings = await scanSeaDropMints(rpcUrl, fromBlock, toBlock, watchTargets, chunkBlocks);
+  return sightings.map((s) => ({
+    txHash: s.txHash,
+    from: s.minter,
+    nftContract: s.nftContract,
+    blockNumber: s.blockNumber,
+  }));
 }
 
 export interface CopyMintOpts {
@@ -85,6 +56,7 @@ export interface CopyMintOpts {
   pollIntervalMs: number;
   maxPriceEth: number; // skip anything pricier than this per wallet
   quantityPerWallet?: number; // default: the drop's own max-per-wallet cap
+  logChunkBlocks?: number; // eth_getLogs range per call — see seadrop-events.ts
   logger?: Logger;
   stopSignal?: { stopped: boolean };
 }
@@ -142,7 +114,7 @@ export async function runCopyMintWatcher(opts: CopyMintOpts): Promise<void> {
 
       let sightings: WatchedMint[] = [];
       try {
-        sightings = await scanWatchedMints(rpcUrls[0], lastScanned + 1, latest, watchTargets);
+        sightings = await scanWatchedMints(rpcUrls[0], lastScanned + 1, latest, watchTargets, opts.logChunkBlocks);
         // Only mark this range scanned on success — advancing it on failure
         // would silently skip it forever despite the "retrying" log below.
         lastScanned = latest;

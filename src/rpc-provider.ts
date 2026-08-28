@@ -18,10 +18,35 @@ import { FetchRequest, JsonRpcProvider } from "ethers";
 // a dead one stalls the poll loop. Override with RPC_TIMEOUT_MS.
 export const DEFAULT_RPC_TIMEOUT_MS = Number(process.env.RPC_TIMEOUT_MS) || 30_000;
 
+// Providers are cached per URL because several call sites (the log/block
+// scanners, every buildLocalMintPlan) construct one on *every* poll tick.
+// Each fresh JsonRpcProvider must run its own eth_chainId network detection
+// before it can serve a single request, so recreating them meant a wasted
+// detection call every few seconds per watcher — and when that detection
+// failed, ethers' own "failed to detect network... retry in 1s" loop on top.
+// One cached provider per endpoint detects once and reuses it.
+const providerCache = new Map<string, JsonRpcProvider>();
+
 export function createProvider(url: string, timeoutMs: number = DEFAULT_RPC_TIMEOUT_MS): JsonRpcProvider {
+  const cacheKey = `${timeoutMs}|${url}`;
+  const cached = providerCache.get(cacheKey);
+  if (cached) return cached;
+
   const request = new FetchRequest(url);
   request.timeout = timeoutMs;
-  return new JsonRpcProvider(request);
+  // staticNetwork: true = detect the network once, then never re-detect. The
+  // chain behind a given URL doesn't change under us, so re-detecting is pure
+  // overhead (and a failure path) on every reconnect.
+  const provider = new JsonRpcProvider(request, undefined, { staticNetwork: true });
+  providerCache.set(cacheKey, provider);
+  return provider;
+}
+
+// Tests point successive mock servers at freshly-assigned ports; clearing
+// keeps a dead endpoint from being reused if a port ever repeats.
+export function clearProviderCache(): void {
+  for (const provider of providerCache.values()) provider.destroy();
+  providerCache.clear();
 }
 
 // Poll loops must never die on a transient RPC failure, but they also

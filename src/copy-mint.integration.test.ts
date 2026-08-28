@@ -1,9 +1,14 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
 import { Interface, Transaction, Wallet, keccak256 } from "ethers";
 import { runCopyMintWatcher } from "./copy-mint";
-import { SEADROP_ADDRESS, decodeMintPublic, encodeMintPublic } from "./seadrop-public";
+import { SEADROP_ADDRESS, decodeMintPublic } from "./seadrop-public";
 import { CHAINS } from "./chains";
+import { clearProviderCache } from "./rpc-provider";
 import { startMockRpc, MockRpc } from "./test-support/mock-rpc";
+
+const EVENT_IFACE = new Interface([
+  "event SeaDropMint(address indexed nftContract, address indexed minter, address indexed feeRecipient, address payer, uint256 quantityMinted, uint256 unitMintPrice, uint256 feeBps, uint256 dropStageIndex)",
+]);
 
 const CALL_IFACE = new Interface([
   "function getPublicDrop(address nftContract) view returns (tuple(uint80 mintPrice, uint48 startTime, uint48 endTime, uint16 maxTotalMintableByWallet, uint16 feeBps, bool restrictFeeRecipients))",
@@ -15,53 +20,27 @@ const COPIER_KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4
 const NFT = "0x1111111111111111111111111111111111111111";
 const RECIPIENT = "0x3333333333333333333333333333333333333333";
 
-async function signedMintTxRpcShape(nftContract: string) {
-  const wallet = new Wallet(SOURCE_KEY);
-  const raw = await wallet.signTransaction({
-    to: SEADROP_ADDRESS,
-    data: encodeMintPublic(nftContract, RECIPIENT, 1),
-    value: 0n,
-    nonce: 0,
-    maxFeePerGas: 2_000_000_000n,
-    maxPriorityFeePerGas: 100_000_000n,
-    gasLimit: 250_000n,
-    type: 2,
-    chainId: 8453n,
-  });
-  const parsed = Transaction.from(raw);
+function mintLog(nftContract: string, minter: string, blockNumber: number) {
+  const { data, topics } = EVENT_IFACE.encodeEventLog(EVENT_IFACE.getEvent("SeaDropMint")!, [
+    nftContract,
+    minter,
+    RECIPIENT,
+    minter,
+    1n,
+    0n,
+    0n,
+    0n,
+  ]);
   return {
-    hash: parsed.hash,
-    from: parsed.from,
-    to: parsed.to,
-    input: parsed.data,
-    nonce: "0x0",
-    gas: `0x${parsed.gasLimit.toString(16)}`,
-    value: "0x0",
-    type: "0x2",
-    chainId: "0x2105",
-    maxFeePerGas: `0x${(parsed.maxFeePerGas ?? 0n).toString(16)}`,
-    maxPriorityFeePerGas: `0x${(parsed.maxPriorityFeePerGas ?? 0n).toString(16)}`,
-    accessList: [],
-    v: `0x${parsed.signature!.v.toString(16)}`,
-    r: parsed.signature!.r,
-    s: parsed.signature!.s,
-  };
-}
-
-function blockShape(number: number, transactions: any[]) {
-  return {
-    number: `0x${number.toString(16)}`,
-    hash: `0x${number.toString(16).padStart(64, "0")}`,
-    parentHash: `0x${"0".repeat(64)}`,
-    timestamp: `0x${Math.floor(Date.now() / 1000).toString(16)}`,
-    nonce: "0x0000000000000000",
-    difficulty: "0x0",
-    gasLimit: "0x1c9c380",
-    gasUsed: "0x0",
-    miner: "0x0000000000000000000000000000000000000000",
-    extraData: "0x",
-    baseFeePerGas: "0x0",
-    transactions,
+    address: SEADROP_ADDRESS,
+    topics,
+    data,
+    blockNumber: `0x${blockNumber.toString(16)}`,
+    transactionHash: `0x${blockNumber.toString(16).padStart(64, "0")}`,
+    transactionIndex: "0x0",
+    blockHash: `0x${"a".repeat(64)}`,
+    logIndex: "0x0",
+    removed: false,
   };
 }
 
@@ -69,6 +48,7 @@ let mock: MockRpc | undefined;
 
 afterEach(async () => {
   vi.restoreAllMocks();
+  clearProviderCache();
   await mock?.close();
   mock = undefined;
 });
@@ -77,14 +57,13 @@ afterEach(async () => {
 const DROP_MAX_PER_WALLET = 3;
 
 async function setUp(quantityPerWallet: number | undefined) {
-  const tx = await signedMintTxRpcShape(NFT);
   let block = 100;
   const sentQuantities: bigint[] = [];
 
   mock = await startMockRpc({
     eth_chainId: () => "0x2105",
     eth_blockNumber: () => `0x${(++block).toString(16)}`,
-    eth_getBlockByNumber: () => blockShape(block, [tx]),
+    eth_getLogs: () => [mintLog(NFT, new Wallet(SOURCE_KEY).address, block)],
     eth_call: (params) => {
       const call = CALL_IFACE.parseTransaction({ data: params[0].data })!;
       if (call.name === "getPublicDrop") {
