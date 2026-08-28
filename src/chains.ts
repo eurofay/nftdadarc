@@ -18,6 +18,12 @@ export interface ChainProfile {
   rpc: {
     alchemyHost?: string; // Alchemy host for this network (docs/reference)
     public: string[];     // public RPC + sequencer endpoints
+    // How many blocks this chain's endpoint accepts in one eth_getLogs.
+    // Measured, not assumed — it's a property of the endpoint and varies
+    // hugely: Alchemy's free tier allows 10 on every chain, while
+    // Robinhood's own public RPC serves 10,000 in ~300ms. Overridable per
+    // chain with AUTO_LOG_CHUNK_BLOCKS_<CHAIN>.
+    logChunkBlocks?: number;
   };
 }
 
@@ -30,6 +36,7 @@ export const CHAINS: ChainProfile[] = [
     nativeSymbol: "ETH",
     rpc: {
       alchemyHost: "eth-mainnet.g.alchemy.com",
+      logChunkBlocks: 10,
       public: [
         "https://ethereum-rpc.publicnode.com",
         "https://eth.merkle.io",
@@ -45,6 +52,7 @@ export const CHAINS: ChainProfile[] = [
     nativeSymbol: "ETH",
     rpc: {
       alchemyHost: "base-mainnet.g.alchemy.com",
+      logChunkBlocks: 10,
       public: [
         "https://mainnet.base.org",
         "https://base-rpc.publicnode.com",
@@ -62,6 +70,10 @@ export const CHAINS: ChainProfile[] = [
     nativeSymbol: "ETH",
     rpc: {
       alchemyHost: "robinhood-mainnet.g.alchemy.com",
+      // Measured: the public endpoint below returns a 10,000-block range in
+      // ~300ms. 2000 keeps a wide margin while still covering ~200s of this
+      // chain's ~10 blocks/second in a single call.
+      logChunkBlocks: 2000,
       public: [
         "https://rpc.mainnet.chain.robinhood.com",
         "https://sequencer.mainnet.chain.robinhood.com",
@@ -96,4 +108,17 @@ export function explorerTx(
   const profile = resolveChain(idOrKey);
   const base = profile?.explorer ?? DEFAULT_EXPLORER;
   return `${base}/tx/${txHash}`;
+}
+
+// Blocks per eth_getLogs for a chain: an explicit per-chain env override
+// wins, then the global one, then the chain's measured default, then a
+// universally-safe 10.
+export function logChunkBlocksFor(chainKey: string, env: NodeJS.ProcessEnv = process.env): number {
+  const perChain = Number(env[`AUTO_LOG_CHUNK_BLOCKS_${chainKey.toUpperCase()}`]);
+  if (Number.isFinite(perChain) && perChain > 0) return perChain;
+
+  const global = Number(env.AUTO_LOG_CHUNK_BLOCKS);
+  if (Number.isFinite(global) && global > 0) return global;
+
+  return resolveChain(chainKey)?.rpc.logChunkBlocks ?? 10;
 }

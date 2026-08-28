@@ -8,7 +8,7 @@ dotenv.config({ path: path.resolve(process.cwd(), ".env") });
 
 import { runWizard } from "./wizard";
 import { closePrompts } from "./prompt";
-import { resolveChain } from "./chains";
+import { resolveChain, logChunkBlocksFor } from "./chains";
 import { resolveRpcsForChain } from "./rpc-resolver";
 import { runAutoMintWatcher } from "./auto-mint";
 import { withPrefix } from "./logger";
@@ -57,9 +57,7 @@ async function runAutoForChain(chainKey: string, walletKeys: string[]): Promise<
   const maxMintsPerRun = process.env.AUTO_MAX_MINTS_PER_RUN
     ? parseInt(process.env.AUTO_MAX_MINTS_PER_RUN, 10)
     : undefined;
-  const logChunkBlocks = process.env.AUTO_LOG_CHUNK_BLOCKS
-    ? parseInt(process.env.AUTO_LOG_CHUNK_BLOCKS, 10)
-    : undefined;
+  const logChunkBlocks = logChunkBlocksFor(chainKey);
 
   await runAutoMintWatcher({
     chain,

@@ -37,7 +37,7 @@ import {
   activityMenu,
   maskAddress,
 } from "./menus";
-import { resolveChain } from "../chains";
+import { resolveChain, logChunkBlocksFor } from "../chains";
 import { resolveRpcsForChain } from "../rpc-resolver";
 import { parseNftLink } from "../nft-link";
 import { resolveSlug, openseaContractInfo } from "../slug-resolver";
@@ -987,7 +987,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
       pollIntervalMs: 4000,
       maxPriceEth: settings.copyMintMaxPriceEth,
       quantityPerWallet: settings.copyMintMaxQuantity,
-      logChunkBlocks: process.env.AUTO_LOG_CHUNK_BLOCKS ? parseInt(process.env.AUTO_LOG_CHUNK_BLOCKS, 10) : undefined,
+      logChunkBlocks: logChunkBlocksFor(settings.chainKey),
       onMinted: (o) => recordOutcome(store, settings.chainKey, o),
       alreadyMinted: (c) => store.listMints().some((m) => m.nftContract.toLowerCase() === c.toLowerCase()),
       logger,
@@ -1072,7 +1072,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
         pollIntervalMs: 4000,
         maxQuantityPerWallet: settings.autoMaxQuantity,
         openseaApiKey: process.env.OPENSEA_API_KEY,
-        logChunkBlocks: process.env.AUTO_LOG_CHUNK_BLOCKS ? parseInt(process.env.AUTO_LOG_CHUNK_BLOCKS, 10) : undefined,
+        logChunkBlocks: logChunkBlocksFor(key),
         onMinted: (o) => recordOutcome(store, key, o),
         alreadyMinted: (c) => store.listMints().some((m) => m.nftContract.toLowerCase() === c.toLowerCase()),
         logger,
