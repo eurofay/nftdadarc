@@ -39,12 +39,18 @@ export function portfolioWalletsMenu(wallets: WalletRecord[]) {
   return Markup.inlineKeyboard(rows);
 }
 
+// Telegram caps callback_data at 64 bytes. An address (42) plus a collection
+// slug blows straight past that, so anything carrying both is stashed and
+// referenced by a short token instead.
+export type Tokenizer = (payload: string) => string;
+
 export function walletHoldingsMenu(
   address: string,
-  collections: { slug: string; count: number }[]
+  collections: { slug: string; count: number }[],
+  tok: Tokenizer
 ) {
   const rows = collections.slice(0, 20).map((c) => [
-    Markup.button.callback(`${c.slug} ×${c.count}`, `pf:col:${address}:${c.slug}`),
+    Markup.button.callback(`${c.slug} ×${c.count}`, `pf:col:${tok(`${address}|${c.slug}`)}`),
   ]);
   rows.push([Markup.button.callback("📈 This wallet's activity", `pf:wactivity:${address}`)]);
   rows.push([Markup.button.callback("🔄 Refresh", `pf:wallet:${address}`)]);
@@ -52,28 +58,31 @@ export function walletHoldingsMenu(
   return Markup.inlineKeyboard(rows);
 }
 
-export function walletCollectionMenu(address: string, slug: string, openseaUrl?: string) {
+export function walletCollectionMenu(address: string, slug: string, tok: Tokenizer, openseaUrl?: string) {
+  const pair = tok(`${address}|${slug}`);
   const rows: any[] = [];
   if (openseaUrl) rows.push([Markup.button.url("🌊 View on OpenSea", openseaUrl)]);
-  rows.push([Markup.button.callback("📈 Collection activity", `pf:colactivity:${slug}`)]);
-  rows.push([Markup.button.callback("💵 Sell / offers", `sell:col:${address}:${slug}`)]);
+  rows.push([Markup.button.callback("📈 Collection activity", `pf:colact:${tok(slug)}`)]);
+  rows.push([Markup.button.callback("💵 Sell / offers", `sell:col:${pair}`)]);
   rows.push([Markup.button.callback("⬅ Back", `pf:wallet:${address}`)]);
   return Markup.inlineKeyboard(rows);
 }
 
-export function sellCollectionMenu(address: string, slug: string, canAccept: boolean) {
+export function sellCollectionMenu(address: string, slug: string, canAccept: boolean, tok: Tokenizer) {
+  const pair = tok(`${address}|${slug}`);
   const rows: any[] = [];
-  if (canAccept) rows.push([Markup.button.callback("✅ Accept best offer", `sell:ask:${address}:${slug}`)]);
-  rows.push([Markup.button.callback("🏷 List at a price", `sell:list:${address}:${slug}`)]);
-  rows.push([Markup.button.callback("🔄 Refresh", `sell:col:${address}:${slug}`)]);
-  rows.push([Markup.button.callback("⬅ Back", `pf:col:${address}:${slug}`)]);
+  if (canAccept) rows.push([Markup.button.callback("✅ Accept best offer", `sell:ask:${pair}`)]);
+  rows.push([Markup.button.callback("🏷 List at a price", `sell:list:${pair}`)]);
+  rows.push([Markup.button.callback("🔄 Refresh", `sell:col:${pair}`)]);
+  rows.push([Markup.button.callback("⬅ Back", `pf:col:${pair}`)]);
   return Markup.inlineKeyboard(rows);
 }
 
-export function sellActionConfirmMenu(action: string, address: string, slug: string) {
+export function sellActionConfirmMenu(action: string, address: string, slug: string, tok: Tokenizer) {
+  const pair = tok(`${address}|${slug}`);
   return Markup.inlineKeyboard([
-    [Markup.button.callback("✅ Confirm", `sell:go:${action}:${address}:${slug}`)],
-    [Markup.button.callback("❌ Cancel", `sell:col:${address}:${slug}`)],
+    [Markup.button.callback("✅ Confirm", `sell:go:${action}:${pair}`)],
+    [Markup.button.callback("❌ Cancel", `sell:col:${pair}`)],
   ]);
 }
 

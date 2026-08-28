@@ -80,6 +80,8 @@ interface SessionData {
   schedDropMax?: number;
   schedStartTime?: number; // on-chain drop start, unix seconds
   schedTargetStartMs?: number | "now"; // chosen fire time, pending confirmation
+  cbTokens?: Record<string, string>;
+  cbSeq?: number;
   sellWallet?: string;
   sellSlug?: string;
   sellPriceEth?: number;
@@ -203,6 +205,40 @@ function createTelegramSink(bot: Telegraf<BotContext>, chatId: number): LogSink 
   };
 }
 
+// Telegram's callback_data limit is 64 bytes; an address plus a slug exceeds
+// it. Long payloads are stashed per chat and referenced by a short id, which
+// keeps every button well under the cap no matter how long a slug is.
+function makeTokenizer(session: SessionData) {
+  return (payload: string): string => {
+    session.cbTokens ??= {};
+    // Reuse an existing id for the same payload so redrawing a menu doesn't
+    // grow the registry without bound.
+    for (const [id, value] of Object.entries(session.cbTokens)) {
+      if (value === payload) return id;
+    }
+    session.cbSeq = (session.cbSeq ?? 0) + 1;
+    const id = session.cbSeq.toString(36);
+    session.cbTokens[id] = payload;
+
+    const ids = Object.keys(session.cbTokens);
+    if (ids.length > 300) delete session.cbTokens[ids[0]];
+    return id;
+  };
+}
+
+function resolveToken(session: SessionData, id: string): string | undefined {
+  return session.cbTokens?.[id];
+}
+
+// Splits an "address|slug" payload back apart.
+function resolvePair(session: SessionData, id: string): { address: string; slug: string } | null {
+  const raw = resolveToken(session, id);
+  if (!raw) return null;
+  const idx = raw.indexOf("|");
+  if (idx < 0) return null;
+  return { address: raw.slice(0, idx), slug: raw.slice(idx + 1) };
+}
+
 export interface BotDeps {
   token: string;
   ownerId: number;
@@ -211,6 +247,20 @@ export interface BotDeps {
 
 export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotContext> {
   const bot = new Telegraf<BotContext>(token);
+
+  // Without this, a throw inside any handler propagates out through
+  // Telegraf's update loop and surfaces as "Failed to start" from the launch
+  // promise — which reads like the bot died at boot when it's actually one
+  // bad button press. Keep the bot alive and tell the user what broke.
+  bot.catch(async (err: any, ctx) => {
+    const detail = err?.description || err?.message || String(err);
+    console.error(`Handler error on ${ctx.updateType}: ${detail}`);
+    try {
+      await ctx.reply(`⚠️ That action failed: ${detail}`);
+    } catch {
+      /* the chat may be unreachable; the log above is the fallback */
+    }
+  });
 
   const sessions = new Map<number, SessionData>();
   bot.use((ctx, next) => {
@@ -298,7 +348,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
     if (collections.length === 0) {
       return ctx.reply(
         `${wallet.label} holds no NFTs on ${settings.chainKey} (or OpenSea hasn't indexed them).`,
-        walletHoldingsMenu(wallet.address, [])
+        walletHoldingsMenu(wallet.address, [], makeTokenizer(ctx.session))
       );
     }
 
@@ -309,12 +359,14 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
     await ctx.reply(
       `🖼 ${wallet.label} (${maskAddress(wallet.address)}) on ${settings.chainKey}\n` +
         `${nfts.length} NFT(s) across ${collections.length} collection(s)\n\n${lines}`,
-      walletHoldingsMenu(wallet.address, collections)
+      walletHoldingsMenu(wallet.address, collections, makeTokenizer(ctx.session))
     );
   });
 
-  bot.action(/^pf:col:([^:]+):(.+)$/, async (ctx) => {
-    const [address, slug] = [ctx.match[1], ctx.match[2]];
+  bot.action(/^pf:col:(.+)$/, async (ctx) => {
+    const pair = resolvePair(ctx.session, ctx.match[1]);
+    if (!pair) return ctx.answerCbQuery("That menu expired — reopen Portfolio.", { show_alert: true });
+    const { address, slug } = pair;
     await ctx.answerCbQuery("Loading...");
     const key = process.env.OPENSEA_API_KEY;
     const [info, stats] = await Promise.all([fetchCollection(slug, key), fetchStats(slug, key)]);
@@ -327,7 +379,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
           `24h: ${stats.oneDaySales} sales, ${stats.oneDayVolume.toFixed(6)} ${stats.floorSymbol}`
         : "Market data unavailable");
 
-    const kb = walletCollectionMenu(address, slug, info?.openseaUrl);
+    const kb = walletCollectionMenu(address, slug, makeTokenizer(ctx.session), info?.openseaUrl);
     if (info?.imageUrl) {
       try {
         await ctx.replyWithPhoto(info.imageUrl, { caption, ...kb });
@@ -359,8 +411,9 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
     );
   });
 
-  bot.action(/^pf:colactivity:(.+)$/, async (ctx) => {
-    const slug = ctx.match[1];
+  bot.action(/^pf:colact:(.+)$/, async (ctx) => {
+    const slug = resolveToken(ctx.session, ctx.match[1]);
+    if (!slug) return ctx.answerCbQuery("That menu expired — reopen Portfolio.", { show_alert: true });
     await ctx.answerCbQuery("Fetching activity...");
     const events = await fetchActivity(slug, process.env.OPENSEA_API_KEY, 15);
     if (events.length === 0) return ctx.reply("No recent activity for this collection.");
@@ -467,8 +520,10 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
   });
 
   // ── Sell from a specific wallet's holdings ───────────────────────────
-  bot.action(/^sell:col:([^:]+):(.+)$/, async (ctx) => {
-    const [address, slug] = [ctx.match[1], ctx.match[2]];
+  bot.action(/^sell:col:(.+)$/, async (ctx) => {
+    const pair = resolvePair(ctx.session, ctx.match[1]);
+    if (!pair) return ctx.answerCbQuery("That menu expired — reopen Portfolio.", { show_alert: true });
+    const { address, slug } = pair;
     await ctx.answerCbQuery("Checking offers...");
     const key = process.env.OPENSEA_API_KEY;
     const [offer, stats] = await Promise.all([fetchBestCollectionOffer(slug, key), fetchStats(slug, key)]);
@@ -483,23 +538,27 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
       `💵 ${slug}\n\n${offerText}\nFloor: ${floorText}\n\n` +
         "Accept sells to the best standing offer immediately.\n" +
         "List creates a signed listing at your price — no gas, no sale until someone buys.",
-      sellCollectionMenu(address, slug, offer !== null)
+      sellCollectionMenu(address, slug, offer !== null, makeTokenizer(ctx.session))
     );
   });
 
-  bot.action(/^sell:ask:([^:]+):(.+)$/, async (ctx) => {
-    const [address, slug] = [ctx.match[1], ctx.match[2]];
+  bot.action(/^sell:ask:(.+)$/, async (ctx) => {
+    const pair = resolvePair(ctx.session, ctx.match[1]);
+    if (!pair) return ctx.answerCbQuery("That menu expired — reopen Portfolio.", { show_alert: true });
+    const { address, slug } = pair;
     const offer = await fetchBestCollectionOffer(slug, process.env.OPENSEA_API_KEY);
     if (!offer) return ctx.answerCbQuery("That offer is gone — refresh.", { show_alert: true });
     await ctx.answerCbQuery();
     return ctx.reply(
       `Sell 1 × ${slug} for ${offer.priceEth} ETH?\n\nThis transfers the NFT out and cannot be undone.`,
-      sellActionConfirmMenu("accept", address, slug)
+      sellActionConfirmMenu("accept", address, slug, makeTokenizer(ctx.session))
     );
   });
 
-  bot.action(/^sell:list:([^:]+):(.+)$/, async (ctx) => {
-    const [address, slug] = [ctx.match[1], ctx.match[2]];
+  bot.action(/^sell:list:(.+)$/, async (ctx) => {
+    const pair = resolvePair(ctx.session, ctx.match[1]);
+    if (!pair) return ctx.answerCbQuery("That menu expired — reopen Portfolio.", { show_alert: true });
+    const { address, slug } = pair;
     ctx.session.step = "awaiting_list_price";
     ctx.session.sellWallet = address;
     ctx.session.sellSlug = slug;
@@ -512,8 +571,11 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
     );
   });
 
-  bot.action(/^sell:go:([^:]+):([^:]+):(.+)$/, async (ctx) => {
-    const [action, address, slug] = [ctx.match[1], ctx.match[2], ctx.match[3]];
+  bot.action(/^sell:go:([^:]+):(.+)$/, async (ctx) => {
+    const action = ctx.match[1];
+    const pair = resolvePair(ctx.session, ctx.match[2]);
+    if (!pair) return ctx.answerCbQuery("That menu expired — reopen Portfolio.", { show_alert: true });
+    const { address, slug } = pair;
     await ctx.answerCbQuery(action === "accept" ? "Selling..." : "Listing...");
 
     const settings = store.getSettings();
@@ -1493,7 +1555,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
         `List 1 × ${slug} at ${priceEth} ETH?\n\n` +
           "Listing costs no gas and moves nothing now — it publishes a signed offer to sell. " +
           "You'll be asked to approve the transfer contract if it isn't approved yet.",
-        sellActionConfirmMenu("list", address, slug)
+        sellActionConfirmMenu("list", address, slug, makeTokenizer(ctx.session))
       );
     }
 
