@@ -60,6 +60,7 @@ import { batchTransfer, estimateBatchCost } from "../fund-transfer";
 import { acceptOfferViaSdk, acceptOfferWithFallback, createListing, parseListingPrice } from "../opensea-sell";
 import { createLogger, withPrefix, LogSink } from "../logger";
 import { istTimeToDate, toIST } from "../time-format";
+import { renderBatch } from "./format";
 
 interface SessionData {
   step?:
@@ -188,20 +189,54 @@ async function recordOutcome(
   }
 }
 
-// Serializes sends to one chat with a small gap between them, so a burst of
-// headline events (a mint firing, then its result) can't trip Telegram's
-// flood limits the way blasting every line unthrottled would.
+// Batches log lines into one message instead of sending each separately.
+//
+// A single mint emits a dozen-odd lines; one Telegram message each turned the
+// chat into noise. Lines are collected until the burst goes quiet, then sent
+// as one structured message. Sends stay serialized so batches arrive in
+// order and can't trip Telegram's flood limits.
+//
+// Each watcher builds its own sink, so their bursts buffer independently and
+// concurrent chains never interleave inside one message.
+const BATCH_QUIET_MS = 1200; // a mint's lines land well inside this
+const BATCH_MAX_LINES = 60; // flush early rather than let a long run grow unbounded
+
 function createTelegramSink(bot: Telegraf<BotContext>, chatId: number): LogSink {
+  let buffer: string[] = [];
+  let timer: NodeJS.Timeout | null = null;
   let queue: Promise<void> = Promise.resolve();
-  return (text: string) => {
+
+  const flush = () => {
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+    if (buffer.length === 0) return;
+    const messages = renderBatch(buffer);
+    buffer = [];
+
     queue = queue.then(async () => {
-      try {
-        await bot.telegram.sendMessage(chatId, text.trim() || "(empty)");
-      } catch {
-        // best-effort — a dropped status line shouldn't crash the mint attempt
+      for (const text of messages) {
+        try {
+          await bot.telegram.sendMessage(chatId, text);
+        } catch {
+          // best-effort — a dropped status message shouldn't affect a mint
+        }
+        await new Promise((r) => setTimeout(r, 350));
       }
-      await new Promise((r) => setTimeout(r, 350));
     });
+  };
+
+  return (text: string) => {
+    buffer.push(text);
+    if (buffer.length >= BATCH_MAX_LINES) {
+      flush();
+      return;
+    }
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(flush, BATCH_QUIET_MS);
+    // Don't hold the process open just to deliver a status message.
+    if (typeof timer.unref === "function") timer.unref();
   };
 }
 
