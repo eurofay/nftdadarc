@@ -44,6 +44,7 @@ export function portfolioItemMenu(record: MintRecord, openseaUrl?: string) {
   const rows: any[] = [];
   if (openseaUrl) rows.push([Markup.button.url("🌊 View on OpenSea", openseaUrl)]);
   rows.push([Markup.button.callback("📈 Recent activity", `pf:activity:${record.nftContract}`)]);
+  rows.push([Markup.button.callback("💵 Sell / offers", `pf:sell:${record.nftContract}`)]);
   rows.push([Markup.button.callback("🗑 Remove from portfolio", `pf:remove:${record.nftContract}`)]);
   rows.push([Markup.button.callback("⬅ Back", "menu:portfolio")]);
   return Markup.inlineKeyboard(rows);
@@ -53,6 +54,21 @@ export function portfolioItemMenu(record: MintRecord, openseaUrl?: string) {
 // removing it directly, since there's a home needed for the Auto/Copy Mint
 // participation toggles. The suffix is an at-a-glance summary of which
 // watchers this wallet currently participates in.
+export function sellMenu(contract: string, canAccept: boolean) {
+  const rows: any[] = [];
+  if (canAccept) rows.push([Markup.button.callback("✅ Accept best offer", `sell:accept:${contract}`)]);
+  rows.push([Markup.button.callback("🔄 Refresh", `pf:sell:${contract}`)]);
+  rows.push([Markup.button.callback("⬅ Back", `pf:view:${contract}`)]);
+  return Markup.inlineKeyboard(rows);
+}
+
+export function sellConfirmMenu(contract: string) {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback("✅ Yes, sell it", `sell:confirm:${contract}`)],
+    [Markup.button.callback("❌ Cancel", `pf:sell:${contract}`)],
+  ]);
+}
+
 export function walletsMenu(wallets: WalletRecord[]) {
   const rows = wallets.map((w) => {
     const flags = `${w.includeInAutoMint === false ? "" : "🎯"}${w.includeInCopyMint === false ? "" : "👀"}` || "—";

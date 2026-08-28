@@ -27,6 +27,8 @@ import {
   schedConfirmMenu,
   portfolioMenu,
   portfolioItemMenu,
+  sellMenu,
+  sellConfirmMenu,
   activityMenu,
   maskAddress,
 } from "./menus";
@@ -38,6 +40,7 @@ import {
   fetchCollection,
   fetchStats,
   fetchActivity,
+  fetchBestCollectionOffer,
   openseaCollectionUrl,
 } from "../opensea-market";
 import { buildLocalMintPlan } from "../seadrop-public";
@@ -46,6 +49,7 @@ import { runAutoMintWatcher } from "../auto-mint";
 import { runCopyMintWatcher } from "../copy-mint";
 import { runActivityWatcher } from "../activity-watcher";
 import { batchTransfer, estimateBatchCost } from "../fund-transfer";
+import { acceptOfferViaSdk, acceptOfferWithFallback } from "../opensea-sell";
 import { createLogger, withPrefix, LogSink } from "../logger";
 import { istTimeToDate, toIST } from "../time-format";
 
@@ -350,6 +354,91 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
     await ctx.reply(
       `📈 ${record.name || record.slug} — last ${events.length} events (${sales} sales)\n\n${lines.join("\n")}`
     );
+  });
+
+  // ── Sell: view the best offer, then accept it via either path ────────
+  bot.action(/^pf:sell:(.+)$/, async (ctx) => {
+    const record = store.listMints().find((m) => m.nftContract.toLowerCase() === ctx.match[1].toLowerCase());
+    if (!record?.slug) {
+      return ctx.answerCbQuery("No OpenSea slug for this collection — selling unavailable.", { show_alert: true });
+    }
+    await ctx.answerCbQuery("Checking offers...");
+
+    const key = process.env.OPENSEA_API_KEY;
+    const [offer, stats] = await Promise.all([
+      fetchBestCollectionOffer(record.slug, key),
+      fetchStats(record.slug, key),
+    ]);
+
+    const floorText = stats?.floorPrice != null ? `${stats.floorPrice} ${stats.floorSymbol}` : "nothing listed";
+    const body = offer
+      ? `💵 ${record.name || record.slug}\n\n` +
+        `Best collection offer: ${offer.priceEth} ETH\n` +
+        `Floor: ${floorText}` +
+        (stats?.floorPrice ? ` (offer is ${((offer.priceEth / stats.floorPrice) * 100).toFixed(0)}% of floor)` : "") +
+        `\nHeld: ${record.quantity}\n\n` +
+        "Accepting sells ONE token to the best standing offer. You'll be asked to confirm, " +
+        "and to approve the transfer contract first if it isn't approved yet."
+      : `💵 ${record.name || record.slug}\n\nNo collection offers right now.\nFloor: ${floorText}`;
+
+    await ctx.reply(body, sellMenu(record.nftContract, offer !== null));
+  });
+
+  bot.action(/^sell:accept:(.+)$/, async (ctx) => {
+    const record = store.listMints().find((m) => m.nftContract.toLowerCase() === ctx.match[1].toLowerCase());
+    if (!record?.slug) return ctx.answerCbQuery("Not sellable.", { show_alert: true });
+    const offer = await fetchBestCollectionOffer(record.slug, process.env.OPENSEA_API_KEY);
+    if (!offer) return ctx.answerCbQuery("That offer is gone — refresh.", { show_alert: true });
+    await ctx.answerCbQuery();
+    return ctx.reply(
+      `Sell 1 × ${record.name || record.slug} for ${offer.priceEth} ETH?\n\n` +
+        "This transfers the NFT out of your wallet and cannot be undone.",
+      sellConfirmMenu(record.nftContract)
+    );
+  });
+
+  bot.action(/^sell:confirm:(.+)$/, async (ctx) => {
+    const record = store.listMints().find((m) => m.nftContract.toLowerCase() === ctx.match[1].toLowerCase());
+    if (!record?.slug) return ctx.answerCbQuery("Not sellable.", { show_alert: true });
+    await ctx.answerCbQuery("Selling...");
+
+    const settings = store.getSettings();
+    const { urls } = resolveRpcsForChain(record.chainKey);
+    const logger = withPrefix("sell", createLogger(createTelegramSink(bot, ctx.chat!.id)));
+
+    // Sell from a wallet that actually minted this collection.
+    const seller = store.listWallets().find((w) =>
+      record.wallets.some((a) => a.toLowerCase() === w.address.toLowerCase())
+    );
+    if (!seller) return ctx.reply("❌ None of your current wallets hold this collection.");
+
+    try {
+      const walletKey = store.getDecryptedKey(seller.address);
+      const result = await acceptOfferWithFallback(
+        [
+          () =>
+            acceptOfferViaSdk({
+              rpcUrl: urls[0],
+              walletKey,
+              chainKey: record.chainKey,
+              slug: record.slug!,
+              apiKey: process.env.OPENSEA_API_KEY,
+              maxFeePerGas: gweiToWei(settings.maxFeeGwei),
+              maxPriorityFee: gweiToWei(settings.priorityGwei),
+            }),
+        ],
+        logger
+      );
+
+      if (result.ok) {
+        await ctx.reply(`✅ Sold via the ${result.usedPath} path.\n${result.txHash}`);
+      } else {
+        const why = result.attempts.map((a) => `• ${a.path}: ${a.error}`).join("\n");
+        await ctx.reply(`❌ Could not sell:\n${why}`);
+      }
+    } catch (err: any) {
+      await ctx.reply(`❌ ${err.message}`);
+    }
   });
 
   bot.action(/^pf:remove:(.+)$/, (ctx) => {
