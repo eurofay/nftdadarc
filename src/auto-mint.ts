@@ -34,6 +34,11 @@ export interface AutoMintOpts {
   logger?: Logger; // defaults to printing locally — the Telegram bot passes one that also forwards to a chat
   stopSignal?: { stopped: boolean }; // lets a caller (the bot) stop the watcher without SIGINT
   onMinted?: (outcome: SnipeOutcome) => void | Promise<void>; // portfolio bookkeeping; never allowed to fail a mint
+  // Consulted before firing. The in-memory 'fired' set below only survives
+  // one run, so without a persistent check a restart re-fires collections
+  // already minted — which reverts with MintQuantityExceedsMaxMintedPerWallet
+  // and burns gas for nothing. The bot backs this with the portfolio store.
+  alreadyMinted?: (nftContract: string) => boolean;
 }
 
 function nowSec(): number {
@@ -135,6 +140,11 @@ export async function runAutoMintWatcher(opts: AutoMintOpts): Promise<void> {
           continue;
         }
         if (fired.has(nftContract) || !isLive(drop)) continue;
+        if (opts.alreadyMinted?.(nftContract)) {
+          fired.add(nftContract); // remember for this run too, so it isn't re-checked every tick
+          log.info(`  ↷ Skipping ${nftContract} — already in your portfolio (would exceed max per wallet).`);
+          continue;
+        }
 
         fired.add(nftContract); // mark first so a slow mint doesn't get retried next tick
         await mintCandidate(nftContract, drop.maxTotalMintableByWallet);

@@ -241,6 +241,61 @@ describe("runAutoMintWatcher (against a real mock RPC node)", () => {
     expect(text).toContain("LIVE FREE MINT");
   });
 
+  it("skips a collection already held, instead of re-minting into a guaranteed revert", { timeout: 15000 }, async () => {
+    // Regression test for gas burned on MintQuantityExceedsMaxMintedPerWallet:
+    // the in-memory `fired` set doesn't survive a restart, so without a
+    // persistent check the watcher re-fires collections already minted and
+    // every one of those transactions reverts.
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    let block = 100;
+    const log = eventLog(NFT);
+
+    mock = await startMockRpc({
+      eth_chainId: () => "0x2105",
+      eth_blockNumber: () => `0x${(++block).toString(16)}`,
+      eth_getLogs: () => [log],
+      eth_call: (params) => {
+        const call = CALL_IFACE.parseTransaction({ data: params[0].data })!;
+        if (call.name === "getPublicDrop") {
+          const d = LIVE_FREE_DROP;
+          return CALL_IFACE.encodeFunctionResult("getPublicDrop", [
+            [d.mintPrice, d.startTime, d.endTime, d.maxTotalMintableByWallet, d.feeBps, d.restrictFeeRecipients],
+          ]);
+        }
+        return CALL_IFACE.encodeFunctionResult("getAllowedFeeRecipients", [[RECIPIENT]]);
+      },
+      eth_getTransactionCount: () => "0x0",
+      eth_sendRawTransaction: (params) => keccak256(params[0]),
+      eth_getTransactionReceipt: () => ({
+        blockNumber: "0x64",
+        transactionIndex: "0x1",
+        gasUsed: "0x5208",
+        status: "0x1",
+      }),
+    });
+
+    const run = runAutoMintWatcher({
+      chain: CHAINS.find((c) => c.key === "base")!,
+      rpcUrls: [mock.url],
+      walletKeys: [TEST_KEY],
+      maxFeePerGas: 2_000_000_000n,
+      maxPriorityFee: 100_000_000n,
+      gasLimit: 250_000,
+      pollIntervalMs: 20,
+      alreadyMinted: (c) => c.toLowerCase() === NFT.toLowerCase(),
+    });
+
+    await new Promise((r) => setTimeout(r, 600));
+    process.emit("SIGINT" as any);
+    await run;
+
+    const text = logSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+    expect(text).toContain("already in your portfolio");
+    expect(text).not.toContain("LIVE FREE MINT");
+    // The decisive assertion: nothing was broadcast at all.
+    expect(mock.calls.some((c) => c.method === "eth_sendRawTransaction")).toBe(false);
+  });
+
   it("never fires on a drop whose price is non-zero", { timeout: 15000 }, async () => {
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     let block = 100;

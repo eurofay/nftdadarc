@@ -549,6 +549,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
       quantityPerWallet: settings.copyMintMaxQuantity,
       logChunkBlocks: process.env.AUTO_LOG_CHUNK_BLOCKS ? parseInt(process.env.AUTO_LOG_CHUNK_BLOCKS, 10) : undefined,
       onMinted: (o) => recordOutcome(store, settings.chainKey, o),
+      alreadyMinted: (c) => store.listMints().some((m) => m.nftContract.toLowerCase() === c.toLowerCase()),
       logger,
       stopSignal,
     }).catch((err) => logger.errorBold(`Copy-mint watcher crashed: ${err.message}`));
@@ -633,6 +634,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
         openseaApiKey: process.env.OPENSEA_API_KEY,
         logChunkBlocks: process.env.AUTO_LOG_CHUNK_BLOCKS ? parseInt(process.env.AUTO_LOG_CHUNK_BLOCKS, 10) : undefined,
         onMinted: (o) => recordOutcome(store, key, o),
+        alreadyMinted: (c) => store.listMints().some((m) => m.nftContract.toLowerCase() === c.toLowerCase()),
         logger,
         stopSignal,
       }).catch((err) => logger.errorBold(`Auto-mint watcher crashed: ${err.message}`));

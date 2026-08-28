@@ -58,6 +58,7 @@ export interface CopyMintOpts {
   quantityPerWallet?: number; // default: the drop's own max-per-wallet cap
   logChunkBlocks?: number; // eth_getLogs range per call — see seadrop-events.ts
   onMinted?: (outcome: SnipeOutcome) => void | Promise<void>; // portfolio bookkeeping; never allowed to fail a mint
+  alreadyMinted?: (nftContract: string) => boolean; // see auto-mint.ts — avoids re-minting across restarts
   logger?: Logger;
   stopSignal?: { stopped: boolean };
 }
@@ -126,6 +127,11 @@ export async function runCopyMintWatcher(opts: CopyMintOpts): Promise<void> {
       for (const sighting of sightings) {
         if (copied.has(sighting.nftContract.toLowerCase())) continue;
         copied.add(sighting.nftContract.toLowerCase());
+
+        if (opts.alreadyMinted?.(sighting.nftContract)) {
+          log.info(`  ↷ Skipping ${sighting.nftContract} — already in your portfolio.`);
+          continue;
+        }
 
         log.warnBold(
           `\n  👀 ${sighting.from} minted ${sighting.nftContract} (block ${sighting.blockNumber}) — copying`
