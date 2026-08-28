@@ -256,6 +256,76 @@ export async function acceptOfferViaApi(opts: {
   }
 }
 
+// Parses a listing price that may be absolute ("0.05") or derived from the
+// live floor ("floor", "floor*1.2"). Returns null for anything unusable
+// rather than guessing — a misread price here lists an NFT at the wrong
+// number, so ambiguity must fail loudly instead of defaulting.
+export function parseListingPrice(input: string, floorPrice: number | null): number | null {
+  const raw = input.trim().toLowerCase();
+
+  const floorExpr = /^floor(?:\s*\*\s*([0-9]*\.?[0-9]+))?$/.exec(raw);
+  if (floorExpr) {
+    if (floorPrice == null || floorPrice <= 0) return null;
+    const multiplier = floorExpr[1] ? Number(floorExpr[1]) : 1;
+    if (!Number.isFinite(multiplier) || multiplier <= 0) return null;
+    return floorPrice * multiplier;
+  }
+
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+// ── Listing ──────────────────────────────────────────────────────────────
+// Creating a listing means constructing a Seaport order with the right fee
+// and royalty split, signing it EIP-712, and posting it. Getting the
+// consideration wrong lists an NFT at the wrong price, so this delegates
+// entirely to the official SDK rather than hand-rolling the order.
+//
+// Unlike accepting an offer, listing costs no gas and moves nothing — it
+// publishes a signed offer to sell. Nothing leaves the wallet until a buyer
+// fills it, which is why this doesn't need the broadcast guard.
+export interface ListingResult {
+  ok: boolean;
+  orderHash?: string;
+  error?: string;
+}
+
+export async function createListing(opts: {
+  rpcUrl: string;
+  walletKey: string;
+  chainKey: string;
+  tokenAddress: string;
+  tokenId: string;
+  priceEth: number;
+  expirationMinutes?: number;
+  apiKey?: string;
+  logger?: Logger;
+}): Promise<ListingResult> {
+  const log = opts.logger ?? defaultLogger;
+  try {
+    const { OpenSeaSDK, Chain } = await import("@opensea/sdk");
+    const chain = Object.values(Chain).find((c) => c === opts.chainKey);
+    if (!chain) throw new Error(`@opensea/sdk has no Chain entry for "${opts.chainKey}"`);
+
+    const provider = createProvider(opts.rpcUrl);
+    const wallet = new Wallet(opts.walletKey, provider);
+    const sdk = new OpenSeaSDK(wallet as any, { chain: chain as any, apiKey: opts.apiKey });
+
+    const expiration = Math.round(Date.now() / 1000) + (opts.expirationMinutes ?? 60 * 24) * 60;
+    log.info(`  Listing ${opts.tokenAddress} #${opts.tokenId} at ${opts.priceEth} ETH...`);
+
+    const order = await (sdk as any).createListing({
+      asset: { tokenAddress: opts.tokenAddress, tokenId: opts.tokenId },
+      accountAddress: wallet.address,
+      startAmount: opts.priceEth,
+      expirationTime: expiration,
+    });
+    return { ok: true, orderHash: order?.orderHash ?? order?.order_hash };
+  } catch (err: any) {
+    return { ok: false, error: err?.message ?? String(err) };
+  }
+}
+
 // ── Orchestrator ─────────────────────────────────────────────────────────
 // Runs the paths in order and stops at the first success — or at the first
 // attempt that broadcast anything, successful or not.

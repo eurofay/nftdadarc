@@ -28,6 +28,55 @@ export function activityMenu(enabled: boolean, s: BotSettings) {
   ]);
 }
 
+// Portfolio and activity are both sectioned per wallet: pick a wallet, then
+// see what IT holds / what happened to IT. Holdings come live from OpenSea so
+// they include NFTs acquired before or outside this bot.
+export function portfolioWalletsMenu(wallets: WalletRecord[]) {
+  const rows = wallets.map((w) => [
+    Markup.button.callback(`${w.label} (${maskAddress(w.address)})`, `pf:wallet:${w.address}`),
+  ]);
+  rows.push([Markup.button.callback("⬅ Back", "menu:main")]);
+  return Markup.inlineKeyboard(rows);
+}
+
+export function walletHoldingsMenu(
+  address: string,
+  collections: { slug: string; count: number }[]
+) {
+  const rows = collections.slice(0, 20).map((c) => [
+    Markup.button.callback(`${c.slug} ×${c.count}`, `pf:col:${address}:${c.slug}`),
+  ]);
+  rows.push([Markup.button.callback("📈 This wallet's activity", `pf:wactivity:${address}`)]);
+  rows.push([Markup.button.callback("🔄 Refresh", `pf:wallet:${address}`)]);
+  rows.push([Markup.button.callback("⬅ Back", "menu:portfolio")]);
+  return Markup.inlineKeyboard(rows);
+}
+
+export function walletCollectionMenu(address: string, slug: string, openseaUrl?: string) {
+  const rows: any[] = [];
+  if (openseaUrl) rows.push([Markup.button.url("🌊 View on OpenSea", openseaUrl)]);
+  rows.push([Markup.button.callback("📈 Collection activity", `pf:colactivity:${slug}`)]);
+  rows.push([Markup.button.callback("💵 Sell / offers", `sell:col:${address}:${slug}`)]);
+  rows.push([Markup.button.callback("⬅ Back", `pf:wallet:${address}`)]);
+  return Markup.inlineKeyboard(rows);
+}
+
+export function sellCollectionMenu(address: string, slug: string, canAccept: boolean) {
+  const rows: any[] = [];
+  if (canAccept) rows.push([Markup.button.callback("✅ Accept best offer", `sell:ask:${address}:${slug}`)]);
+  rows.push([Markup.button.callback("🏷 List at a price", `sell:list:${address}:${slug}`)]);
+  rows.push([Markup.button.callback("🔄 Refresh", `sell:col:${address}:${slug}`)]);
+  rows.push([Markup.button.callback("⬅ Back", `pf:col:${address}:${slug}`)]);
+  return Markup.inlineKeyboard(rows);
+}
+
+export function sellActionConfirmMenu(action: string, address: string, slug: string) {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback("✅ Confirm", `sell:go:${action}:${address}:${slug}`)],
+    [Markup.button.callback("❌ Cancel", `sell:col:${address}:${slug}`)],
+  ]);
+}
+
 export function portfolioMenu(mints: MintRecord[]) {
   const rows = mints.slice(0, 20).map((m) => [
     Markup.button.callback(

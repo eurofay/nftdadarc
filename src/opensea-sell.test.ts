@@ -5,6 +5,7 @@ import {
   encodeFulfillment,
   resolveApprovalTarget,
   isApprovedForAll,
+  parseListingPrice,
   SellAttempt,
 } from "./opensea-sell";
 import { clearProviderCache } from "./rpc-provider";
@@ -69,6 +70,33 @@ describe("acceptOfferWithFallback — the double-sell guard", () => {
     ]);
     expect(res.ok).toBe(false);
     expect(res.attempts.map((a) => a.error)).toEqual(["a", "b"]);
+  });
+});
+
+describe("parseListingPrice", () => {
+  it("accepts an absolute ETH amount", () => {
+    expect(parseListingPrice("0.05", 0.01)).toBe(0.05);
+    expect(parseListingPrice("  1.5  ", null)).toBe(1.5);
+  });
+
+  it("prices off the live floor", () => {
+    expect(parseListingPrice("floor", 0.02)).toBeCloseTo(0.02);
+    expect(parseListingPrice("floor*1.2", 0.02)).toBeCloseTo(0.024);
+    expect(parseListingPrice("FLOOR * 0.9", 0.02)).toBeCloseTo(0.018);
+  });
+
+  it("refuses a floor-relative price when there is no floor", () => {
+    // Guessing here would list at an arbitrary number.
+    expect(parseListingPrice("floor", null)).toBeNull();
+    expect(parseListingPrice("floor*2", 0)).toBeNull();
+  });
+
+  it("rejects zero, negative and non-numeric input rather than defaulting", () => {
+    expect(parseListingPrice("0", 0.01)).toBeNull();
+    expect(parseListingPrice("-1", 0.01)).toBeNull();
+    expect(parseListingPrice("cheap", 0.01)).toBeNull();
+    expect(parseListingPrice("", 0.01)).toBeNull();
+    expect(parseListingPrice("floor*abc", 0.01)).toBeNull();
   });
 });
 

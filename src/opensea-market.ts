@@ -123,6 +123,99 @@ export async function fetchActivity(
   }));
 }
 
+export interface OwnedNft {
+  identifier: string;
+  collection: string;
+  contract: string;
+  name: string;
+  imageUrl: string | null;
+  openseaUrl: string | null;
+}
+
+export interface OwnedCollection {
+  slug: string;
+  contract: string;
+  count: number;
+  sampleImage: string | null;
+  tokenIds: string[];
+}
+
+// Everything a wallet actually holds, not just what this bot minted — the
+// portfolio should reflect the wallet, including NFTs acquired before the bot
+// existed or bought elsewhere.
+//
+// Paginated at 50/page; capped by maxPages so one enormous wallet can't stall
+// a menu tap or burn the OpenSea rate limit in a single request.
+export async function fetchAccountNfts(
+  chain: string,
+  address: string,
+  apiKey?: string,
+  maxPages = 6
+): Promise<OwnedNft[]> {
+  const out: OwnedNft[] = [];
+  let cursor: string | undefined;
+
+  for (let page = 0; page < maxPages; page++) {
+    const q = new URLSearchParams({ limit: "50" });
+    if (cursor) q.set("next", cursor);
+    const json = await get(`chain/${chain}/account/${address}/nfts?${q}`, apiKey);
+    if (!json?.nfts) break;
+
+    for (const n of json.nfts) {
+      out.push({
+        identifier: String(n.identifier ?? ""),
+        collection: n.collection ?? "",
+        contract: n.contract ?? "",
+        name: n.name || `#${n.identifier}`,
+        imageUrl: n.display_image_url || n.image_url || null,
+        openseaUrl: n.opensea_url || null,
+      });
+    }
+    if (!json.next) break;
+    cursor = json.next;
+  }
+  return out;
+}
+
+// Rolls the flat NFT list up to one entry per collection, which is the level
+// floors, offers and sell decisions actually operate at.
+export function groupByCollection(nfts: OwnedNft[]): OwnedCollection[] {
+  const map = new Map<string, OwnedCollection>();
+  for (const nft of nfts) {
+    if (!nft.collection) continue;
+    let entry = map.get(nft.collection);
+    if (!entry) {
+      entry = { slug: nft.collection, contract: nft.contract, count: 0, sampleImage: null, tokenIds: [] };
+      map.set(nft.collection, entry);
+    }
+    entry.count++;
+    if (!entry.sampleImage && nft.imageUrl) entry.sampleImage = nft.imageUrl;
+    if (entry.tokenIds.length < 50) entry.tokenIds.push(nft.identifier);
+  }
+  return [...map.values()].sort((a, b) => b.count - a.count);
+}
+
+// Per-wallet activity. The chain-scoped variant of this route 404s; only the
+// account-scoped one exists, and it already reports the chain per event.
+export async function fetchAccountActivity(
+  address: string,
+  apiKey?: string,
+  limit = 20
+): Promise<ActivityEvent[]> {
+  const json = await get(`events/accounts/${address}?limit=${limit}`, apiKey);
+  if (!json?.asset_events) return [];
+  return json.asset_events.map((e: any) => ({
+    type: e.event_type,
+    timestamp: Number(e.event_timestamp) || 0,
+    chain: e.chain || "",
+    txHash: e.transaction || null,
+    tokenId: e.nft?.identifier ?? null,
+    imageUrl: e.nft?.display_image_url || e.nft?.image_url || null,
+    openseaUrl: e.nft?.opensea_url || null,
+    priceEth: priceToEth(e.payment),
+  }));
+}
+
 export async function fetchBestCollectionOffer(
   slug: string,
   apiKey?: string

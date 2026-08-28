@@ -86,7 +86,7 @@ const DEFAULT_SETTINGS: BotSettings = {
   autoEnabled: false,
   copyMintEnabled: false,
   copyMintMaxPriceEth: 0,
-  activityEnabled: false,
+  activityEnabled: true,
   activitySweepSales: 3,
   activityFloorMovePct: 15,
   activityOfferVsFloorPct: 80,

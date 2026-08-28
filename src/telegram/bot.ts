@@ -27,6 +27,11 @@ import {
   schedConfirmMenu,
   portfolioMenu,
   portfolioItemMenu,
+  portfolioWalletsMenu,
+  walletHoldingsMenu,
+  walletCollectionMenu,
+  sellCollectionMenu,
+  sellActionConfirmMenu,
   sellMenu,
   sellConfirmMenu,
   activityMenu,
@@ -41,6 +46,9 @@ import {
   fetchStats,
   fetchActivity,
   fetchBestCollectionOffer,
+  fetchAccountNfts,
+  fetchAccountActivity,
+  groupByCollection,
   openseaCollectionUrl,
 } from "../opensea-market";
 import { buildLocalMintPlan } from "../seadrop-public";
@@ -49,7 +57,7 @@ import { runAutoMintWatcher } from "../auto-mint";
 import { runCopyMintWatcher } from "../copy-mint";
 import { runActivityWatcher } from "../activity-watcher";
 import { batchTransfer, estimateBatchCost } from "../fund-transfer";
-import { acceptOfferViaSdk, acceptOfferWithFallback } from "../opensea-sell";
+import { acceptOfferViaSdk, acceptOfferWithFallback, createListing, parseListingPrice } from "../opensea-sell";
 import { createLogger, withPrefix, LogSink } from "../logger";
 import { istTimeToDate, toIST } from "../time-format";
 
@@ -61,6 +69,7 @@ interface SessionData {
     | "awaiting_sched_link"
     | "awaiting_sched_quantity"
     | "awaiting_sched_custom_time"
+    | "awaiting_list_price"
     | `awaiting_setting:${string}`;
   fundSource?: string;
   fundTargets?: string[]; // lowercased addresses
@@ -71,6 +80,9 @@ interface SessionData {
   schedDropMax?: number;
   schedStartTime?: number; // on-chain drop start, unix seconds
   schedTargetStartMs?: number | "now"; // chosen fire time, pending confirmation
+  sellWallet?: string;
+  sellSlug?: string;
+  sellPriceEth?: number;
 }
 interface BotContext extends Context {
   session: SessionData;
@@ -261,8 +273,106 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
     return ctx.editMessageText("Send FROM which wallet?", fundSourceMenu(wallets));
   });
 
-  // ── Portfolio: what's been minted, with art, floor and links ─────────
-  bot.action("menu:portfolio", async (ctx) => {
+  // ── Portfolio, sectioned per wallet ──────────────────────────────────
+  // Holdings come live from OpenSea rather than the mint store, so this
+  // shows everything a wallet actually owns — including NFTs acquired
+  // before this bot existed or bought elsewhere. The mint store stays the
+  // source for "don't re-mint what we already have".
+  bot.action("menu:portfolio", (ctx) => {
+    const wallets = store.listWallets();
+    if (wallets.length === 0) return ctx.answerCbQuery("Add a wallet first.", { show_alert: true });
+    return ctx.editMessageText("🖼 Portfolio — pick a wallet:", portfolioWalletsMenu(wallets));
+  });
+
+  bot.action(/^pf:wallet:(.+)$/, async (ctx) => {
+    const address = ctx.match[1];
+    const wallet = store.listWallets().find((w) => w.address.toLowerCase() === address.toLowerCase());
+    if (!wallet) return ctx.answerCbQuery("Unknown wallet.", { show_alert: true });
+    await ctx.answerCbQuery("Loading holdings...");
+
+    const settings = store.getSettings();
+    const key = process.env.OPENSEA_API_KEY;
+    const nfts = await fetchAccountNfts(settings.chainKey, wallet.address, key);
+    const collections = groupByCollection(nfts);
+
+    if (collections.length === 0) {
+      return ctx.reply(
+        `${wallet.label} holds no NFTs on ${settings.chainKey} (or OpenSea hasn't indexed them).`,
+        walletHoldingsMenu(wallet.address, [])
+      );
+    }
+
+    const lines = collections
+      .slice(0, 20)
+      .map((c) => `• ${c.slug} ×${c.count}`)
+      .join("\n");
+    await ctx.reply(
+      `🖼 ${wallet.label} (${maskAddress(wallet.address)}) on ${settings.chainKey}\n` +
+        `${nfts.length} NFT(s) across ${collections.length} collection(s)\n\n${lines}`,
+      walletHoldingsMenu(wallet.address, collections)
+    );
+  });
+
+  bot.action(/^pf:col:([^:]+):(.+)$/, async (ctx) => {
+    const [address, slug] = [ctx.match[1], ctx.match[2]];
+    await ctx.answerCbQuery("Loading...");
+    const key = process.env.OPENSEA_API_KEY;
+    const [info, stats] = await Promise.all([fetchCollection(slug, key), fetchStats(slug, key)]);
+
+    const caption =
+      `${info?.name || slug}\n\n` +
+      (stats
+        ? `Floor: ${stats.floorPrice != null ? `${stats.floorPrice} ${stats.floorSymbol}` : "nothing listed"}\n` +
+          `Owners: ${stats.owners} · Total sales: ${stats.totalSales}\n` +
+          `24h: ${stats.oneDaySales} sales, ${stats.oneDayVolume.toFixed(6)} ${stats.floorSymbol}`
+        : "Market data unavailable");
+
+    const kb = walletCollectionMenu(address, slug, info?.openseaUrl);
+    if (info?.imageUrl) {
+      try {
+        await ctx.replyWithPhoto(info.imageUrl, { caption, ...kb });
+        return;
+      } catch {
+        /* fall through to text */
+      }
+    }
+    await ctx.reply(caption, kb);
+  });
+
+  bot.action(/^pf:wactivity:(.+)$/, async (ctx) => {
+    const address = ctx.match[1];
+    const wallet = store.listWallets().find((w) => w.address.toLowerCase() === address.toLowerCase());
+    await ctx.answerCbQuery("Fetching activity...");
+
+    const events = await fetchAccountActivity(address, process.env.OPENSEA_API_KEY, 20);
+    if (events.length === 0) return ctx.reply("No recent activity for this wallet.");
+
+    const sales = events.filter((e) => e.type === "sale");
+    const lines = events.slice(0, 15).map((e) => {
+      const price = e.priceEth != null ? ` — ${e.priceEth} ETH` : "";
+      const token = e.tokenId ? ` #${e.tokenId}` : "";
+      return `• ${e.type}${token}${price}  (${toIST(new Date(e.timestamp * 1000))} IST)`;
+    });
+    await ctx.reply(
+      `📈 ${wallet?.label || maskAddress(address)} — last ${events.length} events (${sales.length} sales)\n\n` +
+        lines.join("\n")
+    );
+  });
+
+  bot.action(/^pf:colactivity:(.+)$/, async (ctx) => {
+    const slug = ctx.match[1];
+    await ctx.answerCbQuery("Fetching activity...");
+    const events = await fetchActivity(slug, process.env.OPENSEA_API_KEY, 15);
+    if (events.length === 0) return ctx.reply("No recent activity for this collection.");
+    const lines = events.slice(0, 12).map((e) => {
+      const price = e.priceEth != null ? ` — ${e.priceEth} ETH` : "";
+      return `• ${e.type}${e.tokenId ? ` #${e.tokenId}` : ""}${price}  (${toIST(new Date(e.timestamp * 1000))} IST)`;
+    });
+    await ctx.reply(`📈 ${slug}\n\n${lines.join("\n")}`);
+  });
+
+  // ── Legacy minted-only view, kept reachable for the mint store ────────
+  bot.action("menu:mintlog", async (ctx) => {
     const mints = store.listMints();
     if (mints.length === 0) {
       return ctx.answerCbQuery("Nothing minted yet — it fills in automatically as mints land.", {
@@ -354,6 +464,116 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
     await ctx.reply(
       `📈 ${record.name || record.slug} — last ${events.length} events (${sales} sales)\n\n${lines.join("\n")}`
     );
+  });
+
+  // ── Sell from a specific wallet's holdings ───────────────────────────
+  bot.action(/^sell:col:([^:]+):(.+)$/, async (ctx) => {
+    const [address, slug] = [ctx.match[1], ctx.match[2]];
+    await ctx.answerCbQuery("Checking offers...");
+    const key = process.env.OPENSEA_API_KEY;
+    const [offer, stats] = await Promise.all([fetchBestCollectionOffer(slug, key), fetchStats(slug, key)]);
+
+    const floorText = stats?.floorPrice != null ? `${stats.floorPrice} ${stats.floorSymbol}` : "nothing listed";
+    const offerText = offer
+      ? `Best offer: ${offer.priceEth} ETH` +
+        (stats?.floorPrice ? ` (${((offer.priceEth / stats.floorPrice) * 100).toFixed(0)}% of floor)` : "")
+      : "No collection offers right now";
+
+    await ctx.reply(
+      `💵 ${slug}\n\n${offerText}\nFloor: ${floorText}\n\n` +
+        "Accept sells to the best standing offer immediately.\n" +
+        "List creates a signed listing at your price — no gas, no sale until someone buys.",
+      sellCollectionMenu(address, slug, offer !== null)
+    );
+  });
+
+  bot.action(/^sell:ask:([^:]+):(.+)$/, async (ctx) => {
+    const [address, slug] = [ctx.match[1], ctx.match[2]];
+    const offer = await fetchBestCollectionOffer(slug, process.env.OPENSEA_API_KEY);
+    if (!offer) return ctx.answerCbQuery("That offer is gone — refresh.", { show_alert: true });
+    await ctx.answerCbQuery();
+    return ctx.reply(
+      `Sell 1 × ${slug} for ${offer.priceEth} ETH?\n\nThis transfers the NFT out and cannot be undone.`,
+      sellActionConfirmMenu("accept", address, slug)
+    );
+  });
+
+  bot.action(/^sell:list:([^:]+):(.+)$/, async (ctx) => {
+    const [address, slug] = [ctx.match[1], ctx.match[2]];
+    ctx.session.step = "awaiting_list_price";
+    ctx.session.sellWallet = address;
+    ctx.session.sellSlug = slug;
+    const stats = await fetchStats(slug, process.env.OPENSEA_API_KEY);
+    await ctx.answerCbQuery();
+    return ctx.reply(
+      `Listing price in ETH for ${slug}?` +
+        (stats?.floorPrice != null ? `\nCurrent floor: ${stats.floorPrice} ${stats.floorSymbol}` : "") +
+        `\n\nSend a plain number (e.g. 0.05), or "floor" / "floor*1.2" to price off the floor.`
+    );
+  });
+
+  bot.action(/^sell:go:([^:]+):([^:]+):(.+)$/, async (ctx) => {
+    const [action, address, slug] = [ctx.match[1], ctx.match[2], ctx.match[3]];
+    await ctx.answerCbQuery(action === "accept" ? "Selling..." : "Listing...");
+
+    const settings = store.getSettings();
+    const { urls } = resolveRpcsForChain(settings.chainKey);
+    const logger = withPrefix("sell", createLogger(createTelegramSink(bot, ctx.chat!.id)));
+    const wallet = store.listWallets().find((w) => w.address.toLowerCase() === address.toLowerCase());
+    if (!wallet) return ctx.reply("❌ Unknown wallet.");
+
+    try {
+      const walletKey = store.getDecryptedKey(wallet.address);
+
+      if (action === "accept") {
+        const result = await acceptOfferWithFallback(
+          [
+            () =>
+              acceptOfferViaSdk({
+                rpcUrl: urls[0],
+                walletKey,
+                chainKey: settings.chainKey,
+                slug,
+                apiKey: process.env.OPENSEA_API_KEY,
+                maxFeePerGas: gweiToWei(settings.maxFeeGwei),
+                maxPriorityFee: gweiToWei(settings.priorityGwei),
+              }),
+          ],
+          logger
+        );
+        return ctx.reply(
+          result.ok
+            ? `✅ Sold via the ${result.usedPath} path.\n${result.txHash}`
+            : `❌ Could not sell:\n${result.attempts.map((a) => `• ${a.path}: ${a.error}`).join("\n")}`
+        );
+      }
+
+      const priceEth = ctx.session.sellPriceEth;
+      if (!priceEth) return ctx.reply("That request expired — start again from Sell / offers.");
+      ctx.session.sellPriceEth = undefined;
+
+      const nfts = await fetchAccountNfts(settings.chainKey, wallet.address, process.env.OPENSEA_API_KEY);
+      const owned = nfts.find((n) => n.collection === slug);
+      if (!owned) return ctx.reply("❌ That wallet no longer holds anything in this collection.");
+
+      const result = await createListing({
+        rpcUrl: urls[0],
+        walletKey,
+        chainKey: settings.chainKey,
+        tokenAddress: owned.contract,
+        tokenId: owned.identifier,
+        priceEth,
+        apiKey: process.env.OPENSEA_API_KEY,
+        logger,
+      });
+      return ctx.reply(
+        result.ok
+          ? `✅ Listed ${slug} #${owned.identifier} at ${priceEth} ETH.${result.orderHash ? `\n${result.orderHash}` : ""}`
+          : `❌ Could not list: ${result.error}`
+      );
+    } catch (err: any) {
+      await ctx.reply(`❌ ${err.message}`);
+    }
   });
 
   // ── Sell: view the best offer, then accept it via either path ────────
@@ -449,14 +669,35 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
   });
 
   // ── Activity alerts on held collections ──────────────────────────────
-  function startActivity(chatId: number): { ok: true } | { ok: false; reason: string } {
+  // Collections are taken from what the wallets actually hold, not just what
+  // this bot minted — so alerts cover NFTs acquired before or outside it.
+  // Falls back to the mint store if the holdings lookup returns nothing.
+  async function resolveWatchedCollections(): Promise<{ slug: string; name: string }[]> {
+    const settings = store.getSettings();
+    const key = process.env.OPENSEA_API_KEY;
+    const seen = new Map<string, { slug: string; name: string }>();
+
+    for (const w of store.listWallets()) {
+      try {
+        const nfts = await fetchAccountNfts(settings.chainKey, w.address, key, 3);
+        for (const c of groupByCollection(nfts)) {
+          if (!seen.has(c.slug)) seen.set(c.slug, { slug: c.slug, name: c.slug });
+        }
+      } catch {
+        /* one unreadable wallet shouldn't blank the whole watchlist */
+      }
+    }
+    for (const m of store.listMints()) {
+      if (m.slug && !seen.has(m.slug)) seen.set(m.slug, { slug: m.slug, name: m.name || m.slug });
+    }
+    return [...seen.values()];
+  }
+
+  async function startActivity(chatId: number): Promise<{ ok: true } | { ok: false; reason: string }> {
     if (runningActivity) return { ok: true };
-    const collections = store
-      .listMints()
-      .filter((m) => m.slug)
-      .map((m) => ({ slug: m.slug!, name: m.name || m.slug! }));
+    const collections = await resolveWatchedCollections();
     if (collections.length === 0) {
-      return { ok: false, reason: "No portfolio collections with an OpenSea slug to watch yet." };
+      return { ok: false, reason: "No collections held by your wallets to watch yet." };
     }
 
     const settings = store.getSettings();
@@ -501,7 +742,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
       stopActivity();
       await ctx.answerCbQuery("Stopping...");
     } else {
-      const result = startActivity(ctx.chat!.id);
+      const result = await startActivity(ctx.chat!.id);
       if (!result.ok) return ctx.answerCbQuery(result.reason, { show_alert: true });
       await ctx.answerCbQuery("Started.");
     }
@@ -511,13 +752,13 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
     );
   });
 
+  // Default-on: starts itself as soon as there's anything to watch. Holdings
+  // are fetched asynchronously, so this can't block bot startup — and a
+  // failure just leaves alerts off rather than preventing the bot from running.
   if (store.getSettings().activityEnabled) {
-    try {
-      const result = startActivity(ownerId);
-      if (!result.ok) store.updateSettings({ activityEnabled: false });
-    } catch {
-      store.updateSettings({ activityEnabled: false });
-    }
+    void startActivity(ownerId).catch(() => {
+      /* leave alerts off; the menu can start them later */
+    });
   }
 
   bot.action("menu:status", async (ctx) => {
@@ -1218,6 +1459,42 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
       }
       ctx.session.schedTargetStartMs = targetStart.getTime();
       return ctx.reply(confirmSummary(ctx), schedConfirmMenu());
+    }
+
+    if (step === "awaiting_list_price") {
+      ctx.session.step = undefined;
+      const slug = ctx.session.sellSlug;
+      const address = ctx.session.sellWallet;
+      if (!slug || !address) return ctx.reply("That request expired — start again from Sell / offers.");
+
+      const raw = ctx.message.text.trim().toLowerCase();
+      let priceEth: number | null = null;
+
+      // Both pricing bases, per the choice made when this was designed:
+      // an absolute figure, or one derived from the live floor.
+      const floorExpr = /^floor(?:\s*\*\s*([0-9.]+))?$/.exec(raw);
+      if (floorExpr) {
+        const stats = await fetchStats(slug, process.env.OPENSEA_API_KEY);
+        if (stats?.floorPrice == null) {
+          return ctx.reply("That collection has no floor right now — give an absolute ETH amount instead.");
+        }
+        priceEth = stats.floorPrice * (floorExpr[1] ? Number(floorExpr[1]) : 1);
+      } else {
+        const n = Number(raw);
+        if (Number.isFinite(n) && n > 0) priceEth = n;
+      }
+
+      if (priceEth === null || !Number.isFinite(priceEth) || priceEth <= 0) {
+        return ctx.reply('Not a valid price. Send a number like 0.05, or "floor" / "floor*1.2".');
+      }
+
+      ctx.session.sellPriceEth = priceEth;
+      return ctx.reply(
+        `List 1 × ${slug} at ${priceEth} ETH?\n\n` +
+          "Listing costs no gas and moves nothing now — it publishes a signed offer to sell. " +
+          "You'll be asked to approve the transfer contract if it isn't approved yet.",
+        sellActionConfirmMenu("list", address, slug)
+      );
     }
 
     if (step === "awaiting_fund_amount") {
