@@ -27,6 +27,7 @@ import {
   schedConfirmMenu,
   portfolioMenu,
   portfolioItemMenu,
+  activityMenu,
   maskAddress,
 } from "./menus";
 import { resolveChain } from "../chains";
@@ -43,6 +44,7 @@ import { buildLocalMintPlan } from "../seadrop-public";
 import { localPublicSnipe } from "../local-mint";
 import { runAutoMintWatcher } from "../auto-mint";
 import { runCopyMintWatcher } from "../copy-mint";
+import { runActivityWatcher } from "../activity-watcher";
 import { batchTransfer, estimateBatchCost } from "../fund-transfer";
 import { createLogger, withPrefix, LogSink } from "../logger";
 import { istTimeToDate, toIST } from "../time-format";
@@ -210,6 +212,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
 
   const runningAuto = new Map<string, RunningWatcher>(); // keyed by chain key — one watcher per chain
   let runningCopy: RunningWatcher | null = null;
+  let runningActivity: RunningWatcher | null = null;
 
   // ── Menu navigation ──────────────────────────────────────────────────
   bot.start((ctx) => ctx.reply("NFT Public Mint Sniper — choose an action:", mainMenu()));
@@ -356,6 +359,78 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
     return ctx.editMessageText(`🖼 Portfolio — ${mints.length} collection(s)`, portfolioMenu(mints));
   });
 
+  // ── Activity alerts on held collections ──────────────────────────────
+  function startActivity(chatId: number): { ok: true } | { ok: false; reason: string } {
+    if (runningActivity) return { ok: true };
+    const collections = store
+      .listMints()
+      .filter((m) => m.slug)
+      .map((m) => ({ slug: m.slug!, name: m.name || m.slug! }));
+    if (collections.length === 0) {
+      return { ok: false, reason: "No portfolio collections with an OpenSea slug to watch yet." };
+    }
+
+    const settings = store.getSettings();
+    const stopSignal = { stopped: false };
+    const logger = withPrefix("activity", createLogger(createTelegramSink(bot, chatId)));
+    const promise = runActivityWatcher({
+      collections,
+      apiKey: process.env.OPENSEA_API_KEY,
+      pollIntervalMs: 120_000, // OpenSea, not an RPC — a couple of minutes is plenty and stays well inside its limits
+      sweepSalesThreshold: settings.activitySweepSales,
+      floorMovePct: settings.activityFloorMovePct,
+      offerVsFloorPct: settings.activityOfferVsFloorPct,
+      logger,
+      stopSignal,
+    }).catch((err) => logger.errorBold(`Activity watcher crashed: ${err.message}`));
+    runningActivity = { stopSignal, promise };
+    store.updateSettings({ activityEnabled: true });
+    return { ok: true };
+  }
+
+  function stopActivity(): void {
+    if (!runningActivity) return;
+    runningActivity.stopSignal.stopped = true;
+    runningActivity = null;
+    store.updateSettings({ activityEnabled: false });
+  }
+
+  bot.action("menu:activity", (ctx) => {
+    const tracked = store.listMints().filter((m) => m.slug).length;
+    return ctx.editMessageText(
+      `🔔 Activity alerts: ${runningActivity ? "🟢 running" : "🔴 stopped"}
+` +
+        `Watching ${tracked} portfolio collection(s) for sweeps, floor moves and offers.
+` +
+        "Alerts arrive here automatically; nothing is ever bought or sold.",
+      activityMenu(runningActivity !== null, store.getSettings())
+    );
+  });
+
+  bot.action("activity:toggle", async (ctx) => {
+    if (runningActivity) {
+      stopActivity();
+      await ctx.answerCbQuery("Stopping...");
+    } else {
+      const result = startActivity(ctx.chat!.id);
+      if (!result.ok) return ctx.answerCbQuery(result.reason, { show_alert: true });
+      await ctx.answerCbQuery("Started.");
+    }
+    return ctx.editMessageText(
+      `🔔 Activity alerts: ${runningActivity ? "🟢 running" : "🔴 stopped"}`,
+      activityMenu(runningActivity !== null, store.getSettings())
+    );
+  });
+
+  if (store.getSettings().activityEnabled) {
+    try {
+      const result = startActivity(ownerId);
+      if (!result.ok) store.updateSettings({ activityEnabled: false });
+    } catch {
+      store.updateSettings({ activityEnabled: false });
+    }
+  }
+
   bot.action("menu:status", async (ctx) => {
     const settings = store.getSettings();
     const wallets = store.listWallets();
@@ -380,7 +455,11 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
       `Chain: ${settings.chainKey}\n` +
         `Wallets: ${wallets.length}${balances}\n` +
         `Auto mint: ${runningAuto.size > 0 ? `running on ${[...runningAuto.keys()].join(", ")}` : "stopped"}\n` +
-        `Copy mint: ${runningCopy ? "running" : "stopped"} (watching ${store.listCopyTargets().length})`,
+        `Copy mint: ${runningCopy ? "running" : "stopped"} (watching ${store.listCopyTargets().length})
+` +
+        `Portfolio: ${store.listMints().length} collection(s)
+` +
+        `Activity alerts: ${runningActivity ? "running" : "stopped"}`,
       mainMenu()
     );
   });
@@ -707,6 +786,9 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
     "autoMaxQuantity",
     "copyMintMaxPriceEth",
     "copyMintMaxQuantity",
+    "activitySweepSales",
+    "activityFloorMovePct",
+    "activityOfferVsFloorPct",
   ] as const;
   // Both quantity caps are optional — clearable back to "unlimited" (the
   // drop's own true max-per-wallet) rather than needing some magic number.

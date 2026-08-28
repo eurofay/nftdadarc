@@ -13,7 +13,18 @@ export function mainMenu() {
     [Markup.button.callback("💼 Wallets", "menu:wallets"), Markup.button.callback("⚙️ Settings", "menu:settings")],
     [Markup.button.callback("🎯 Auto Mint", "menu:auto"), Markup.button.callback("👀 Copy Mint", "menu:copy")],
     [Markup.button.callback("💸 Fund Wallets", "menu:fund"), Markup.button.callback("⏰ Scheduled Mint", "menu:sched")],
-    [Markup.button.callback("🖼 Portfolio", "menu:portfolio"), Markup.button.callback("📊 Status", "menu:status")],
+    [Markup.button.callback("🖼 Portfolio", "menu:portfolio"), Markup.button.callback("🔔 Activity Alerts", "menu:activity")],
+    [Markup.button.callback("📊 Status", "menu:status")],
+  ]);
+}
+
+export function activityMenu(enabled: boolean, s: BotSettings) {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback(enabled ? "⏸ Turn off" : "▶️ Turn on", "activity:toggle")],
+    [Markup.button.callback(`Sweep = ${s.activitySweepSales}+ sales`, "setting:activitySweepSales")],
+    [Markup.button.callback(`Floor move alert: ${s.activityFloorMovePct}%`, "setting:activityFloorMovePct")],
+    [Markup.button.callback(`Offer alert: ${s.activityOfferVsFloorPct}% of floor`, "setting:activityOfferVsFloorPct")],
+    [Markup.button.callback("⬅ Back", "menu:main")],
   ]);
 }
 

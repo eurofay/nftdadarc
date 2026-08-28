@@ -64,6 +64,11 @@ export interface BotSettings {
   // a huge per-wallet allowance (e.g. 4000) doesn't burn far more gas than
   // intended just because nothing here says otherwise.
   copyMintMaxQuantity?: number;
+  // Activity watcher — alerts on sweeps/floor moves/offers for held collections.
+  activityEnabled: boolean;
+  activitySweepSales: number;
+  activityFloorMovePct: number;
+  activityOfferVsFloorPct: number;
 }
 
 interface StoreData {
@@ -81,6 +86,10 @@ const DEFAULT_SETTINGS: BotSettings = {
   autoEnabled: false,
   copyMintEnabled: false,
   copyMintMaxPriceEth: 0,
+  activityEnabled: false,
+  activitySweepSales: 3,
+  activityFloorMovePct: 15,
+  activityOfferVsFloorPct: 80,
 };
 
 export class TelegramStore {
