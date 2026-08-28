@@ -165,6 +165,102 @@ describe("TelegramStore copy-mint watchlist", () => {
   });
 });
 
+describe("TelegramStore minted holdings", () => {
+  const NFT = "0x1111111111111111111111111111111111111111";
+  const W1 = "0xaaaAaAaaAaAaAaaAaAAAAAAAAaaaAaAaAaaAaaAa";
+  const W2 = "0xbbbBbBbbBbBbBbbBbBBBBBBBBbbbBbBbBbbBbbBb";
+
+  it("records a first mint with its metadata", () => {
+    const store = freshStore();
+    const rec = store.recordMint({
+      chainKey: "robinhood",
+      nftContract: NFT,
+      quantity: 3,
+      wallets: [W1],
+      txHash: "0xtx1",
+      slug: "osborns",
+      name: "Osborns",
+    });
+    expect(rec.quantity).toBe(3);
+    expect(rec.slug).toBe("osborns");
+    expect(store.listMints()).toHaveLength(1);
+  });
+
+  it("accumulates quantity and wallets into one row per collection", () => {
+    const store = freshStore();
+    store.recordMint({ chainKey: "robinhood", nftContract: NFT, quantity: 3, wallets: [W1], txHash: "0xa" });
+    const rec = store.recordMint({ chainKey: "robinhood", nftContract: NFT, quantity: 2, wallets: [W2], txHash: "0xb" });
+
+    expect(store.listMints()).toHaveLength(1);
+    expect(rec.quantity).toBe(5);
+    expect(rec.wallets).toEqual([W1, W2]);
+    expect(rec.lastTxHash).toBe("0xb");
+  });
+
+  it("does not duplicate a wallet that mints the same collection twice", () => {
+    const store = freshStore();
+    store.recordMint({ chainKey: "robinhood", nftContract: NFT, quantity: 1, wallets: [W1], txHash: "0xa" });
+    const rec = store.recordMint({ chainKey: "robinhood", nftContract: NFT, quantity: 1, wallets: [W1], txHash: "0xb" });
+    expect(rec.wallets).toEqual([W1]);
+    expect(rec.quantity).toBe(2);
+  });
+
+  it("backfills metadata that wasn't resolvable on the first mint", () => {
+    const store = freshStore();
+    store.recordMint({ chainKey: "robinhood", nftContract: NFT, quantity: 1, wallets: [W1], txHash: "0xa" });
+    expect(store.listMints()[0].slug).toBeUndefined();
+
+    const rec = store.recordMint({
+      chainKey: "robinhood",
+      nftContract: NFT,
+      quantity: 1,
+      wallets: [W1],
+      txHash: "0xb",
+      slug: "osborns",
+      name: "Osborns",
+    });
+    expect(rec.slug).toBe("osborns");
+    expect(rec.name).toBe("Osborns");
+  });
+
+  it("keeps the same contract on different chains as separate holdings", () => {
+    const store = freshStore();
+    store.recordMint({ chainKey: "robinhood", nftContract: NFT, quantity: 1, wallets: [W1], txHash: "0xa" });
+    store.recordMint({ chainKey: "ethereum", nftContract: NFT, quantity: 1, wallets: [W1], txHash: "0xb" });
+    expect(store.listMints()).toHaveLength(2);
+  });
+
+  it("matches the contract case-insensitively", () => {
+    const store = freshStore();
+    store.recordMint({ chainKey: "robinhood", nftContract: NFT, quantity: 1, wallets: [W1], txHash: "0xa" });
+    store.recordMint({ chainKey: "robinhood", nftContract: NFT.toUpperCase(), quantity: 1, wallets: [W1], txHash: "0xb" });
+    expect(store.listMints()).toHaveLength(1);
+  });
+
+  it("lists most-recently-minted first", () => {
+    const store = freshStore();
+    const other = "0x2222222222222222222222222222222222222222";
+    store.recordMint({ chainKey: "robinhood", nftContract: NFT, quantity: 1, wallets: [W1], txHash: "0xa" });
+    store.recordMint({ chainKey: "robinhood", nftContract: other, quantity: 1, wallets: [W1], txHash: "0xb" });
+    expect(store.listMints()[0].nftContract).toBe(other);
+  });
+
+  it("removes a holding, and reports false for one that isn't held", () => {
+    const store = freshStore();
+    store.recordMint({ chainKey: "robinhood", nftContract: NFT, quantity: 1, wallets: [W1], txHash: "0xa" });
+    expect(store.removeMint(NFT)).toBe(true);
+    expect(store.listMints()).toHaveLength(0);
+    expect(store.removeMint(NFT)).toBe(false);
+  });
+
+  it("persists holdings across a fresh instance", () => {
+    const store1 = freshStore();
+    store1.recordMint({ chainKey: "robinhood", nftContract: NFT, quantity: 4, wallets: [W1], txHash: "0xa" });
+    const store2 = new TelegramStore(tmpFile, "test-pass");
+    expect(store2.listMints()[0].quantity).toBe(4);
+  });
+});
+
 describe("TelegramStore settings", () => {
   it("returns sane defaults when nothing has been set", () => {
     const store = freshStore();

@@ -13,7 +13,7 @@
 
 import { buildLocalMintPlan } from "./seadrop-public";
 import { scanPublicDropUpdates, DropSighting } from "./seadrop-events";
-import { localPublicSnipe } from "./local-mint";
+import { localPublicSnipe, SnipeOutcome } from "./local-mint";
 import { openseaContractInfo } from "./slug-resolver";
 import { ChainProfile } from "./chains";
 import { defaultLogger, Logger } from "./logger";
@@ -33,6 +33,7 @@ export interface AutoMintOpts {
   logChunkBlocks?: number; // eth_getLogs range per call — see seadrop-events.ts
   logger?: Logger; // defaults to printing locally — the Telegram bot passes one that also forwards to a chat
   stopSignal?: { stopped: boolean }; // lets a caller (the bot) stop the watcher without SIGINT
+  onMinted?: (outcome: SnipeOutcome) => void | Promise<void>; // portfolio bookkeeping; never allowed to fail a mint
 }
 
 function nowSec(): number {
@@ -180,7 +181,7 @@ export async function runAutoMintWatcher(opts: AutoMintOpts): Promise<void> {
     }
 
     try {
-      await localPublicSnipe({
+      const outcome = await localPublicSnipe({
         nftContract,
         quantity,
         walletKeys,
@@ -192,6 +193,11 @@ export async function runAutoMintWatcher(opts: AutoMintOpts): Promise<void> {
         plan,
         logger: log,
       });
+      try {
+        await opts.onMinted?.(outcome);
+      } catch {
+        /* bookkeeping only */
+      }
     } catch (err: any) {
       log.error(`     ✗ Auto-mint attempt failed: ${err.message}`);
     }

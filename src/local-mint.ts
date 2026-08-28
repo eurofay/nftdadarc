@@ -29,7 +29,18 @@ export interface LocalSnipeOpts {
   logger?: Logger; // defaults to printing locally — the Telegram bot passes one that also forwards to a chat
 }
 
-export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<void> {
+// Returned so callers can record what was actually acquired. Only a
+// confirmed on-chain SUCCESS counts — a dispatched tx that reverted or timed
+// out is not a mint, and portfolio tracking that assumed otherwise would
+// quietly fill up with NFTs that were never received.
+export interface SnipeOutcome {
+  nftContract: string;
+  quantity: number;
+  chainId: number;
+  minted: { address: string; txHash: string; block: number }[];
+}
+
+export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<SnipeOutcome> {
   const {
     nftContract, quantity, walletKeys, rpcUrls,
     maxFeePerGas, maxPriorityFee, gasLimit, targetStart, plan,
@@ -124,15 +135,22 @@ export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<void> {
     }
   }
 
+  const outcome: SnipeOutcome = {
+    nftContract,
+    quantity,
+    chainId: Number(chainId),
+    minted: [],
+  };
+
   if (accepted.length === 0) {
     log.errorBold("\n===== NOTHING WAS BROADCAST — no receipts to wait for =====\n");
-    return;
+    return outcome;
   }
 
   // ── Receipts (only for txs an endpoint actually accepted) ──
   log.info("\n  Waiting for receipts...");
   await Promise.all(
-    accepted.map(async ({ idx, txHash }) => {
+    accepted.map(async ({ idx, address, txHash }) => {
       const receipt = await waitForReceipt(txHash, rpcUrls[0], 60_000);
       if (!receipt) {
         log.warn(`  [W${idx}] TIMEOUT — check: ${explorerTx(chainId, txHash)}`);
@@ -141,8 +159,12 @@ export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<void> {
       const emit = receipt.status === "SUCCESS" ? log.successBold : log.errorBold;
       emit(`  [W${idx}] Block: ${receipt.block} | Pos: ${receipt.position} | ${receipt.status} | Gas: ${receipt.gasUsed}`);
       log.info(`  [W${idx}] Track: ${explorerTx(chainId, txHash)}`);
+      if (receipt.status === "SUCCESS") {
+        outcome.minted.push({ address, txHash, block: receipt.block });
+      }
     })
   );
 
   log.done("\n===== LOCAL PUBLIC MINT COMPLETE =====");
+  return outcome;
 }

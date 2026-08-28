@@ -17,7 +17,7 @@
 
 import { buildLocalMintPlan } from "./seadrop-public";
 import { scanSeaDropMints } from "./seadrop-events";
-import { localPublicSnipe } from "./local-mint";
+import { localPublicSnipe, SnipeOutcome } from "./local-mint";
 import { backoffMs, createProvider } from "./rpc-provider";
 import { ChainProfile } from "./chains";
 import { defaultLogger, Logger } from "./logger";
@@ -57,6 +57,7 @@ export interface CopyMintOpts {
   maxPriceEth: number; // skip anything pricier than this per wallet
   quantityPerWallet?: number; // default: the drop's own max-per-wallet cap
   logChunkBlocks?: number; // eth_getLogs range per call — see seadrop-events.ts
+  onMinted?: (outcome: SnipeOutcome) => void | Promise<void>; // portfolio bookkeeping; never allowed to fail a mint
   logger?: Logger;
   stopSignal?: { stopped: boolean };
 }
@@ -155,7 +156,7 @@ export async function runCopyMintWatcher(opts: CopyMintOpts): Promise<void> {
         }
 
         try {
-          await localPublicSnipe({
+          const outcome = await localPublicSnipe({
             nftContract: sighting.nftContract,
             quantity,
             walletKeys,
@@ -167,6 +168,11 @@ export async function runCopyMintWatcher(opts: CopyMintOpts): Promise<void> {
             plan,
             logger: log,
           });
+          try {
+            await opts.onMinted?.(outcome);
+          } catch {
+            /* bookkeeping only */
+          }
         } catch (err: any) {
           log.error(`     ✗ Copy-mint attempt failed: ${err.message}`);
         }

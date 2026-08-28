@@ -25,12 +25,20 @@ import {
   schedWalletsMenu,
   schedTimingMenu,
   schedConfirmMenu,
+  portfolioMenu,
+  portfolioItemMenu,
   maskAddress,
 } from "./menus";
 import { resolveChain } from "../chains";
 import { resolveRpcsForChain } from "../rpc-resolver";
 import { parseNftLink } from "../nft-link";
-import { resolveSlug } from "../slug-resolver";
+import { resolveSlug, openseaContractInfo } from "../slug-resolver";
+import {
+  fetchCollection,
+  fetchStats,
+  fetchActivity,
+  openseaCollectionUrl,
+} from "../opensea-market";
 import { buildLocalMintPlan } from "../seadrop-public";
 import { localPublicSnipe } from "../local-mint";
 import { runAutoMintWatcher } from "../auto-mint";
@@ -133,6 +141,33 @@ async function previewMint(
   return lines.join("\n");
 }
 
+// Records a confirmed mint into the portfolio, enriching it with OpenSea's
+// slug/name when that lookup succeeds. Deliberately swallows every failure:
+// portfolio bookkeeping is decoration, and must never turn into an error on
+// a mint that actually succeeded.
+async function recordOutcome(
+  store: TelegramStore,
+  chainKey: string,
+  outcome: { nftContract: string; quantity: number; minted: { address: string; txHash: string }[] }
+): Promise<void> {
+  if (outcome.minted.length === 0) return;
+  try {
+    const info = await openseaContractInfo(chainKey, outcome.nftContract, process.env.OPENSEA_API_KEY);
+    store.recordMint({
+      chainKey,
+      nftContract: outcome.nftContract,
+      // One record per wallet that actually received tokens.
+      quantity: outcome.quantity * outcome.minted.length,
+      wallets: outcome.minted.map((m) => m.address),
+      txHash: outcome.minted[0].txHash,
+      slug: info?.slug,
+      name: info?.name,
+    });
+  } catch {
+    // ignore — never let bookkeeping surface as a mint failure
+  }
+}
+
 // Serializes sends to one chat with a small gap between them, so a burst of
 // headline events (a mint firing, then its result) can't trip Telegram's
 // flood limits the way blasting every line unthrottled would.
@@ -217,6 +252,108 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
     ctx.session.fundSource = undefined;
     ctx.session.fundTargets = undefined;
     return ctx.editMessageText("Send FROM which wallet?", fundSourceMenu(wallets));
+  });
+
+  // ── Portfolio: what's been minted, with art, floor and links ─────────
+  bot.action("menu:portfolio", async (ctx) => {
+    const mints = store.listMints();
+    if (mints.length === 0) {
+      return ctx.answerCbQuery("Nothing minted yet — it fills in automatically as mints land.", {
+        show_alert: true,
+      });
+    }
+    await ctx.answerCbQuery("Fetching floors...");
+
+    const key = process.env.OPENSEA_API_KEY;
+    // Sequential on purpose: OpenSea rate-limits, and a portfolio refresh is
+    // not worth risking a 429 that also breaks the slug lookups the mint
+    // path uses for labelling.
+    const lines: string[] = [];
+    for (const m of mints.slice(0, 20)) {
+      const stats = m.slug ? await fetchStats(m.slug, key) : null;
+      const floor =
+        stats?.floorPrice != null
+          ? `floor ${stats.floorPrice} ${stats.floorSymbol}`
+          : stats
+            ? "nothing listed"
+            : "floor n/a";
+      const day = stats ? ` · 24h ${stats.oneDaySales} sales` : "";
+      lines.push(`• ${m.name || maskAddress(m.nftContract)} ×${m.quantity} — ${floor}${day}`);
+    }
+
+    await ctx.editMessageText(
+      `🖼 Portfolio — ${mints.length} collection(s)\n\n${lines.join("\n")}\n\nTap one for art, links and activity.`,
+      portfolioMenu(mints)
+    );
+  });
+
+  bot.action(/^pf:view:(.+)$/, async (ctx) => {
+    const record = store.listMints().find((m) => m.nftContract.toLowerCase() === ctx.match[1].toLowerCase());
+    if (!record) return ctx.answerCbQuery("No longer in your portfolio.", { show_alert: true });
+    await ctx.answerCbQuery();
+
+    const key = process.env.OPENSEA_API_KEY;
+    const [info, stats] = await Promise.all([
+      record.slug ? fetchCollection(record.slug, key) : Promise.resolve(null),
+      record.slug ? fetchStats(record.slug, key) : Promise.resolve(null),
+    ]);
+
+    const chain = resolveChain(record.chainKey);
+    const caption =
+      `${info?.name || record.name || "Unknown collection"}\n` +
+      `${record.nftContract}\n\n` +
+      `Held: ${record.quantity} across ${record.wallets.length} wallet(s)\n` +
+      (stats
+        ? `Floor: ${stats.floorPrice != null ? `${stats.floorPrice} ${stats.floorSymbol}` : "nothing listed"}\n` +
+          `Owners: ${stats.owners} · Total sales: ${stats.totalSales}\n` +
+          `24h: ${stats.oneDaySales} sales, ${stats.oneDayVolume.toFixed(6)} ${stats.floorSymbol}`
+        : "Market data unavailable (collection may not be indexed by OpenSea)") +
+      `\n\nMinted: ${toIST(new Date(record.firstMintedAt))} IST` +
+      (chain ? `\nChain: ${chain.name}` : "");
+
+    const url = record.slug ? openseaCollectionUrl(record.slug) : undefined;
+    const keyboard = portfolioItemMenu(record, url);
+
+    // Art if OpenSea has it; otherwise the same detail as plain text rather
+    // than failing the whole view over a missing image.
+    if (info?.imageUrl) {
+      try {
+        await ctx.replyWithPhoto(info.imageUrl, { caption, ...keyboard });
+        return;
+      } catch {
+        /* fall through to text */
+      }
+    }
+    await ctx.reply(caption, keyboard);
+  });
+
+  bot.action(/^pf:activity:(.+)$/, async (ctx) => {
+    const record = store.listMints().find((m) => m.nftContract.toLowerCase() === ctx.match[1].toLowerCase());
+    if (!record?.slug) {
+      return ctx.answerCbQuery("No OpenSea slug for this collection — activity unavailable.", { show_alert: true });
+    }
+    await ctx.answerCbQuery("Fetching activity...");
+
+    const events = await fetchActivity(record.slug, process.env.OPENSEA_API_KEY, 15);
+    if (events.length === 0) return ctx.reply("No recent activity reported for this collection.");
+
+    const lines = events.slice(0, 12).map((e) => {
+      const when = toIST(new Date(e.timestamp * 1000));
+      const price = e.priceEth != null ? ` — ${e.priceEth} ETH` : "";
+      const token = e.tokenId ? ` #${e.tokenId}` : "";
+      return `• ${e.type}${token}${price}  (${when} IST)`;
+    });
+    const sales = events.filter((e) => e.type === "sale").length;
+    await ctx.reply(
+      `📈 ${record.name || record.slug} — last ${events.length} events (${sales} sales)\n\n${lines.join("\n")}`
+    );
+  });
+
+  bot.action(/^pf:remove:(.+)$/, (ctx) => {
+    store.removeMint(ctx.match[1]);
+    const mints = store.listMints();
+    if (mints.length === 0) return ctx.editMessageText("Portfolio is empty.", mainMenu());
+    return ctx.editMessageText(`🖼 Portfolio — ${mints.length} collection(s)`, portfolioMenu(mints));
   });
 
   bot.action("menu:status", async (ctx) => {
@@ -332,6 +469,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
       maxPriceEth: settings.copyMintMaxPriceEth,
       quantityPerWallet: settings.copyMintMaxQuantity,
       logChunkBlocks: process.env.AUTO_LOG_CHUNK_BLOCKS ? parseInt(process.env.AUTO_LOG_CHUNK_BLOCKS, 10) : undefined,
+      onMinted: (o) => recordOutcome(store, settings.chainKey, o),
       logger,
       stopSignal,
     }).catch((err) => logger.errorBold(`Copy-mint watcher crashed: ${err.message}`));
@@ -415,6 +553,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
         maxQuantityPerWallet: settings.autoMaxQuantity,
         openseaApiKey: process.env.OPENSEA_API_KEY,
         logChunkBlocks: process.env.AUTO_LOG_CHUNK_BLOCKS ? parseInt(process.env.AUTO_LOG_CHUNK_BLOCKS, 10) : undefined,
+        onMinted: (o) => recordOutcome(store, key, o),
         logger,
         stopSignal,
       }).catch((err) => logger.errorBold(`Auto-mint watcher crashed: ${err.message}`));
@@ -640,7 +779,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
         );
       }
 
-      await localPublicSnipe({
+      const outcome = await localPublicSnipe({
         nftContract: contract,
         quantity,
         walletKeys: wallets.map((w) => store.getDecryptedKey(w.address)),
@@ -652,6 +791,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
         plan,
         logger,
       });
+      await recordOutcome(store, settings.chainKey, outcome);
     } catch (err: any) {
       await ctx.reply(`❌ ${err.message}`);
     }
@@ -725,7 +865,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
       // means this promise resolves whenever it eventually fires, which
       // can be a long time from now. That's fine: Node doesn't block on a
       // pending await, so the bot keeps handling everything else meanwhile.
-      await localPublicSnipe({
+      const outcome = await localPublicSnipe({
         nftContract: schedContract,
         quantity: schedQuantity,
         walletKeys: schedWallets.map((addr) => store.getDecryptedKey(addr)),
@@ -737,6 +877,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
         plan,
         logger,
       });
+      await recordOutcome(store, settings.chainKey, outcome);
     } catch (err: any) {
       logger.errorBold(`Scheduled mint failed: ${err.message}`);
     }

@@ -27,6 +27,21 @@ export interface CopyTarget {
   addedAt: number;
 }
 
+// One row per collection actually minted (confirmed on-chain), not per token
+// — the portfolio view is about "which collections am I in", and quantity
+// accumulates as more mints land.
+export interface MintRecord {
+  chainKey: string;
+  nftContract: string;
+  slug?: string; // resolved from OpenSea when available; absent for unindexed collections
+  name?: string;
+  quantity: number;
+  wallets: string[];
+  lastTxHash: string;
+  firstMintedAt: number;
+  lastMintedAt: number;
+}
+
 export interface BotSettings {
   chainKey: string; // the single chain used by /mint, Fund Wallets, and Copy Mint
   maxFeeGwei: number;
@@ -54,6 +69,7 @@ export interface BotSettings {
 interface StoreData {
   wallets: WalletRecord[];
   copyTargets: CopyTarget[];
+  mints: MintRecord[];
   settings: BotSettings;
 }
 
@@ -80,12 +96,13 @@ export class TelegramStore {
 
   private load(): StoreData {
     if (!fs.existsSync(this.filePath)) {
-      return { wallets: [], copyTargets: [], settings: { ...DEFAULT_SETTINGS } };
+      return { wallets: [], copyTargets: [], mints: [], settings: { ...DEFAULT_SETTINGS } };
     }
     const raw = JSON.parse(fs.readFileSync(this.filePath, "utf8"));
     return {
       wallets: raw.wallets ?? [],
       copyTargets: raw.copyTargets ?? [],
+      mints: raw.mints ?? [],
       settings: { ...DEFAULT_SETTINGS, ...(raw.settings ?? {}) },
     };
   }
@@ -177,6 +194,64 @@ export class TelegramStore {
 
   listCopyTargets(): CopyTarget[] {
     return [...this.data.copyTargets];
+  }
+
+  // ── Minted holdings ──────────────────────────────────────────────────
+  // Accumulates into one row per (chain, contract). Called only for mints
+  // confirmed on-chain, so this reflects what was actually received.
+  recordMint(entry: {
+    chainKey: string;
+    nftContract: string;
+    quantity: number;
+    wallets: string[];
+    txHash: string;
+    slug?: string;
+    name?: string;
+  }): MintRecord {
+    const key = entry.nftContract.toLowerCase();
+    let record = this.data.mints.find(
+      (m) => m.nftContract.toLowerCase() === key && m.chainKey === entry.chainKey
+    );
+    const now = Date.now();
+
+    if (record) {
+      record.quantity += entry.quantity;
+      record.wallets = [...new Set([...record.wallets, ...entry.wallets])];
+      record.lastTxHash = entry.txHash;
+      record.lastMintedAt = now;
+      // Metadata may resolve on a later mint even if it didn't the first time.
+      if (entry.slug && !record.slug) record.slug = entry.slug;
+      if (entry.name && !record.name) record.name = entry.name;
+    } else {
+      record = {
+        chainKey: entry.chainKey,
+        nftContract: entry.nftContract,
+        slug: entry.slug,
+        name: entry.name,
+        quantity: entry.quantity,
+        wallets: [...new Set(entry.wallets)],
+        lastTxHash: entry.txHash,
+        firstMintedAt: now,
+        lastMintedAt: now,
+      };
+      this.data.mints.push(record);
+    }
+    this.save();
+    return record;
+  }
+
+  listMints(): MintRecord[] {
+    return [...this.data.mints].sort((a, b) => b.lastMintedAt - a.lastMintedAt);
+  }
+
+  removeMint(nftContract: string): boolean {
+    const before = this.data.mints.length;
+    this.data.mints = this.data.mints.filter(
+      (m) => m.nftContract.toLowerCase() !== nftContract.toLowerCase()
+    );
+    const removed = this.data.mints.length !== before;
+    if (removed) this.save();
+    return removed;
   }
 
   // ── Settings ─────────────────────────────────────────────────────────

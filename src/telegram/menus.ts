@@ -2,7 +2,7 @@
 
 import { Markup } from "telegraf";
 import { CHAINS } from "../chains";
-import { WalletRecord, CopyTarget, BotSettings } from "./store";
+import { WalletRecord, CopyTarget, BotSettings, MintRecord } from "./store";
 
 export function maskAddress(addr: string): string {
   return `${addr.slice(0, 6)}…${addr.slice(-4)}`;
@@ -13,8 +13,29 @@ export function mainMenu() {
     [Markup.button.callback("💼 Wallets", "menu:wallets"), Markup.button.callback("⚙️ Settings", "menu:settings")],
     [Markup.button.callback("🎯 Auto Mint", "menu:auto"), Markup.button.callback("👀 Copy Mint", "menu:copy")],
     [Markup.button.callback("💸 Fund Wallets", "menu:fund"), Markup.button.callback("⏰ Scheduled Mint", "menu:sched")],
-    [Markup.button.callback("📊 Status", "menu:status")],
+    [Markup.button.callback("🖼 Portfolio", "menu:portfolio"), Markup.button.callback("📊 Status", "menu:status")],
   ]);
+}
+
+export function portfolioMenu(mints: MintRecord[]) {
+  const rows = mints.slice(0, 20).map((m) => [
+    Markup.button.callback(
+      `${m.name || maskAddress(m.nftContract)} ×${m.quantity}`,
+      `pf:view:${m.nftContract}`
+    ),
+  ]);
+  rows.push([Markup.button.callback("🔄 Refresh floors", "menu:portfolio")]);
+  rows.push([Markup.button.callback("⬅ Back", "menu:main")]);
+  return Markup.inlineKeyboard(rows);
+}
+
+export function portfolioItemMenu(record: MintRecord, openseaUrl?: string) {
+  const rows: any[] = [];
+  if (openseaUrl) rows.push([Markup.button.url("🌊 View on OpenSea", openseaUrl)]);
+  rows.push([Markup.button.callback("📈 Recent activity", `pf:activity:${record.nftContract}`)]);
+  rows.push([Markup.button.callback("🗑 Remove from portfolio", `pf:remove:${record.nftContract}`)]);
+  rows.push([Markup.button.callback("⬅ Back", "menu:portfolio")]);
+  return Markup.inlineKeyboard(rows);
 }
 
 // Tapping a wallet now opens its detail view (walletDetailMenu) instead of
