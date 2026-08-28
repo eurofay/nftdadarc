@@ -1,10 +1,17 @@
-// Public-mint execution with no OpenSea in the loop.
+// Public-mint execution with no API in the loop.
 //
 // Because the calldata is known ahead of time (see seadrop-public.ts), every
 // transaction can be signed and serialised *before* the stage opens. At T-0 the
 // only work left is writing bytes to sockets — no API poll, no signing, no
 // encoding. That is strictly faster than the OpenSea path, which cannot sign
 // until the API hands over calldata roughly a second after the stage starts.
+//
+// Worth being precise, since this repo now uses OpenSea elsewhere (portfolio,
+// activity alerts, selling): none of that touches the path below. Firing a
+// mint reads only chain state, so it still works when OpenSea is down,
+// rate-limiting, or has never indexed the collection. The one OpenSea thing
+// involved is an on-chain address — their fee recipient, which SeaDrop itself
+// requires as a mint parameter (see seadrop-public.ts) — not a network call.
 
 import { performance } from "perf_hooks";
 import { Wallet, formatEther } from "ethers";
@@ -51,7 +58,7 @@ export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<SnipeOutco
   const endpoints = parseRpcEndpoints(rpcUrls);
   const wallets = walletKeys.map((k) => new Wallet(k, provider));
 
-  log.title("\n── LOCAL PUBLIC MINT (no OpenSea) ──");
+  log.title("\n── PUBLIC MINT · on-chain only, no API ──");
   log.info(`  SeaDrop:       ${plan.to}`);
   log.info(`  NFT:           ${nftContract}`);
   log.info(`  Fee recipient: ${plan.feeRecipient}`);
