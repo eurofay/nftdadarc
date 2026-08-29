@@ -286,8 +286,12 @@ export class TelegramStore {
   }
 
   // Newest first. Pass a watched wallet to see only what it triggered.
+  //
+  // Two attempts can share a millisecond, and Date.now() then can't separate
+  // them. Array.sort is stable, so reversing before sorting makes the later
+  // *insertion* win a tie — which is what "newest" means here.
   listCopyAttempts(sourceWallet?: string): CopyMintAttempt[] {
-    const all = [...this.data.copyHistory].sort((a, b) => b.at - a.at);
+    const all = [...this.data.copyHistory].reverse().sort((a, b) => b.at - a.at);
     if (!sourceWallet) return all;
     return all.filter((a) => a.sourceWallet.toLowerCase() === sourceWallet.toLowerCase());
   }
@@ -304,7 +308,8 @@ export class TelegramStore {
   }
 
   listMints(): MintRecord[] {
-    return [...this.data.mints].sort((a, b) => b.lastMintedAt - a.lastMintedAt);
+    // Same millisecond-tie reasoning as listCopyAttempts.
+    return [...this.data.mints].reverse().sort((a, b) => b.lastMintedAt - a.lastMintedAt);
   }
 
   removeMint(nftContract: string): boolean {
