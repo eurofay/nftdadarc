@@ -59,6 +59,7 @@ import { runAutoMintWatcher } from "../auto-mint";
 import { runCopyMintWatcher } from "../copy-mint";
 import { runActivityWatcher } from "../activity-watcher";
 import { batchTransfer, estimateBatchCost } from "../fund-transfer";
+import { fetchOnChainHoldings } from "../nft-holdings";
 import { acceptOfferViaSdk, acceptOfferWithFallback, createListing, parseListingPrice } from "../opensea-sell";
 import { createLogger, withPrefix, LogSink } from "../logger";
 import { istTimeToDate, toIST } from "../time-format";
@@ -379,12 +380,45 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
 
     const settings = store.getSettings();
     const key = process.env.OPENSEA_API_KEY;
-    const nfts = await fetchAccountNfts(settings.chainKey, wallet.address, key);
-    const collections = groupByCollection(nfts);
+
+    // Chain first — balanceOf is authoritative, free, and works for drops
+    // OpenSea has never indexed. OpenSea is then asked only for what it
+    // alone knows (slugs/art/floors), and its absence degrades labels
+    // rather than emptying the portfolio.
+    const { urls } = resolveRpcsForChain(settings.chainKey);
+    const known = store
+      .listMints()
+      .filter((m) => m.chainKey === settings.chainKey)
+      .map((m) => m.nftContract);
+    const onChain = await fetchOnChainHoldings(urls[0], wallet.address, known, { withNames: true });
+
+    // OpenSea can still surface collections this bot never minted.
+    const viaOpenSea = await fetchAccountNfts(settings.chainKey, wallet.address, key);
+    const openSeaCollections = groupByCollection(viaOpenSea);
+
+    // Merge, preferring the on-chain count where both know a contract.
+    const merged = new Map<string, { slug: string; count: number }>();
+    for (const c of openSeaCollections) merged.set(c.contract.toLowerCase(), { slug: c.slug, count: c.count });
+    for (const h of onChain) {
+      const existing = merged.get(h.contract);
+      const record = store.listMints().find((m) => m.nftContract.toLowerCase() === h.contract);
+      merged.set(h.contract, {
+        slug: existing?.slug ?? record?.slug ?? h.name ?? maskAddress(h.contract),
+        count: h.balance,
+      });
+    }
+    const collections = [...merged.values()].sort((a, b) => b.count - a.count);
+    const total = collections.reduce((n, c) => n + c.count, 0);
 
     if (collections.length === 0) {
+      // Say which of the two actually came back empty, instead of blaming
+      // indexing for what may be a rejected API key or a wallet that in
+      // fact holds nothing.
+      const openSeaWorks = viaOpenSea.length > 0 || (await fetchStats("osborns", key)) !== null;
       return ctx.reply(
-        `${wallet.label} holds no NFTs on ${settings.chainKey} (or OpenSea hasn't indexed them).`,
+        `${wallet.label} holds nothing on ${settings.chainKey}.\n\n` +
+          `Checked ${known.length} known collection(s) on-chain — all zero.` +
+          (openSeaWorks ? "" : "\n\n⚠️ OpenSea also rejected the request, so anything minted outside this bot can't be listed. Check OPENSEA_API_KEY."),
         walletHoldingsMenu(wallet.address, [], makeTokenizer(ctx.session))
       );
     }
@@ -395,7 +429,9 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
       .join("\n");
     await ctx.reply(
       `🖼 ${wallet.label} (${maskAddress(wallet.address)}) on ${settings.chainKey}\n` +
-        `${nfts.length} NFT(s) across ${collections.length} collection(s)\n\n${lines}`,
+        `${total} NFT(s) across ${collections.length} collection(s)` +
+        (viaOpenSea.length === 0 && onChain.length > 0 ? "\n(read from chain — OpenSea unavailable)" : "") +
+        `\n\n${lines}`,
       walletHoldingsMenu(wallet.address, collections, makeTokenizer(ctx.session))
     );
   });

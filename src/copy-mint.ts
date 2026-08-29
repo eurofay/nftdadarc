@@ -138,8 +138,15 @@ export async function runCopyMintWatcher(opts: CopyMintOpts): Promise<void> {
       // and the watcher drifts permanently behind. Copying a mint from
       // thousands of blocks ago is pointless anyway.
       if (latest - lastScanned > MAX_CATCHUP_BLOCKS) {
-        const skipped = latest - lastScanned - MAX_CATCHUP_BLOCKS;
-        log.warn(`  ⏩ ${skipped} blocks behind — skipping ahead to stay near the chain head.`);
+        const behind = latest - lastScanned;
+        const skipped = behind - MAX_CATCHUP_BLOCKS;
+        // Say both numbers: how far behind it had fallen, and how many
+        // blocks are being given up unscanned. Those skipped blocks are
+        // never examined, so a drop inside them is genuinely missed —
+        // reporting only one of the two hides that.
+        log.warn(
+          `  ⏩ ${behind} blocks behind — skipping ${skipped} unscanned to stay near the head.`
+        );
         lastScanned = latest - MAX_CATCHUP_BLOCKS;
       }
 
