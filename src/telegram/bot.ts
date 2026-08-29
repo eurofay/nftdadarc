@@ -60,6 +60,8 @@ import { runCopyMintWatcher } from "../copy-mint";
 import { runActivityWatcher } from "../activity-watcher";
 import { batchTransfer, estimateBatchCost } from "../fund-transfer";
 import { fetchOnChainHoldings } from "../nft-holdings";
+import { MintCardData } from "../mint-card";
+import { renderMintCardPng } from "../mint-card-render";
 import { acceptOfferViaSdk, acceptOfferWithFallback, createListing, parseListingPrice } from "../opensea-sell";
 import { createLogger, withPrefix, LogSink } from "../logger";
 import { istTimeToDate, toIST } from "../time-format";
@@ -172,7 +174,10 @@ async function previewMint(
 async function recordOutcome(
   store: TelegramStore,
   chainKey: string,
-  outcome: { nftContract: string; quantity: number; minted: { address: string; txHash: string }[] }
+  outcome: { nftContract: string; quantity: number; minted: { address: string; txHash: string }[] },
+  // Supplied by the bot so a confirmed mint also posts its card. Optional so
+  // the CLI paths can record without one.
+  card?: { bot: Telegraf<BotContext>; chatId: number; source: MintCardData["source"] }
 ): Promise<void> {
   if (outcome.minted.length === 0) return;
   try {
@@ -189,6 +194,62 @@ async function recordOutcome(
     });
   } catch {
     // ignore — never let bookkeeping surface as a mint failure
+  }
+
+  if (card) {
+    const data = await buildCard(store, outcome.nftContract, card.source);
+    if (data) await sendCard(card.bot, card.chatId, data);
+  }
+}
+
+// Assembles a mint card for a collection already in the portfolio, pulling
+// live market data so a card generated later reflects today's floor rather
+// than the one at mint time.
+async function buildCard(
+  store: TelegramStore,
+  nftContract: string,
+  source: MintCardData["source"]
+): Promise<MintCardData | null> {
+  const record = store.listMints().find((m) => m.nftContract.toLowerCase() === nftContract.toLowerCase());
+  if (!record) return null;
+
+  const key = process.env.OPENSEA_API_KEY;
+  const [info, stats, offer] = await Promise.all([
+    record.slug ? fetchCollection(record.slug, key) : Promise.resolve(null),
+    record.slug ? fetchStats(record.slug, key) : Promise.resolve(null),
+    record.slug ? fetchBestCollectionOffer(record.slug, key) : Promise.resolve(null),
+  ]);
+
+  return {
+    collection: info?.name || record.name || maskAddress(record.nftContract),
+    contract: record.nftContract,
+    chain: record.chainKey,
+    source,
+    minted: record.quantity,
+    wallets: record.wallets.length,
+    // The store doesn't track spend per collection; these are overwhelmingly
+    // free mints, and gas isn't part of the token's cost basis.
+    pricePaidEth: 0,
+    floorEth: stats?.floorPrice ?? null,
+    bestOfferEth: offer?.priceEth ?? null,
+    mintedAt: record.firstMintedAt,
+    artHref: info?.imageUrl ?? null,
+  };
+}
+
+// Rendering costs ~1s of CPU and can fail on a bad image; it must never
+// interfere with the mint that produced it.
+async function sendCard(
+  bot: Telegraf<BotContext>,
+  chatId: number,
+  data: MintCardData,
+  caption?: string
+): Promise<void> {
+  try {
+    const png = await renderMintCardPng(data);
+    await bot.telegram.sendPhoto(chatId, { source: png }, caption ? { caption } : undefined);
+  } catch (err: any) {
+    console.error(`Mint card failed for ${data.contract}: ${err?.message ?? err}`);
   }
 }
 
@@ -590,6 +651,34 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
     await ctx.reply(
       `📈 ${record.name || record.slug} — last ${events.length} events (${sales} sales)\n\n${lines.join("\n")}`
     );
+  });
+
+  // ── Mint cards ───────────────────────────────────────────────────────
+  bot.action(/^card:col:(.+)$/, async (ctx) => {
+    const pair = resolvePair(ctx.session, ctx.match[1]);
+    if (!pair) return ctx.answerCbQuery("That menu expired — reopen Portfolio.", { show_alert: true });
+
+    const record = store
+      .listMints()
+      .find((m) => m.slug === pair.slug || m.nftContract.toLowerCase() === pair.slug.toLowerCase());
+    if (!record) {
+      return ctx.answerCbQuery("No mint on record for this collection — cards cover what this bot minted.", {
+        show_alert: true,
+      });
+    }
+    await ctx.answerCbQuery("Rendering…");
+    const data = await buildCard(store, record.nftContract, "Auto Mint");
+    if (!data) return ctx.reply("Couldn't assemble a card for that collection.");
+    await sendCard(bot, ctx.chat!.id, data);
+  });
+
+  bot.action(/^card:hist:(.+)$/, async (ctx) => {
+    const contract = resolveToken(ctx.session, ctx.match[1]);
+    if (!contract) return ctx.answerCbQuery("That menu expired — reopen Copy Mint.", { show_alert: true });
+    await ctx.answerCbQuery("Rendering…");
+    const data = await buildCard(store, contract, "Copy Mint");
+    if (!data) return ctx.reply("Couldn't assemble a card for that collection.");
+    await sendCard(bot, ctx.chat!.id, data);
   });
 
   // ── Sell from a specific wallet's holdings ───────────────────────────
@@ -1026,7 +1115,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
       maxPriceEth: settings.copyMintMaxPriceEth,
       quantityPerWallet: settings.copyMintMaxQuantity,
       logChunkBlocks: logChunkBlocksFor(settings.chainKey),
-      onMinted: (o) => recordOutcome(store, settings.chainKey, o),
+      onMinted: (o) => recordOutcome(store, settings.chainKey, o, { bot, chatId, source: "Copy Mint" }),
       onAttempt: (a) => {
         store.recordCopyAttempt({
           chainKey: settings.chainKey,
@@ -1128,7 +1217,22 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
         `✅ ${totals.success} copied · ❌ ${totals.failed} failed · ↷ ${totals.skipped} skipped` +
         (attempts.length > 25 ? `\n(showing the latest 25 of ${attempts.length})` : "") +
         `\n\n${lines.join("\n")}`,
-      copyHistoryWalletMenu(address, makeTokenizer(ctx.session))
+      copyHistoryWalletMenu(
+        address,
+        // Only successful copies get a card — there's nothing to celebrate
+        // about a skip, and de-duped so one collection appears once.
+        [
+          ...new Map(
+            attempts
+              .filter((a) => a.outcome === "success")
+              .map((a) => [
+                a.nftContract.toLowerCase(),
+                { nftContract: a.nftContract, label: a.name || a.slug || maskAddress(a.nftContract) },
+              ])
+          ).values(),
+        ],
+        makeTokenizer(ctx.session)
+      )
     );
   });
 
@@ -1200,7 +1304,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
         maxQuantityPerWallet: settings.autoMaxQuantity,
         openseaApiKey: process.env.OPENSEA_API_KEY,
         logChunkBlocks: logChunkBlocksFor(key),
-        onMinted: (o) => recordOutcome(store, key, o),
+        onMinted: (o) => recordOutcome(store, key, o, { bot, chatId, source: "Auto Mint" }),
         alreadyMinted: (c) => store.listMints().some((m) => m.nftContract.toLowerCase() === c.toLowerCase()),
         logger,
         stopSignal,
@@ -1442,7 +1546,11 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
         plan,
         logger,
       });
-      await recordOutcome(store, settings.chainKey, outcome);
+      await recordOutcome(store, settings.chainKey, outcome, {
+        bot,
+        chatId: ctx.chat!.id,
+        source: "Manual Mint",
+      });
     } catch (err: any) {
       await ctx.reply(`❌ ${err.message}`);
     }
@@ -1528,7 +1636,11 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
         plan,
         logger,
       });
-      await recordOutcome(store, settings.chainKey, outcome);
+      await recordOutcome(store, settings.chainKey, outcome, {
+        bot,
+        chatId: ctx.chat!.id,
+        source: "Scheduled Mint",
+      });
     } catch (err: any) {
       logger.errorBold(`Scheduled mint failed: ${err.message}`);
     }

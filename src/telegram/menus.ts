@@ -63,6 +63,7 @@ export function walletCollectionMenu(address: string, slug: string, tok: Tokeniz
   const rows: any[] = [];
   if (openseaUrl) rows.push([Markup.button.url("🌊 View on OpenSea", openseaUrl)]);
   rows.push([Markup.button.callback("📈 Collection activity", `pf:colact:${tok(slug)}`)]);
+  rows.push([Markup.button.callback("🖼 Mint card", `card:col:${pair}`)]);
   rows.push([Markup.button.callback("💵 Sell / offers", `sell:col:${pair}`)]);
   rows.push([Markup.button.callback("⬅ Back", `pf:wallet:${address}`)]);
   return Markup.inlineKeyboard(rows);
@@ -176,11 +177,18 @@ export function copyHistoryMenu(
   return Markup.inlineKeyboard(rows);
 }
 
-export function copyHistoryWalletMenu(address: string, tok: Tokenizer) {
-  return Markup.inlineKeyboard([
-    [Markup.button.callback("🔄 Refresh", `copy:hist:${tok(address)}`)],
-    [Markup.button.callback("⬅ Back", "copy:history")],
+export function copyHistoryWalletMenu(
+  address: string,
+  copied: { nftContract: string; label: string }[],
+  tok: Tokenizer
+) {
+  // A card only means anything for an attempt that actually minted.
+  const rows = copied.slice(0, 8).map((c) => [
+    Markup.button.callback(`🖼 ${c.label}`, `card:hist:${tok(c.nftContract)}`),
   ]);
+  rows.push([Markup.button.callback("🔄 Refresh", `copy:hist:${tok(address)}`)]);
+  rows.push([Markup.button.callback("⬅ Back", "copy:history")]);
+  return Markup.inlineKeyboard(rows);
 }
 
 export function autoMenu(enabled: boolean) {
