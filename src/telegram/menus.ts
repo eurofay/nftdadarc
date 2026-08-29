@@ -154,8 +154,33 @@ export function copyMenu(enabled: boolean, targets: CopyTarget[]) {
   ]);
   rows.push([Markup.button.callback(enabled ? "⏸ Turn off" : "▶️ Turn on", "copy:toggle")]);
   rows.push([Markup.button.callback("➕ Watch a wallet", "copy:add")]);
+  rows.push([Markup.button.callback("📜 Copy-mint history", "copy:history")]);
   rows.push([Markup.button.callback("⬅ Back", "menu:main")]);
   return Markup.inlineKeyboard(rows);
+}
+
+// History is sectioned by the watched wallet that triggered each copy —
+// "what has this wallet led me into" is the question being asked.
+export function copyHistoryMenu(
+  wallets: { address: string; label: string; count: number }[],
+  tok: Tokenizer
+) {
+  const rows = wallets.slice(0, 20).map((w) => [
+    Markup.button.callback(
+      `${w.label} (${w.count})`,
+      `copy:hist:${tok(w.address)}`
+    ),
+  ]);
+  if (wallets.length > 0) rows.push([Markup.button.callback("🗑 Clear history", "copy:hist:clear")]);
+  rows.push([Markup.button.callback("⬅ Back", "menu:copy")]);
+  return Markup.inlineKeyboard(rows);
+}
+
+export function copyHistoryWalletMenu(address: string, tok: Tokenizer) {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback("🔄 Refresh", `copy:hist:${tok(address)}`)],
+    [Markup.button.callback("⬅ Back", "copy:history")],
+  ]);
 }
 
 export function autoMenu(enabled: boolean) {

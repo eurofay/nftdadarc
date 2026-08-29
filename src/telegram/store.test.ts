@@ -285,3 +285,95 @@ describe("TelegramStore settings", () => {
     expect(store2.getSettings().maxFeeGwei).toBe(12.5);
   });
 });
+
+describe("TelegramStore copy-mint history", () => {
+  const NFT = "0x1111111111111111111111111111111111111111";
+  const SRC_A = "0xaaaAaAaaAaAaAaaAaAAAAAAAAaaaAaAaAaaAaaAa";
+  const SRC_B = "0xbbbBbBbbBbBbBbbBbBBBBBBBBbbbBbBbBbbBbbBb";
+
+  const attempt = (over: Partial<Parameters<TelegramStore["recordCopyAttempt"]>[0]> = {}) => ({
+    chainKey: "robinhood",
+    sourceWallet: SRC_A,
+    nftContract: NFT,
+    quantity: 1,
+    outcome: "success" as const,
+    txHashes: ["0xtx"],
+    ...over,
+  });
+
+  it("records every outcome, not just successes", () => {
+    const store = freshStore();
+    store.recordCopyAttempt(attempt({ outcome: "success" }));
+    store.recordCopyAttempt(attempt({ outcome: "failed", reason: "no receipt" }));
+    store.recordCopyAttempt(attempt({ outcome: "skipped", reason: "price exceeds cap" }));
+
+    const all = store.listCopyAttempts();
+    expect(all).toHaveLength(3);
+    expect(all.map((a) => a.outcome).sort()).toEqual(["failed", "skipped", "success"]);
+    // The reason is the point of recording a non-success at all.
+    expect(all.find((a) => a.outcome === "skipped")!.reason).toBe("price exceeds cap");
+  });
+
+  it("stamps each attempt with a time", () => {
+    const store = freshStore();
+    const before = Date.now();
+    const rec = store.recordCopyAttempt(attempt());
+    expect(rec.at).toBeGreaterThanOrEqual(before);
+  });
+
+  it("filters by the watched wallet that triggered the copy", () => {
+    const store = freshStore();
+    store.recordCopyAttempt(attempt({ sourceWallet: SRC_A }));
+    store.recordCopyAttempt(attempt({ sourceWallet: SRC_B }));
+    store.recordCopyAttempt(attempt({ sourceWallet: SRC_B }));
+
+    expect(store.listCopyAttempts(SRC_A)).toHaveLength(1);
+    expect(store.listCopyAttempts(SRC_B)).toHaveLength(2);
+    expect(store.listCopyAttempts()).toHaveLength(3);
+  });
+
+  it("matches the source wallet case-insensitively", () => {
+    const store = freshStore();
+    store.recordCopyAttempt(attempt({ sourceWallet: SRC_A }));
+    expect(store.listCopyAttempts(SRC_A.toUpperCase())).toHaveLength(1);
+  });
+
+  it("lists newest first", () => {
+    const store = freshStore();
+    store.recordCopyAttempt(attempt({ nftContract: "0x1" }));
+    store.recordCopyAttempt(attempt({ nftContract: "0x2" }));
+    expect(store.listCopyAttempts()[0].nftContract).toBe("0x2");
+  });
+
+  it("reports the wallets that appear in history, even once un-watched", () => {
+    const store = freshStore();
+    store.recordCopyAttempt(attempt({ sourceWallet: SRC_A }));
+    store.recordCopyAttempt(attempt({ sourceWallet: SRC_B }));
+    store.recordCopyAttempt(attempt({ sourceWallet: SRC_A }));
+    expect(store.listCopyHistoryWallets().sort()).toEqual([SRC_A, SRC_B].sort());
+  });
+
+  it("keeps history bounded, discarding the oldest", () => {
+    const store = freshStore();
+    for (let i = 0; i < 520; i++) store.recordCopyAttempt(attempt({ nftContract: `0x${i}` }));
+    const all = store.listCopyAttempts();
+    expect(all.length).toBeLessThanOrEqual(500);
+    // Newest survived, oldest did not.
+    expect(all[0].nftContract).toBe("0x519");
+    expect(all.some((a) => a.nftContract === "0x0")).toBe(false);
+  });
+
+  it("clears history on request", () => {
+    const store = freshStore();
+    store.recordCopyAttempt(attempt());
+    store.clearCopyHistory();
+    expect(store.listCopyAttempts()).toEqual([]);
+  });
+
+  it("persists history across a fresh instance", () => {
+    const store1 = freshStore();
+    store1.recordCopyAttempt(attempt({ outcome: "failed", reason: "gas" }));
+    const store2 = new TelegramStore(tmpFile, "test-pass");
+    expect(store2.listCopyAttempts()[0].reason).toBe("gas");
+  });
+});

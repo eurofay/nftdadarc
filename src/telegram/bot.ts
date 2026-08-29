@@ -35,6 +35,8 @@ import {
   sellMenu,
   sellConfirmMenu,
   activityMenu,
+  copyHistoryMenu,
+  copyHistoryWalletMenu,
   maskAddress,
 } from "./menus";
 import { resolveChain, logChunkBlocksFor } from "../chains";
@@ -989,6 +991,18 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
       quantityPerWallet: settings.copyMintMaxQuantity,
       logChunkBlocks: logChunkBlocksFor(settings.chainKey),
       onMinted: (o) => recordOutcome(store, settings.chainKey, o),
+      onAttempt: (a) => {
+        store.recordCopyAttempt({
+          chainKey: settings.chainKey,
+          sourceWallet: a.sourceWallet,
+          sourceTxHash: a.sourceTxHash,
+          nftContract: a.nftContract,
+          quantity: a.quantity,
+          outcome: a.outcome,
+          reason: a.reason,
+          txHashes: a.txHashes,
+        });
+      },
       alreadyMinted: (c) => store.listMints().some((m) => m.nftContract.toLowerCase() === c.toLowerCase()),
       logger,
       stopSignal,
@@ -1004,6 +1018,83 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
     runningCopy = null;
     store.updateSettings({ copyMintEnabled: false });
   }
+
+  // ── Copy-mint history ────────────────────────────────────────────────
+  bot.action("copy:history", (ctx) => {
+    const attempts = store.listCopyAttempts();
+    if (attempts.length === 0) {
+      return ctx.answerCbQuery(
+        "No copy-mint attempts recorded yet. History starts from the first attempt after this update.",
+        { show_alert: true }
+      );
+    }
+
+    // Group by the watched wallet that triggered each copy.
+    const byWallet = new Map<string, number>();
+    for (const a of attempts) {
+      byWallet.set(a.sourceWallet, (byWallet.get(a.sourceWallet) ?? 0) + 1);
+    }
+    const targets = store.listCopyTargets();
+    const wallets = [...byWallet.entries()]
+      .map(([address, count]) => ({
+        address,
+        // Prefer the label from the watchlist; fall back for wallets since removed.
+        label: targets.find((t) => t.address.toLowerCase() === address.toLowerCase())?.label ?? maskAddress(address),
+        count,
+      }))
+      .sort((a, b) => b.count - a.count);
+
+    const totals = attempts.reduce(
+      (acc, a) => ({ ...acc, [a.outcome]: (acc as any)[a.outcome] + 1 }),
+      { success: 0, failed: 0, skipped: 0 } as Record<string, number>
+    );
+
+    return ctx.editMessageText(
+      `📜 Copy-mint history — ${attempts.length} attempt(s)\n` +
+        `✅ ${totals.success} copied · ❌ ${totals.failed} failed · ↷ ${totals.skipped} skipped\n\n` +
+        "Pick a watched wallet to see what it led into:",
+      copyHistoryMenu(wallets, makeTokenizer(ctx.session))
+    );
+  });
+
+  bot.action("copy:hist:clear", (ctx) => {
+    store.clearCopyHistory();
+    return ctx.editMessageText("📜 Copy-mint history cleared.", copyMenu(runningCopy !== null, store.listCopyTargets()));
+  });
+
+  bot.action(/^copy:hist:(.+)$/, async (ctx) => {
+    const address = resolveToken(ctx.session, ctx.match[1]);
+    if (!address) return ctx.answerCbQuery("That menu expired — reopen Copy Mint.", { show_alert: true });
+
+    const attempts = store.listCopyAttempts(address);
+    if (attempts.length === 0) return ctx.answerCbQuery("Nothing recorded for that wallet.", { show_alert: true });
+
+    const target = store.listCopyTargets().find((t) => t.address.toLowerCase() === address.toLowerCase());
+    const icon = { success: "✅", failed: "❌", skipped: "↷" } as const;
+
+    const lines = attempts.slice(0, 25).map((a) => {
+      const when = toIST(new Date(a.at));
+      const what = a.name || a.slug || maskAddress(a.nftContract);
+      const qty = a.quantity > 0 ? ` ×${a.quantity}` : "";
+      const why = a.reason ? ` — ${a.reason}` : "";
+      return `${icon[a.outcome]} ${what}${qty}${why}\n    ${when} IST`;
+    });
+
+    const totals = attempts.reduce(
+      (acc, a) => ({ ...acc, [a.outcome]: (acc as any)[a.outcome] + 1 }),
+      { success: 0, failed: 0, skipped: 0 } as Record<string, number>
+    );
+
+    await ctx.answerCbQuery();
+    return ctx.reply(
+      `📜 ${target?.label ?? maskAddress(address)}\n` +
+        `${address}\n\n` +
+        `✅ ${totals.success} copied · ❌ ${totals.failed} failed · ↷ ${totals.skipped} skipped` +
+        (attempts.length > 25 ? `\n(showing the latest 25 of ${attempts.length})` : "") +
+        `\n\n${lines.join("\n")}`,
+      copyHistoryWalletMenu(address, makeTokenizer(ctx.session))
+    );
+  });
 
   bot.action("copy:toggle", async (ctx) => {
     if (runningCopy) {

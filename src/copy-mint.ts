@@ -25,6 +25,16 @@ import { defaultLogger, Logger } from "./logger";
 // See auto-mint.ts — staying near the head matters more than completeness.
 const MAX_CATCHUP_BLOCKS = 200;
 
+export interface CopyAttemptReport {
+  sourceWallet: string;
+  sourceTxHash: string;
+  nftContract: string;
+  quantity: number;
+  outcome: "success" | "failed" | "skipped";
+  reason?: string;
+  txHashes: string[];
+}
+
 export interface WatchedMint {
   txHash: string;
   from: string;
@@ -61,6 +71,9 @@ export interface CopyMintOpts {
   quantityPerWallet?: number; // default: the drop's own max-per-wallet cap
   logChunkBlocks?: number; // eth_getLogs range per call — see seadrop-events.ts
   onMinted?: (outcome: SnipeOutcome) => void | Promise<void>; // portfolio bookkeeping; never allowed to fail a mint
+  // Every attempt, including the ones that never fired. "Why didn't it copy
+  // that one" is only answerable if skips are recorded too.
+  onAttempt?: (attempt: CopyAttemptReport) => void | Promise<void>;
   alreadyMinted?: (nftContract: string) => boolean; // see auto-mint.ts — avoids re-minting across restarts
   logger?: Logger;
   stopSignal?: { stopped: boolean };
@@ -88,6 +101,15 @@ export async function runCopyMintWatcher(opts: CopyMintOpts): Promise<void> {
   process.once("SIGINT", () => {
     signal.stopped = true;
   });
+
+  // Recording must never be able to break a copy attempt.
+  const report = async (a: CopyAttemptReport) => {
+    try {
+      await opts.onAttempt?.(a);
+    } catch {
+      /* history is bookkeeping */
+    }
+  };
 
   while (!signal.stopped) {
     await new Promise((r) => setTimeout(r, backoffMs(pollIntervalMs, consecutiveFailures)));
@@ -141,7 +163,17 @@ export async function runCopyMintWatcher(opts: CopyMintOpts): Promise<void> {
         copied.add(sighting.nftContract.toLowerCase());
 
         if (opts.alreadyMinted?.(sighting.nftContract)) {
-          log.info(`  ↷ Skipping ${sighting.nftContract} — already in your portfolio.`);
+          const reason = "already in your portfolio";
+          log.info(`  ↷ Skipping ${sighting.nftContract} — ${reason}.`);
+          await report({
+            sourceWallet: sighting.from,
+            sourceTxHash: sighting.txHash,
+            nftContract: sighting.nftContract,
+            quantity: 0,
+            outcome: "skipped",
+            reason,
+            txHashes: [],
+          });
           continue;
         }
 
@@ -151,12 +183,16 @@ export async function runCopyMintWatcher(opts: CopyMintOpts): Promise<void> {
 
         const drop = await buildLocalMintPlan(rpcUrls[0], sighting.nftContract, 1);
         if (!drop) {
-          log.error("     ✗ Skipped — couldn't resolve a public drop for this contract.");
+          const reason = "no public drop resolvable for this contract";
+          log.error(`     ✗ Skipped — ${reason}.`);
+          await report({ sourceWallet: sighting.from, sourceTxHash: sighting.txHash, nftContract: sighting.nftContract, quantity: 0, outcome: "skipped", reason, txHashes: [] });
           continue;
         }
         const priceEth = Number(drop.drop.mintPrice) / 1e18;
         if (priceEth > opts.maxPriceEth) {
-          log.error(`     ✗ Skipped — price ${priceEth} ETH exceeds your ${opts.maxPriceEth} ETH cap.`);
+          const reason = `price ${priceEth} ETH exceeds your ${opts.maxPriceEth} ETH cap`;
+          log.error(`     ✗ Skipped — ${reason}.`);
+          await report({ sourceWallet: sighting.from, sourceTxHash: sighting.txHash, nftContract: sighting.nftContract, quantity: 0, outcome: "skipped", reason, txHashes: [] });
           continue;
         }
 
@@ -169,7 +205,9 @@ export async function runCopyMintWatcher(opts: CopyMintOpts): Promise<void> {
           : drop.drop.maxTotalMintableByWallet;
         const plan = await buildLocalMintPlan(rpcUrls[0], sighting.nftContract, quantity);
         if (!plan) {
-          log.error("     ✗ Skipped — drop no longer resolvable at the intended quantity.");
+          const reason = `drop no longer resolvable at quantity ${quantity}`;
+          log.error(`     ✗ Skipped — ${reason}.`);
+          await report({ sourceWallet: sighting.from, sourceTxHash: sighting.txHash, nftContract: sighting.nftContract, quantity, outcome: "skipped", reason, txHashes: [] });
           continue;
         }
 
@@ -191,8 +229,20 @@ export async function runCopyMintWatcher(opts: CopyMintOpts): Promise<void> {
           } catch {
             /* bookkeeping only */
           }
+          // Dispatch alone isn't a copy — only confirmed receipts count.
+          await report({
+            sourceWallet: sighting.from,
+            sourceTxHash: sighting.txHash,
+            nftContract: sighting.nftContract,
+            quantity,
+            outcome: outcome.minted.length > 0 ? "success" : "failed",
+            reason: outcome.minted.length > 0 ? undefined : "broadcast but no wallet confirmed a receipt",
+            txHashes: outcome.minted.map((m) => m.txHash),
+          });
         } catch (err: any) {
-          log.error(`     ✗ Copy-mint attempt failed: ${describeRpcError(err)}`);
+          const reason = describeRpcError(err);
+          log.error(`     ✗ Copy-mint attempt failed: ${reason}`);
+          await report({ sourceWallet: sighting.from, sourceTxHash: sighting.txHash, nftContract: sighting.nftContract, quantity, outcome: "failed", reason, txHashes: [] });
         }
       }
 

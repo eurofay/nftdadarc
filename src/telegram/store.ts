@@ -42,6 +42,28 @@ export interface MintRecord {
   lastMintedAt: number;
 }
 
+// One row per copy-mint attempt, whatever came of it. Skips and failures are
+// as interesting as successes here — "why didn't it copy that one" is the
+// question this history exists to answer.
+export type CopyAttemptOutcome = "success" | "failed" | "skipped";
+
+export interface CopyMintAttempt {
+  at: number;
+  chainKey: string;
+  sourceWallet: string; // the watched wallet whose mint triggered this
+  sourceTxHash?: string;
+  nftContract: string;
+  slug?: string;
+  name?: string;
+  quantity: number;
+  outcome: CopyAttemptOutcome;
+  reason?: string; // why it was skipped, or how it failed
+  txHashes: string[];
+}
+
+// Bounded so a long-running bot can't grow the store without limit.
+const MAX_COPY_HISTORY = 500;
+
 export interface BotSettings {
   chainKey: string; // the single chain used by /mint, Fund Wallets, and Copy Mint
   maxFeeGwei: number;
@@ -75,6 +97,7 @@ interface StoreData {
   wallets: WalletRecord[];
   copyTargets: CopyTarget[];
   mints: MintRecord[];
+  copyHistory: CopyMintAttempt[];
   settings: BotSettings;
 }
 
@@ -105,13 +128,14 @@ export class TelegramStore {
 
   private load(): StoreData {
     if (!fs.existsSync(this.filePath)) {
-      return { wallets: [], copyTargets: [], mints: [], settings: { ...DEFAULT_SETTINGS } };
+      return { wallets: [], copyTargets: [], mints: [], copyHistory: [], settings: { ...DEFAULT_SETTINGS } };
     }
     const raw = JSON.parse(fs.readFileSync(this.filePath, "utf8"));
     return {
       wallets: raw.wallets ?? [],
       copyTargets: raw.copyTargets ?? [],
       mints: raw.mints ?? [],
+      copyHistory: raw.copyHistory ?? [],
       settings: { ...DEFAULT_SETTINGS, ...(raw.settings ?? {}) },
     };
   }
@@ -247,6 +271,36 @@ export class TelegramStore {
     }
     this.save();
     return record;
+  }
+
+  // ── Copy-mint history ────────────────────────────────────────────────
+  recordCopyAttempt(entry: Omit<CopyMintAttempt, "at">): CopyMintAttempt {
+    const record: CopyMintAttempt = { at: Date.now(), ...entry };
+    this.data.copyHistory.push(record);
+    // Keep the newest; trimming from the front drops the least useful rows.
+    if (this.data.copyHistory.length > MAX_COPY_HISTORY) {
+      this.data.copyHistory = this.data.copyHistory.slice(-MAX_COPY_HISTORY);
+    }
+    this.save();
+    return record;
+  }
+
+  // Newest first. Pass a watched wallet to see only what it triggered.
+  listCopyAttempts(sourceWallet?: string): CopyMintAttempt[] {
+    const all = [...this.data.copyHistory].sort((a, b) => b.at - a.at);
+    if (!sourceWallet) return all;
+    return all.filter((a) => a.sourceWallet.toLowerCase() === sourceWallet.toLowerCase());
+  }
+
+  // Wallets that actually appear in the history, so the menu can offer them
+  // even after one has been removed from the live watchlist.
+  listCopyHistoryWallets(): string[] {
+    return [...new Set(this.data.copyHistory.map((a) => a.sourceWallet))];
+  }
+
+  clearCopyHistory(): void {
+    this.data.copyHistory = [];
+    this.save();
   }
 
   listMints(): MintRecord[] {
