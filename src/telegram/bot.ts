@@ -39,7 +39,7 @@ import {
   copyHistoryWalletMenu,
   maskAddress,
 } from "./menus";
-import { resolveChain, logChunkBlocksFor } from "../chains";
+import { resolveChain, logChunkBlocksFor, blocksForSeconds } from "../chains";
 import { resolveRpcsForChain } from "../rpc-resolver";
 import { parseNftLink } from "../nft-link";
 import { resolveSlug, openseaContractInfo } from "../slug-resolver";
@@ -1115,6 +1115,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
       maxPriceEth: settings.copyMintMaxPriceEth,
       quantityPerWallet: settings.copyMintMaxQuantity,
       logChunkBlocks: logChunkBlocksFor(settings.chainKey),
+      backfillBlocks: blocksForSeconds(settings.chainKey, settings.copyBackfillHours * 3600),
       onMinted: (o) => recordOutcome(store, settings.chainKey, o, { bot, chatId, source: "Copy Mint" }),
       onAttempt: (a) => {
         store.recordCopyAttempt({
@@ -1459,6 +1460,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
     "autoMaxQuantity",
     "copyMintMaxPriceEth",
     "copyMintMaxQuantity",
+    "copyBackfillHours",
     "activitySweepSales",
     "activityFloorMovePct",
     "activityOfferVsFloorPct",

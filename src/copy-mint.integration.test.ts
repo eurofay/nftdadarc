@@ -127,3 +127,74 @@ describe("runCopyMintWatcher quantity cap (regression: was quantityPerWallet ?? 
     expect(sentQuantities).toEqual([3n]);
   });
 });
+
+// The watcher used to start at the chain head, so any mint older than its
+// own start time was invisible. That looked reasonable until the drops were
+// measured: of 28 collections watched wallets minted over 12 hours, 25 were
+// still open, with windows from 1 to 365 days. A copy signal stays good for
+// as long as the drop does, so the backfill is where most of the value is.
+async function setUpBackfill(backfillBlocks: number) {
+  const HEAD = 1000;
+  const PAST = 900; // 100 blocks before the watcher ever wakes up
+  const sentQuantities: bigint[] = [];
+  const past = mintLog(NFT, new Wallet(SOURCE_KEY).address, PAST);
+
+  mock = await startMockRpc({
+    eth_chainId: () => "0x2105",
+    eth_blockNumber: () => `0x${HEAD.toString(16)}`,
+    // Honors the requested range, so a scan that never looks back finds nothing.
+    eth_getLogs: (params) => {
+      const from = parseInt(params[0].fromBlock, 16);
+      const to = parseInt(params[0].toBlock, 16);
+      return PAST >= from && PAST <= to ? [past] : [];
+    },
+    eth_call: (params) => {
+      const call = CALL_IFACE.parseTransaction({ data: params[0].data })!;
+      if (call.name === "getPublicDrop") {
+        return CALL_IFACE.encodeFunctionResult("getPublicDrop", [[0n, 1, 0, DROP_MAX_PER_WALLET, 0, false]]);
+      }
+      return CALL_IFACE.encodeFunctionResult("getAllowedFeeRecipients", [[RECIPIENT]]);
+    },
+    eth_getTransactionCount: () => "0x0",
+    eth_sendRawTransaction: (params) => {
+      const decoded = decodeMintPublic(Transaction.from(params[0]).data);
+      if (decoded) sentQuantities.push(decoded.quantity);
+      return keccak256(params[0]);
+    },
+    eth_getTransactionReceipt: () => ({ blockNumber: "0x64", transactionIndex: "0x1", gasUsed: "0x5208", status: "0x1" }),
+  });
+
+  const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+  const run = runCopyMintWatcher({
+    chain: CHAINS.find((c) => c.key === "base")!,
+    rpcUrls: [mock.url],
+    walletKeys: [COPIER_KEY],
+    watchTargets: [new Wallet(SOURCE_KEY).address],
+    maxFeePerGas: 2_000_000_000n,
+    maxPriorityFee: 100_000_000n,
+    gasLimit: 250_000,
+    pollIntervalMs: 30,
+    maxPriceEth: 1,
+    backfillBlocks,
+    logChunkBlocks: 500,
+  });
+
+  await new Promise((r) => setTimeout(r, 1500));
+  process.emit("SIGINT" as any);
+  await run;
+  logSpy.mockRestore();
+  return { sentQuantities };
+}
+
+describe("runCopyMintWatcher startup backfill", () => {
+  it("copies a mint that happened before it started", { timeout: 15000 }, async () => {
+    const { sentQuantities } = await setUpBackfill(200);
+    expect(sentQuantities).toEqual([3n]);
+  });
+
+  it("ignores history when the backfill is switched off", { timeout: 15000 }, async () => {
+    // Documents the old behaviour, and proves the backfill is what changed it.
+    const { sentQuantities } = await setUpBackfill(0);
+    expect(sentQuantities).toEqual([]);
+  });
+});

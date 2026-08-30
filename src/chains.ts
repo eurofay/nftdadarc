@@ -15,6 +15,11 @@ export interface ChainProfile {
   name: string;         // human label
   explorer: string;     // block explorer base URL, NO trailing slash
   nativeSymbol: string;
+  // Seconds per block, measured. Used to turn a block count into a span of
+  // time: "200 blocks behind" means 40 minutes on Ethereum and 20 seconds on
+  // Robinhood, so any tolerance expressed in blocks is really a per-chain
+  // constant in disguise.
+  blockSeconds: number;
   rpc: {
     alchemyHost?: string; // Alchemy host for this network (docs/reference)
     public: string[];     // public RPC + sequencer endpoints
@@ -34,6 +39,7 @@ export const CHAINS: ChainProfile[] = [
     name: "Ethereum",
     explorer: "https://etherscan.io",
     nativeSymbol: "ETH",
+    blockSeconds: 12.12,
     rpc: {
       alchemyHost: "eth-mainnet.g.alchemy.com",
       logChunkBlocks: 10,
@@ -50,6 +56,7 @@ export const CHAINS: ChainProfile[] = [
     name: "Base",
     explorer: "https://basescan.org",
     nativeSymbol: "ETH",
+    blockSeconds: 2,
     rpc: {
       alchemyHost: "base-mainnet.g.alchemy.com",
       logChunkBlocks: 10,
@@ -68,6 +75,7 @@ export const CHAINS: ChainProfile[] = [
     name: "Robinhood Chain",
     explorer: "https://robinhoodchain.blockscout.com",
     nativeSymbol: "ETH",
+    blockSeconds: 0.1,
     rpc: {
       alchemyHost: "robinhood-mainnet.g.alchemy.com",
       // Measured: the public endpoint below returns a 10,000-block range in
@@ -121,4 +129,32 @@ export function logChunkBlocksFor(chainKey: string, env: NodeJS.ProcessEnv = pro
   if (Number.isFinite(global) && global > 0) return global;
 
   return resolveChain(chainKey)?.rpc.logChunkBlocks ?? 10;
+}
+
+/** Blocks spanning `seconds` of this chain's time, floored at 1. */
+export function blocksForSeconds(chainKey: string, seconds: number): number {
+  const per = resolveChain(chainKey)?.blockSeconds ?? 12;
+  return Math.max(1, Math.round(seconds / per));
+}
+
+// How far behind the head a watcher may fall before it gives up on the gap.
+// Expressed in TIME, not blocks: the old flat 200 blocks was 40 minutes of
+// tolerance on Ethereum but only 20 SECONDS on Robinhood — far less than a
+// single RPC timeout, so one slow response silently discarded every sighting
+// in the gap.
+export function catchupBlocksFor(chainKey: string, env: NodeJS.ProcessEnv = process.env): number {
+  const override = Number(env.COPY_CATCHUP_SECONDS);
+  const seconds = Number.isFinite(override) && override > 0 ? override : 600;
+  return blocksForSeconds(chainKey, seconds);
+}
+
+// On startup a watcher looks BACK over this span before following the head.
+// Copy-mint drops observed in practice stay open for days, so a mint seen
+// hours ago is usually still mintable — starting at the head throws those
+// away for no benefit. 0 disables the backfill.
+export function backfillBlocksFor(chainKey: string, env: NodeJS.ProcessEnv = process.env): number {
+  const override = Number(env.COPY_BACKFILL_HOURS);
+  const hours = Number.isFinite(override) && override >= 0 ? override : 12;
+  if (hours === 0) return 0;
+  return blocksForSeconds(chainKey, hours * 3600);
 }

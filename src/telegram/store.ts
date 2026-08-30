@@ -81,6 +81,10 @@ export interface BotSettings {
   // Copy-mint isn't restricted to free drops, so this is the one guardrail
   // against blindly following a watched wallet into an expensive mint.
   copyMintMaxPriceEth: number;
+  // Hours of history the copy watcher scans on startup. Drops it follows
+  // routinely stay open for days, so a mint seen this morning is usually
+  // still mintable — starting at the chain head threw those away.
+  copyBackfillHours: number;
   // Caps quantity per wallet the same way autoMaxQuantity does for Auto
   // Mint — capped at whichever is smaller, this or the drop's own max, so
   // a huge per-wallet allowance (e.g. 4000) doesn't burn far more gas than
@@ -109,6 +113,7 @@ const DEFAULT_SETTINGS: BotSettings = {
   autoEnabled: false,
   copyMintEnabled: false,
   copyMintMaxPriceEth: 0,
+  copyBackfillHours: 12,
   activityEnabled: true,
   activitySweepSales: 3,
   activityFloorMovePct: 15,
@@ -324,8 +329,11 @@ export class TelegramStore {
 
   // ── Settings ─────────────────────────────────────────────────────────
   getSettings(): BotSettings {
+    // load() already merges DEFAULT_SETTINGS over what's on disk, so a store
+    // written before a setting existed answers with that setting's default.
     return { ...this.data.settings };
   }
+
 
   updateSettings(patch: Partial<BotSettings>): BotSettings {
     this.data.settings = { ...this.data.settings, ...patch };

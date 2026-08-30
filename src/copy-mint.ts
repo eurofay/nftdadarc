@@ -19,11 +19,9 @@ import { buildLocalMintPlan } from "./seadrop-public";
 import { scanSeaDropMints } from "./seadrop-events";
 import { localPublicSnipe, SnipeOutcome } from "./local-mint";
 import { backoffMs, createProvider, describeRpcError } from "./rpc-provider";
-import { ChainProfile } from "./chains";
+import { ChainProfile, backfillBlocksFor, catchupBlocksFor } from "./chains";
 import { defaultLogger, Logger } from "./logger";
 
-// See auto-mint.ts — staying near the head matters more than completeness.
-const MAX_CATCHUP_BLOCKS = 200;
 
 export interface CopyAttemptReport {
   sourceWallet: string;
@@ -69,6 +67,9 @@ export interface CopyMintOpts {
   pollIntervalMs: number;
   maxPriceEth: number; // skip anything pricier than this per wallet
   quantityPerWallet?: number; // default: the drop's own max-per-wallet cap
+  // Blocks to look back on startup. Defaults to the chain's 12-hour span;
+  // 0 starts at the head. See backfillBlocksFor.
+  backfillBlocks?: number;
   logChunkBlocks?: number; // eth_getLogs range per call — see seadrop-events.ts
   onMinted?: (outcome: SnipeOutcome) => void | Promise<void>; // portfolio bookkeeping; never allowed to fail a mint
   // Every attempt, including the ones that never fired. "Why didn't it copy
@@ -96,6 +97,8 @@ export async function runCopyMintWatcher(opts: CopyMintOpts): Promise<void> {
   // instead of throwing before the watcher has even started.
   let lastScanned: number | null = null;
   let consecutiveFailures = 0;
+  let firstPass = false;
+  const maxCatchup = catchupBlocksFor(chain.key);
 
   const signal = opts.stopSignal ?? { stopped: false };
   process.once("SIGINT", () => {
@@ -126,20 +129,34 @@ export async function runCopyMintWatcher(opts: CopyMintOpts): Promise<void> {
       // doesn't have yet.
       const latest = (await provider.getBlockNumber()) - 2;
 
-      // First successful poll only establishes a baseline — this follows
-      // watched wallets from now on, not through the chain's history.
+      // First successful poll: look BACK before following the head.
+      //
+      // This used to start at the head, on the reasoning that a stale mint
+      // isn't worth copying. Measurement says otherwise — of 28 collections
+      // watched wallets minted over 12 hours, 25 were still open, with
+      // windows of 1 to 365 days. Starting at the head threw all of them
+      // away. Unlike a contested free mint, a copy signal keeps its value
+      // for as long as the drop stays open.
       if (lastScanned === null) {
-        lastScanned = latest;
+        const backfill = opts.backfillBlocks ?? backfillBlocksFor(chain.key);
+        lastScanned = Math.max(0, latest - backfill);
         consecutiveFailures = 0;
-        continue;
+        if (backfill > 0) {
+          const hours = ((backfill * chain.blockSeconds) / 3600).toFixed(1);
+          log.info(`  ⏮ Backfilling ${backfill} blocks (~${hours}h) for drops that are still open…`);
+        }
+        // Fall through and scan it, rather than `continue` — but skip the
+        // catch-up guard below, which would otherwise discard the backfill
+        // as "too far behind" the instant it was set.
+        firstPass = true;
       }
 
       // Same reasoning as auto-mint.ts: on a fast chain a backlog compounds
       // and the watcher drifts permanently behind. Copying a mint from
       // thousands of blocks ago is pointless anyway.
-      if (latest - lastScanned > MAX_CATCHUP_BLOCKS) {
+      if (!firstPass && latest - lastScanned > maxCatchup) {
         const behind = latest - lastScanned;
-        const skipped = behind - MAX_CATCHUP_BLOCKS;
+        const skipped = behind - maxCatchup;
         // Say both numbers: how far behind it had fallen, and how many
         // blocks are being given up unscanned. Those skipped blocks are
         // never examined, so a drop inside them is genuinely missed —
@@ -147,7 +164,7 @@ export async function runCopyMintWatcher(opts: CopyMintOpts): Promise<void> {
         log.warn(
           `  ⏩ ${behind} blocks behind — skipping ${skipped} unscanned to stay near the head.`
         );
-        lastScanned = latest - MAX_CATCHUP_BLOCKS;
+        lastScanned = latest - maxCatchup;
       }
 
       if (latest <= lastScanned) {
@@ -156,13 +173,30 @@ export async function runCopyMintWatcher(opts: CopyMintOpts): Promise<void> {
       }
 
       let sightings: WatchedMint[] = [];
+      const chunk = opts.logChunkBlocks;
       try {
-        sightings = await scanWatchedMints(rpcUrls[0], lastScanned + 1, latest, watchTargets, opts.logChunkBlocks);
+        try {
+          sightings = await scanWatchedMints(rpcUrls[0], lastScanned + 1, latest, watchTargets, chunk);
+        } catch (err: any) {
+          // Robinhood's public node answers a 10k-block range in ~300ms when
+          // idle and times out on 2k when busy, so a failure here says more
+          // about load than about the range. One retry at half the chunk
+          // costs a few extra calls and saves the whole range — which for
+          // the startup backfill is hours of signal.
+          const halved = Math.max(10, Math.floor((chunk ?? 10) / 2));
+          log.warn(`  ⚠ scan failed at chunk ${chunk ?? 10} (${describeRpcError(err)}) — retrying at ${halved}`);
+          sightings = await scanWatchedMints(rpcUrls[0], lastScanned + 1, latest, watchTargets, halved);
+        }
         // Only mark this range scanned on success — advancing it on failure
         // would silently skip it forever despite the "retrying" log below.
         lastScanned = latest;
       } catch (err: any) {
         log.error(`  ⚠ block scan failed: ${describeRpcError(err)} — retrying next tick`);
+      } finally {
+        // One backfill attempt only. If it failed, the catch-up guard above
+        // takes over next tick and reports honestly what it gives up on,
+        // rather than re-scanning an hours-long range forever.
+        firstPass = false;
       }
 
       for (const sighting of sightings) {

@@ -210,6 +210,7 @@ export function settingsMenu(s: BotSettings) {
     [Markup.button.callback(`Auto max qty: ${s.autoMaxQuantity ?? "unlimited (true max)"}`, "setting:autoMaxQuantity")],
     [Markup.button.callback(`Copy-mint price cap: ${s.copyMintMaxPriceEth} ETH`, "setting:copyMintMaxPriceEth")],
     [Markup.button.callback(`Copy-mint max qty: ${s.copyMintMaxQuantity ?? "unlimited (true max)"}`, "setting:copyMintMaxQuantity")],
+    [Markup.button.callback(`Copy-mint backfill: ${s.copyBackfillHours === 0 ? "off (head only)" : s.copyBackfillHours + "h"}`, "setting:copyBackfillHours")],
     [Markup.button.callback("⬅ Back", "menu:main")],
   ]);
 }
