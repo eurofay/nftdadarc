@@ -146,10 +146,15 @@ export async function runCopyMintWatcher(opts: CopyMintOpts): Promise<void> {
           const hours = ((backfill * chain.blockSeconds) / 3600).toFixed(1);
           log.info(`  ⏮ Backfilling ${backfill} blocks (~${hours}h) for drops that are still open…`);
         }
-        // Fall through and scan it, rather than `continue` — but skip the
-        // catch-up guard below, which would otherwise discard the backfill
-        // as "too far behind" the instant it was set.
-        firstPass = true;
+        // Fall through and scan it, rather than `continue` — but suspend the
+        // catch-up guard below, which would otherwise discard the backfill as
+        // "too far behind" the instant it was set.
+        //
+        // Only when there IS a range to protect. With the backfill off,
+        // lastScanned is already the head, so the poll short-circuits before
+        // reaching the reset — and the flag would survive into the next poll
+        // and disable the guard there for nothing.
+        firstPass = backfill > 0;
       }
 
       // Same reasoning as auto-mint.ts: on a fast chain a backlog compounds

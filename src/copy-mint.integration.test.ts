@@ -271,3 +271,12 @@ describe("runCopyMintWatcher affordability pre-flight", () => {
     expect(skips.join(" ")).toContain("0.0005");
   });
 });
+
+describe("runCopyMintWatcher catch-up guard is not left suspended", () => {
+  it("keeps following the head when the backfill is off", { timeout: 15000 }, async () => {
+    // With no backfill there is no range to protect, so the first poll must
+    // not leave the catch-up guard disabled for the poll that follows it.
+    const { sentQuantities } = await setUpBackfill(0);
+    expect(sentQuantities).toEqual([]);
+  });
+});
