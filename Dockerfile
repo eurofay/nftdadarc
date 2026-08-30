@@ -19,9 +19,14 @@ COPY --from=build /app/dist ./dist
 # serif face that isn't in the design.
 COPY assets ./assets
 
-# Wallets live here. This MUST be a mounted volume — see DEPLOY.md. On an
-# ephemeral filesystem every redeploy silently destroys every stored wallet.
+# Wallets live here. This MUST be a mounted volume, attached by the host —
+# see DEPLOY.md. On an ephemeral filesystem every redeploy silently destroys
+# every stored wallet.
+#
+# No VOLUME instruction: Railway rejects the image outright if one is present
+# ("docker VOLUME is not supported, use Railway Volumes"), because it manages
+# mounts itself. Declaring it here never created the volume anyway — only the
+# host attaching one at /data does that.
 ENV DATA_DIR=/data
-VOLUME ["/data"]
 
 CMD ["node", "dist/telegram-bot.js"]

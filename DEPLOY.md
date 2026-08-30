@@ -14,6 +14,10 @@ every automatic restart — silently deletes every wallet in the bot. There is n
 warning and no recovery. The encrypted store is the only copy of those keys
 unless you separately kept the seed phrase.
 
+Note: the Dockerfile deliberately contains no `VOLUME` instruction — Railway
+rejects an image that declares one. The mount is created by attaching a volume
+in the dashboard, which is the step below.
+
 ## Railway
 
 1. Push this repo to GitHub, then **New Project → Deploy from GitHub repo**.
