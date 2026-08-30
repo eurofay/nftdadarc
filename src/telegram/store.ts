@@ -68,6 +68,8 @@ export interface BotSettings {
   chainKey: string; // the single chain used by /mint, Fund Wallets, and Copy Mint
   maxFeeGwei: number;
   priorityGwei: number;
+  // 0 means "size it from the quantity being minted" (see gas.ts). A fixed
+  // number over-reserves for a small mint and runs out of gas on a large one.
   gasLimit: number;
   autoEnabled: boolean;
   autoMaxQuantity?: number;

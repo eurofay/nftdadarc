@@ -1471,7 +1471,12 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
   for (const field of NUMERIC_SETTINGS) {
     bot.action(`setting:${field}`, (ctx) => {
       ctx.session.step = `awaiting_setting:${field}`;
-      return ctx.reply(`Send the new value for ${field}${CLEARABLE.has(field) ? " (or \"clear\" for unlimited)" : ""}:`);
+      const hint = CLEARABLE.has(field)
+        ? ' (or "clear" for unlimited)'
+        : field === "gasLimit"
+          ? ' (or "auto" to size it from the quantity — recommended)'
+          : "";
+      return ctx.reply(`Send the new value for ${field}${hint}:`);
     });
   }
 
@@ -1885,6 +1890,17 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
           field === "autoMaxQuantity"
             ? "Cleared — auto mint will use each drop's true max per wallet."
             : "Cleared — copy mint will use each drop's true max per wallet."
+        );
+      }
+
+      // "auto" on the gas limit means size it from the quantity being minted,
+      // which is stored as 0. A fixed limit both over-reserves for a small
+      // mint and runs out of gas on a large one.
+      if (field === "gasLimit" && raw.toLowerCase() === "auto") {
+        store.updateSettings({ gasLimit: 0 });
+        return ctx.reply(
+          "✅ Gas limit is now sized automatically from the quantity being minted.",
+          settingsMenu(store.getSettings())
         );
       }
 

@@ -21,6 +21,7 @@ import { waitForMintTime } from "./timer";
 import { explorerTx } from "./chains";
 import { LocalMintPlan } from "./seadrop-public";
 import { defaultLogger, Logger } from "./logger";
+import { gasLimitForQuantity } from "./gas";
 import { createProvider } from "./rpc-provider";
 
 export interface LocalSnipeOpts {
@@ -89,7 +90,9 @@ export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<SnipeOutco
       nonce: nonces[i],
       maxFeePerGas,
       maxPriorityFeePerGas: maxPriorityFee,
-      gasLimit: gasLimit || 250_000,
+      // 0 (or unset) means "size it from the quantity" — see gas.ts. A
+      // non-zero value is an explicit override and is honoured as given.
+      gasLimit: gasLimit > 0 ? gasLimit : gasLimitForQuantity(quantity),
       type: 2,
       chainId,
     });
