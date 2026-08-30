@@ -1143,9 +1143,12 @@ export function createBot({ token, ownerId, stores }: BotDeps): Telegraf<BotCont
   // ── Copy-mint watchlist ──────────────────────────────────────────────
   bot.action("copy:add", (ctx) => {
     ctx.session.step = "awaiting_copy_target";
-    return ctx.reply("Send the wallet address to watch (optionally followed by a label, e.g. `0xabc... whale`).", {
-      parse_mode: "Markdown",
-    });
+    return ctx.reply(
+      "Send the wallet address to watch, optionally followed by a label:\n" +
+        "0xabc... whale\n\n" +
+        "Or paste many at once — one per line, or separated by spaces or commas. " +
+        "Addresses already on the list are skipped."
+    );
   });
 
   bot.action(/^copy:remove:(.+)$/, (ctx) => {
@@ -1893,14 +1896,39 @@ export function createBot({ token, ownerId, stores }: BotDeps): Telegraf<BotCont
 
     if (step === "awaiting_copy_target") {
       ctx.session.step = undefined;
-      const [address, ...labelParts] = ctx.message.text.trim().split(/\s+/);
-      if (!isAddress(address)) return ctx.reply("That doesn't look like a valid address.");
-      try {
-        const target = ctx.store.addCopyTarget(labelParts.join(" "), address);
-        await ctx.reply(`✅ Watching ${target.label} (${maskAddress(target.address)}).`);
-      } catch (err: any) {
-        await ctx.reply(`❌ ${err.message}`);
+      const tokens = ctx.message.text.trim().split(/[\s,]+/).filter(Boolean);
+      const addresses = tokens.filter((t) => isAddress(t));
+
+      if (addresses.length === 0) {
+        return ctx.reply("I couldn't find a valid address in that. Paste one or more 0x… addresses.");
       }
+
+      // One address plus trailing words is the single-add case, where those
+      // words are its label. Several addresses is a bulk paste, and stray
+      // words in it are ignored rather than becoming a label for whichever
+      // address happened to come first.
+      const bulk = addresses.length > 1;
+      const label = bulk ? "" : tokens.filter((t) => !isAddress(t)).join(" ");
+
+      const added: string[] = [];
+      const already: string[] = [];
+      for (const address of addresses) {
+        try {
+          added.push(ctx.store.addCopyTarget(label, address).address);
+        } catch {
+          already.push(address); // addCopyTarget rejects duplicates by design
+        }
+      }
+
+      const skipped = tokens.length - addresses.length;
+      const lines = [`✅ Watching ${added.length} new wallet(s).`];
+      if (already.length) lines.push(`${already.length} already on the list.`);
+      if (bulk && skipped > 0) lines.push(`${skipped} item(s) weren't valid addresses and were ignored.`);
+      lines.push("", `Total watched: ${ctx.store.listCopyTargets().length}`);
+      await ctx.reply(
+        lines.join("\n"),
+        copyMenu(ctx.store.getSettings().copyMintEnabled, ctx.store.listCopyTargets())
+      );
       return;
     }
 
