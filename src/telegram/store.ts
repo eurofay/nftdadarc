@@ -147,9 +147,35 @@ export class TelegramStore {
     };
   }
 
+  // Written to a temp file, flushed, then renamed over the target. rename is
+  // atomic within a filesystem, so a reader either sees the whole old file or
+  // the whole new one — never a half-written one.
+  //
+  // Writing straight to the target was fine on a laptop and is not fine on a
+  // host that restarts: a SIGTERM landing mid-write leaves the file truncated,
+  // and a truncated store is every private key in it gone. Redeploys make that
+  // an ordinary event rather than a freak one.
   private save(): void {
     fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
-    fs.writeFileSync(this.filePath, JSON.stringify(this.data, null, 2), { mode: 0o600 });
+    const tmp = `${this.filePath}.${process.pid}.tmp`;
+    const payload = JSON.stringify(this.data, null, 2);
+    let fd: number | undefined;
+    try {
+      fd = fs.openSync(tmp, "w", 0o600);
+      fs.writeFileSync(fd, payload);
+      // Without the flush the rename can land while the contents are still in
+      // the OS cache, which on a hard stop leaves an empty file in place.
+      fs.fsyncSync(fd);
+      fs.closeSync(fd);
+      fd = undefined;
+      fs.renameSync(tmp, this.filePath);
+    } catch (err) {
+      if (fd !== undefined) {
+        try { fs.closeSync(fd); } catch { /* already closing on the error path */ }
+      }
+      try { fs.unlinkSync(tmp); } catch { /* nothing to clean up */ }
+      throw err;
+    }
   }
 
   // ── Wallets ──────────────────────────────────────────────────────────

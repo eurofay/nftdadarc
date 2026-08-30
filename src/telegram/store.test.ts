@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, vi } from "vitest";
 import fs from "fs";
 import os from "os";
 import path from "path";
@@ -375,5 +375,51 @@ describe("TelegramStore copy-mint history", () => {
     store1.recordCopyAttempt(attempt({ outcome: "failed", reason: "gas" }));
     const store2 = new TelegramStore(tmpFile, "test-pass");
     expect(store2.listCopyAttempts()[0].reason).toBe("gas");
+  });
+});
+
+describe("save durability", () => {
+  it("leaves no partial file behind, and no temp files after a write", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "store-atomic-"));
+    try {
+      const file = path.join(dir, "s.json");
+      const store = new TelegramStore(file, "pass");
+      store.addWallet("a", "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
+      store.addWallet("b", "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d");
+
+      // A temp file surviving the write would be a leak, and on a restart loop
+      // would accumulate one per crash.
+      expect(fs.readdirSync(dir)).toEqual(["s.json"]);
+      // Whole-file readable, not truncated.
+      expect(() => JSON.parse(fs.readFileSync(file, "utf8"))).not.toThrow();
+      expect(new TelegramStore(file, "pass").listWallets()).toHaveLength(2);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the previous good file when a write fails", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "store-atomic-"));
+    try {
+      const file = path.join(dir, "s.json");
+      const store = new TelegramStore(file, "pass");
+      store.addWallet("keeper", "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
+      const good = fs.readFileSync(file, "utf8");
+
+      const spy = vi.spyOn(fs, "renameSync").mockImplementation(() => {
+        throw new Error("disk full");
+      });
+      expect(() =>
+        store.addWallet("doomed", "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d")
+      ).toThrow(/disk full/);
+      spy.mockRestore();
+
+      // The old contents are intact and nothing was left half-written.
+      expect(fs.readFileSync(file, "utf8")).toBe(good);
+      expect(fs.readdirSync(dir)).toEqual(["s.json"]);
+      expect(new TelegramStore(file, "pass").listWallets().map((w) => w.label)).toEqual(["keeper"]);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
