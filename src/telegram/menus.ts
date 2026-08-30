@@ -133,7 +133,9 @@ export function walletsMenu(wallets: WalletRecord[]) {
     const flags = `${w.includeInAutoMint === false ? "" : "🎯"}${w.includeInCopyMint === false ? "" : "👀"}` || "—";
     return [Markup.button.callback(`${w.label} (${maskAddress(w.address)}) [${flags}]`, `wallet:manage:${w.address}`)];
   });
-  rows.push([Markup.button.callback("➕ Add wallet", "wallet:add")]);
+  rows.push([Markup.button.callback("➕ Add wallet (private key)", "wallet:add")]);
+  rows.push([Markup.button.callback("🌱 Generate seed + wallets", "wallet:seed:new")]);
+  rows.push([Markup.button.callback("📥 Import seed phrase", "wallet:seed:import")]);
   rows.push([Markup.button.callback("⬅ Back", "menu:main")]);
   return Markup.inlineKeyboard(rows);
 }

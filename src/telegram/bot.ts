@@ -8,6 +8,7 @@
 import { Telegraf, Markup, Context } from "telegraf";
 import { message } from "telegraf/filters";
 import { isAddress, formatEther, parseEther } from "ethers";
+import { generateMnemonic, deriveWallets, isValidMnemonic } from "../hd-wallet";
 import { createProvider } from "../rpc-provider";
 import { TelegramStore, WalletRecord } from "./store";
 import {
@@ -70,6 +71,8 @@ import { renderBatch } from "./format";
 interface SessionData {
   step?:
     | "awaiting_wallet_key"
+    | "awaiting_seed_count"
+    | "awaiting_seed_import"
     | "awaiting_copy_target"
     | "awaiting_fund_amount"
     | "awaiting_sched_link"
@@ -1032,6 +1035,28 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
   });
 
   // ── Wallets ──────────────────────────────────────────────────────────
+  bot.action("wallet:seed:new", (ctx) => {
+    ctx.session.step = "awaiting_seed_count";
+    return ctx.reply(
+      "How many wallets should I create from a new seed phrase? (1-50)\n\n" +
+        "I'll show the phrase once. It is the ONLY backup — it restores every one of " +
+        "these wallets in MetaMask, Rabby or Ledger, and anyone who reads it controls " +
+        "all of them. Write it down offline, then delete my message."
+    );
+  });
+
+  bot.action("wallet:seed:import", (ctx) => {
+    ctx.session.step = "awaiting_seed_import";
+    return ctx.reply(
+      "Send your seed phrase, optionally followed by how many wallets to derive " +
+        "(defaults to 5):\n\n" +
+        "word1 word2 ... word12 5\n\n" +
+        "Your message is deleted the instant I read it — but Telegram is not " +
+        "end-to-end encrypted for bots, so only import a phrase you're happy to " +
+        "dedicate to this bot."
+    );
+  });
+
   bot.action("wallet:add", (ctx) => {
     ctx.session.step = "awaiting_wallet_key";
     return ctx.reply(
@@ -1745,6 +1770,76 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
         await ctx.reply(`❌ ${err.message}`);
       }
       return;
+    }
+
+    if (step === "awaiting_seed_count") {
+      ctx.session.step = undefined;
+      const count = parseInt(ctx.message.text.trim(), 10);
+      if (!Number.isFinite(count) || count < 1 || count > 50) {
+        return ctx.reply("Give me a number between 1 and 50.");
+      }
+
+      const phrase = generateMnemonic();
+      const derived = deriveWallets(phrase, count);
+      const added: string[] = [];
+      let dupes = 0;
+      for (const w of derived) {
+        try {
+          store.addWallet(`seed-${w.index}`, w.privateKey);
+          added.push(w.address);
+        } catch {
+          dupes++; // deriving is deterministic, so re-importing hits this
+        }
+      }
+
+      await ctx.reply(
+        `✅ Created ${added.length} wallet(s)${dupes ? ` (${dupes} already existed)` : ""}. ` +
+          "They mint on copy signals automatically.\n\n" +
+          added.map((a, i) => `${i + 1}. ${a}`).join("\n")
+      );
+      // The phrase gets its own message so it can be deleted on its own,
+      // without taking the address list with it.
+      return ctx.reply(
+        "🌱 SEED PHRASE — write this down offline, then DELETE this message:\n\n" +
+          `${phrase}\n\n` +
+          "I do not store it. It is the only way to restore these wallets, and anyone " +
+          "who reads it can take everything in them.",
+        mainMenu()
+      );
+    }
+
+    if (step === "awaiting_seed_import") {
+      ctx.session.step = undefined;
+      const raw = ctx.message.text.trim();
+      await ctx.deleteMessage(ctx.message.message_id).catch(() => {});
+
+      // A trailing number is the wallet count; everything before it is the phrase.
+      const parts = raw.split(/\s+/);
+      const tail = Number(parts[parts.length - 1]);
+      const hasCount = Number.isFinite(tail) && tail > 0;
+      const count = hasCount ? Math.min(50, Math.floor(tail)) : 5;
+      const phrase = (hasCount ? parts.slice(0, -1) : parts).join(" ");
+
+      if (!isValidMnemonic(phrase)) {
+        return ctx.reply("❌ That isn't a valid BIP-39 seed phrase. Check for a typo or a missing word.");
+      }
+
+      const added: string[] = [];
+      let dupes = 0;
+      for (const w of deriveWallets(phrase, count)) {
+        try {
+          store.addWallet(`seed-${w.index}`, w.privateKey);
+          added.push(w.address);
+        } catch {
+          dupes++;
+        }
+      }
+      return ctx.reply(
+        `✅ Imported ${added.length} wallet(s)${dupes ? ` (${dupes} already added)` : ""}.\n\n` +
+          added.map((a, i) => `${i + 1}. ${a}`).join("\n") +
+          "\n\nThey mint on copy signals automatically. Fund them before the next drop.",
+        mainMenu()
+      );
     }
 
     if (step === "awaiting_copy_target") {
