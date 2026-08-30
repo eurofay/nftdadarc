@@ -11,6 +11,7 @@ import { isAddress, formatEther, parseEther } from "ethers";
 import { generateMnemonic, deriveWallets, isValidMnemonic } from "../hd-wallet";
 import { createProvider } from "../rpc-provider";
 import { TelegramStore, WalletRecord } from "./store";
+import { UserStores } from "./user-stores";
 import {
   mainMenu,
   walletsMenu,
@@ -97,6 +98,8 @@ interface SessionData {
 }
 interface BotContext extends Context {
   session: SessionData;
+  /** This user's store, resolved per update. Never shared between users. */
+  store: TelegramStore;
 }
 
 interface RunningWatcher {
@@ -341,13 +344,37 @@ function resolvePair(session: SessionData, id: string): { address: string; slug:
   return { address: raw.slice(0, idx), slug: raw.slice(idx + 1) };
 }
 
-export interface BotDeps {
-  token: string;
-  ownerId: number;
-  store: TelegramStore;
+/**
+ * Which store, if any, an update may touch.
+ *
+ * Extracted from the middleware so the rule can be tested directly: this is
+ * the boundary that keeps one user out of another's wallets, and it is worth
+ * far more coverage than mocking Telegraf's update plumbing would buy.
+ */
+export function resolveAccess(
+  chatType: string | undefined,
+  userId: number | undefined,
+  stores: UserStores
+): { allowed: false; reason: string } | { allowed: true; store: TelegramStore } {
+  // Group chats are refused outright: everyone in one would otherwise share
+  // whichever member's store resolved first.
+  if (chatType !== "private") return { allowed: false, reason: "not a private chat" };
+  if (!userId) return { allowed: false, reason: "no user id on the update" };
+  try {
+    return { allowed: true, store: stores.for(userId) };
+  } catch {
+    return { allowed: false, reason: "unusable user id" };
+  }
 }
 
-export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotContext> {
+export interface BotDeps {
+  token: string;
+  /** Retains admin powers; everyone else gets their own isolated store. */
+  ownerId: number;
+  stores: UserStores;
+}
+
+export function createBot({ token, ownerId, stores }: BotDeps): Telegraf<BotContext> {
   const bot = new Telegraf<BotContext>(token);
 
   // Without this, a throw inside any handler propagates out through
@@ -372,49 +399,65 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
     return next();
   });
 
-  // ── Access control: this owner, this private chat, nobody else ─────────
+  // ── Access control and store binding ──────────────────────────────────
+  // Private chats only, and every update is bound to the sender's OWN store
+  // before any handler runs. Handlers reach data exclusively through
+  // ctx.store, so there is no shared store object one user could read
+  // another user's wallets out of.
   bot.use((ctx, next) => {
-    if (ctx.chat?.type !== "private" || ctx.from?.id !== ownerId) return;
+    const access = resolveAccess(ctx.chat?.type, ctx.from?.id, stores);
+    if (!access.allowed) return;
+    ctx.store = access.store;
     return next();
   });
 
-  const runningAuto = new Map<string, RunningWatcher>(); // keyed by chain key — one watcher per chain
-  let runningCopy: RunningWatcher | null = null;
-  let runningActivity: RunningWatcher | null = null;
+  // Watchers are per user: each person's wallets mint on their own signals,
+  // so one user stopping a watcher must never stop anyone else's.
+  const runningAutoByUser = new Map<number, Map<string, RunningWatcher>>();
+  const runningCopy = new Map<number, RunningWatcher>();
+  const runningActivity = new Map<number, RunningWatcher>();
+  // Resolved once for the boot-time "always on" restarts below, which run
+  // outside any update and so have no ctx to hang a store off.
+  const ownerStore = stores.for(ownerId);
+  const runningAutoFor = (userId: number): Map<string, RunningWatcher> => {
+    let m = runningAutoByUser.get(userId);
+    if (!m) runningAutoByUser.set(userId, (m = new Map()));
+    return m;
+  };
 
   // ── Menu navigation ──────────────────────────────────────────────────
   bot.start((ctx) => ctx.reply("NFT Public Mint Sniper — choose an action:", mainMenu()));
   bot.action("menu:main", (ctx) => ctx.editMessageText("Choose an action:", mainMenu()));
 
   bot.action("menu:wallets", (ctx) =>
-    ctx.editMessageText("Wallets — tap one to manage it. [🎯 Auto] [👀 Copy]:", walletsMenu(store.listWallets()))
+    ctx.editMessageText("Wallets — tap one to manage it. [🎯 Auto] [👀 Copy]:", walletsMenu(ctx.store.listWallets()))
   );
 
   bot.action("menu:settings", (ctx) =>
-    ctx.editMessageText("Settings (tap to change):", settingsMenu(store.getSettings()))
+    ctx.editMessageText("Settings (tap to change):", settingsMenu(ctx.store.getSettings()))
   );
 
   bot.action("menu:auto", (ctx) =>
     ctx.editMessageText(
-      `Auto free-mint watcher: ${runningAuto.size > 0 ? `🟢 running on ${[...runningAuto.keys()].join(", ")}` : "🔴 stopped"}\n` +
-        `Wallets enabled: ${store.listWalletsFor("auto").length}/${store.listWallets().length} (toggle per wallet in Wallets)\n` +
+      `Auto free-mint watcher: ${runningAutoFor(ctx.from!.id).size > 0 ? `🟢 running on ${[...runningAutoFor(ctx.from!.id).keys()].join(", ")}` : "🔴 stopped"}\n` +
+        `Wallets enabled: ${ctx.store.listWalletsFor("auto").length}/${ctx.store.listWallets().length} (toggle per wallet in Wallets)\n` +
         "Detects any SeaDrop drop going live at price 0 and mints the max per wallet — no confirmation. " +
         "Runs on one or more chains at once — set which ones in Settings → Auto-mint chains.",
-      autoMenu(runningAuto.size > 0)
+      autoMenu(runningAutoFor(ctx.from!.id).size > 0)
     )
   );
 
   bot.action("menu:copy", (ctx) =>
     ctx.editMessageText(
       `Copy-mint watcher: ${runningCopy ? "🟢 running" : "🔴 stopped"}\n` +
-        `Wallets enabled: ${store.listWalletsFor("copy").length}/${store.listWallets().length} (toggle per wallet in Wallets)\n` +
+        `Wallets enabled: ${ctx.store.listWalletsFor("copy").length}/${ctx.store.listWallets().length} (toggle per wallet in Wallets)\n` +
         "Copies any mintPublic call from a watched wallet, using your own wallets.",
-      copyMenu(runningCopy !== null, store.listCopyTargets())
+      copyMenu(runningCopy !== null, ctx.store.listCopyTargets())
     )
   );
 
   bot.action("menu:fund", (ctx) => {
-    const wallets = store.listWallets();
+    const wallets = ctx.store.listWallets();
     if (wallets.length < 2) {
       return ctx.answerCbQuery("Add at least two wallets first — one to send from, one to receive.", {
         show_alert: true,
@@ -431,18 +474,18 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
   // before this bot existed or bought elsewhere. The mint store stays the
   // source for "don't re-mint what we already have".
   bot.action("menu:portfolio", (ctx) => {
-    const wallets = store.listWallets();
+    const wallets = ctx.store.listWallets();
     if (wallets.length === 0) return ctx.answerCbQuery("Add a wallet first.", { show_alert: true });
     return ctx.editMessageText("🖼 Portfolio — pick a wallet:", portfolioWalletsMenu(wallets));
   });
 
   bot.action(/^pf:wallet:(.+)$/, async (ctx) => {
     const address = ctx.match[1];
-    const wallet = store.listWallets().find((w) => w.address.toLowerCase() === address.toLowerCase());
+    const wallet = ctx.store.listWallets().find((w) => w.address.toLowerCase() === address.toLowerCase());
     if (!wallet) return ctx.answerCbQuery("Unknown wallet.", { show_alert: true });
     await ctx.answerCbQuery("Loading holdings...");
 
-    const settings = store.getSettings();
+    const settings = ctx.store.getSettings();
     const key = process.env.OPENSEA_API_KEY;
 
     // Chain first — balanceOf is authoritative, free, and works for drops
@@ -450,7 +493,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
     // alone knows (slugs/art/floors), and its absence degrades labels
     // rather than emptying the portfolio.
     const { urls } = resolveRpcsForChain(settings.chainKey);
-    const known = store
+    const known = ctx.store
       .listMints()
       .filter((m) => m.chainKey === settings.chainKey)
       .map((m) => m.nftContract);
@@ -465,7 +508,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
     for (const c of openSeaCollections) merged.set(c.contract.toLowerCase(), { slug: c.slug, count: c.count });
     for (const h of onChain) {
       const existing = merged.get(h.contract);
-      const record = store.listMints().find((m) => m.nftContract.toLowerCase() === h.contract);
+      const record = ctx.store.listMints().find((m) => m.nftContract.toLowerCase() === h.contract);
       merged.set(h.contract, {
         slug: existing?.slug ?? record?.slug ?? h.name ?? maskAddress(h.contract),
         count: h.balance,
@@ -530,7 +573,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
 
   bot.action(/^pf:wactivity:(.+)$/, async (ctx) => {
     const address = ctx.match[1];
-    const wallet = store.listWallets().find((w) => w.address.toLowerCase() === address.toLowerCase());
+    const wallet = ctx.store.listWallets().find((w) => w.address.toLowerCase() === address.toLowerCase());
     await ctx.answerCbQuery("Fetching activity...");
 
     const events = await fetchAccountActivity(address, process.env.OPENSEA_API_KEY, 20);
@@ -563,7 +606,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
 
   // ── Legacy minted-only view, kept reachable for the mint store ────────
   bot.action("menu:mintlog", async (ctx) => {
-    const mints = store.listMints();
+    const mints = ctx.store.listMints();
     if (mints.length === 0) {
       return ctx.answerCbQuery("Nothing minted yet — it fills in automatically as mints land.", {
         show_alert: true,
@@ -595,7 +638,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
   });
 
   bot.action(/^pf:view:(.+)$/, async (ctx) => {
-    const record = store.listMints().find((m) => m.nftContract.toLowerCase() === ctx.match[1].toLowerCase());
+    const record = ctx.store.listMints().find((m) => m.nftContract.toLowerCase() === ctx.match[1].toLowerCase());
     if (!record) return ctx.answerCbQuery("No longer in your portfolio.", { show_alert: true });
     await ctx.answerCbQuery();
 
@@ -635,7 +678,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
   });
 
   bot.action(/^pf:activity:(.+)$/, async (ctx) => {
-    const record = store.listMints().find((m) => m.nftContract.toLowerCase() === ctx.match[1].toLowerCase());
+    const record = ctx.store.listMints().find((m) => m.nftContract.toLowerCase() === ctx.match[1].toLowerCase());
     if (!record?.slug) {
       return ctx.answerCbQuery("No OpenSea slug for this collection — activity unavailable.", { show_alert: true });
     }
@@ -661,7 +704,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
     const pair = resolvePair(ctx.session, ctx.match[1]);
     if (!pair) return ctx.answerCbQuery("That menu expired — reopen Portfolio.", { show_alert: true });
 
-    const record = store
+    const record = ctx.store
       .listMints()
       .find((m) => m.slug === pair.slug || m.nftContract.toLowerCase() === pair.slug.toLowerCase());
     if (!record) {
@@ -670,7 +713,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
       });
     }
     await ctx.answerCbQuery("Rendering…");
-    const data = await buildCard(store, record.nftContract, "Auto Mint");
+    const data = await buildCard(ctx.store, record.nftContract, "Auto Mint");
     if (!data) return ctx.reply("Couldn't assemble a card for that collection.");
     await sendCard(bot, ctx.chat!.id, data);
   });
@@ -679,7 +722,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
     const contract = resolveToken(ctx.session, ctx.match[1]);
     if (!contract) return ctx.answerCbQuery("That menu expired — reopen Copy Mint.", { show_alert: true });
     await ctx.answerCbQuery("Rendering…");
-    const data = await buildCard(store, contract, "Copy Mint");
+    const data = await buildCard(ctx.store, contract, "Copy Mint");
     if (!data) return ctx.reply("Couldn't assemble a card for that collection.");
     await sendCard(bot, ctx.chat!.id, data);
   });
@@ -743,14 +786,14 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
     const { address, slug } = pair;
     await ctx.answerCbQuery(action === "accept" ? "Selling..." : "Listing...");
 
-    const settings = store.getSettings();
+    const settings = ctx.store.getSettings();
     const { urls } = resolveRpcsForChain(settings.chainKey);
     const logger = withPrefix("sell", createLogger(createTelegramSink(bot, ctx.chat!.id)));
-    const wallet = store.listWallets().find((w) => w.address.toLowerCase() === address.toLowerCase());
+    const wallet = ctx.store.listWallets().find((w) => w.address.toLowerCase() === address.toLowerCase());
     if (!wallet) return ctx.reply("❌ Unknown wallet.");
 
     try {
-      const walletKey = store.getDecryptedKey(wallet.address);
+      const walletKey = ctx.store.getDecryptedKey(wallet.address);
 
       if (action === "accept") {
         const result = await acceptOfferWithFallback(
@@ -805,7 +848,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
 
   // ── Sell: view the best offer, then accept it via either path ────────
   bot.action(/^pf:sell:(.+)$/, async (ctx) => {
-    const record = store.listMints().find((m) => m.nftContract.toLowerCase() === ctx.match[1].toLowerCase());
+    const record = ctx.store.listMints().find((m) => m.nftContract.toLowerCase() === ctx.match[1].toLowerCase());
     if (!record?.slug) {
       return ctx.answerCbQuery("No OpenSea slug for this collection — selling unavailable.", { show_alert: true });
     }
@@ -832,7 +875,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
   });
 
   bot.action(/^sell:accept:(.+)$/, async (ctx) => {
-    const record = store.listMints().find((m) => m.nftContract.toLowerCase() === ctx.match[1].toLowerCase());
+    const record = ctx.store.listMints().find((m) => m.nftContract.toLowerCase() === ctx.match[1].toLowerCase());
     if (!record?.slug) return ctx.answerCbQuery("Not sellable.", { show_alert: true });
     const offer = await fetchBestCollectionOffer(record.slug, process.env.OPENSEA_API_KEY);
     if (!offer) return ctx.answerCbQuery("That offer is gone — refresh.", { show_alert: true });
@@ -845,22 +888,22 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
   });
 
   bot.action(/^sell:confirm:(.+)$/, async (ctx) => {
-    const record = store.listMints().find((m) => m.nftContract.toLowerCase() === ctx.match[1].toLowerCase());
+    const record = ctx.store.listMints().find((m) => m.nftContract.toLowerCase() === ctx.match[1].toLowerCase());
     if (!record?.slug) return ctx.answerCbQuery("Not sellable.", { show_alert: true });
     await ctx.answerCbQuery("Selling...");
 
-    const settings = store.getSettings();
+    const settings = ctx.store.getSettings();
     const { urls } = resolveRpcsForChain(record.chainKey);
     const logger = withPrefix("sell", createLogger(createTelegramSink(bot, ctx.chat!.id)));
 
     // Sell from a wallet that actually minted this collection.
-    const seller = store.listWallets().find((w) =>
+    const seller = ctx.store.listWallets().find((w) =>
       record.wallets.some((a) => a.toLowerCase() === w.address.toLowerCase())
     );
     if (!seller) return ctx.reply("❌ None of your current wallets hold this collection.");
 
     try {
-      const walletKey = store.getDecryptedKey(seller.address);
+      const walletKey = ctx.store.getDecryptedKey(seller.address);
       const result = await acceptOfferWithFallback(
         [
           () =>
@@ -889,8 +932,8 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
   });
 
   bot.action(/^pf:remove:(.+)$/, (ctx) => {
-    store.removeMint(ctx.match[1]);
-    const mints = store.listMints();
+    ctx.store.removeMint(ctx.match[1]);
+    const mints = ctx.store.listMints();
     if (mints.length === 0) return ctx.editMessageText("Portfolio is empty.", mainMenu());
     return ctx.editMessageText(`🖼 Portfolio — ${mints.length} collection(s)`, portfolioMenu(mints));
   });
@@ -899,7 +942,8 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
   // Collections are taken from what the wallets actually hold, not just what
   // this bot minted — so alerts cover NFTs acquired before or outside it.
   // Falls back to the mint store if the holdings lookup returns nothing.
-  async function resolveWatchedCollections(): Promise<{ slug: string; name: string }[]> {
+  async function resolveWatchedCollections(userId: number): Promise<{ slug: string; name: string }[]> {
+    const store = stores.for(userId);
     const settings = store.getSettings();
     const key = process.env.OPENSEA_API_KEY;
     const seen = new Map<string, { slug: string; name: string }>();
@@ -921,8 +965,9 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
   }
 
   async function startActivity(chatId: number): Promise<{ ok: true } | { ok: false; reason: string }> {
-    if (runningActivity) return { ok: true };
-    const collections = await resolveWatchedCollections();
+    const store = stores.for(chatId);
+    if (runningActivity.has(chatId)) return { ok: true };
+    const collections = await resolveWatchedCollections(chatId);
     if (collections.length === 0) {
       return { ok: false, reason: "No collections held by your wallets to watch yet." };
     }
@@ -940,33 +985,34 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
       logger,
       stopSignal,
     }).catch((err) => logger.errorBold(`Activity watcher crashed: ${err.message}`));
-    runningActivity = { stopSignal, promise };
+    runningActivity.set(chatId, { stopSignal, promise });
     store.updateSettings({ activityEnabled: true });
     return { ok: true };
   }
 
-  function stopActivity(): void {
-    if (!runningActivity) return;
-    runningActivity.stopSignal.stopped = true;
-    runningActivity = null;
-    store.updateSettings({ activityEnabled: false });
+  function stopActivity(userId: number): void {
+    const watcher = runningActivity.get(userId);
+    if (!watcher) return;
+    watcher.stopSignal.stopped = true;
+    runningActivity.delete(userId);
+    stores.for(userId).updateSettings({ activityEnabled: false });
   }
 
   bot.action("menu:activity", (ctx) => {
-    const tracked = store.listMints().filter((m) => m.slug).length;
+    const tracked = ctx.store.listMints().filter((m) => m.slug).length;
     return ctx.editMessageText(
       `🔔 Activity alerts: ${runningActivity ? "🟢 running" : "🔴 stopped"}
 ` +
         `Watching ${tracked} portfolio collection(s) for sweeps, floor moves and offers.
 ` +
         "Alerts arrive here automatically; nothing is ever bought or sold.",
-      activityMenu(runningActivity !== null, store.getSettings())
+      activityMenu(runningActivity !== null, ctx.store.getSettings())
     );
   });
 
   bot.action("activity:toggle", async (ctx) => {
-    if (runningActivity) {
-      stopActivity();
+    if (runningActivity.has(ctx.from!.id)) {
+      stopActivity(ctx.from!.id);
       await ctx.answerCbQuery("Stopping...");
     } else {
       const result = await startActivity(ctx.chat!.id);
@@ -975,7 +1021,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
     }
     return ctx.editMessageText(
       `🔔 Activity alerts: ${runningActivity ? "🟢 running" : "🔴 stopped"}`,
-      activityMenu(runningActivity !== null, store.getSettings())
+      activityMenu(runningActivity !== null, ctx.store.getSettings())
     );
   });
 
@@ -985,7 +1031,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
   //
   // Always reports the outcome. "Always on" that quietly failed to start
   // would be worse than being off, because it looks identical to working.
-  if (store.getSettings().activityEnabled) {
+  if (ownerStore.getSettings().activityEnabled) {
     void startActivity(ownerId)
       .then((result) => {
         const text = result.ok
@@ -1002,8 +1048,8 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
   }
 
   bot.action("menu:status", async (ctx) => {
-    const settings = store.getSettings();
-    const wallets = store.listWallets();
+    const settings = ctx.store.getSettings();
+    const wallets = ctx.store.listWallets();
     const chain = resolveChain(settings.chainKey);
     let balances = "";
     if (chain && wallets.length > 0) {
@@ -1024,10 +1070,10 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
     await ctx.editMessageText(
       `Chain: ${settings.chainKey}\n` +
         `Wallets: ${wallets.length}${balances}\n` +
-        `Auto mint: ${runningAuto.size > 0 ? `running on ${[...runningAuto.keys()].join(", ")}` : "stopped"}\n` +
-        `Copy mint: ${runningCopy ? "running" : "stopped"} (watching ${store.listCopyTargets().length})
+        `Auto mint: ${runningAutoFor(ctx.from!.id).size > 0 ? `running on ${[...runningAutoFor(ctx.from!.id).keys()].join(", ")}` : "stopped"}\n` +
+        `Copy mint: ${runningCopy ? "running" : "stopped"} (watching ${ctx.store.listCopyTargets().length})
 ` +
-        `Portfolio: ${store.listMints().length} collection(s)
+        `Portfolio: ${ctx.store.listMints().length} collection(s)
 ` +
         `Activity alerts: ${runningActivity ? "running" : "stopped"}`,
       mainMenu()
@@ -1070,12 +1116,12 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
 
   bot.action(/^wallet:remove:(.+)$/, (ctx) => {
     const address = ctx.match[1];
-    store.removeWallet(address);
-    return ctx.editMessageText("Wallets — tap one to manage it. [🎯 Auto] [👀 Copy]:", walletsMenu(store.listWallets()));
+    ctx.store.removeWallet(address);
+    return ctx.editMessageText("Wallets — tap one to manage it. [🎯 Auto] [👀 Copy]:", walletsMenu(ctx.store.listWallets()));
   });
 
   bot.action(/^wallet:manage:(.+)$/, (ctx) => {
-    const wallet = store.listWallets().find((w) => w.address.toLowerCase() === ctx.match[1].toLowerCase());
+    const wallet = ctx.store.listWallets().find((w) => w.address.toLowerCase() === ctx.match[1].toLowerCase());
     if (!wallet) return ctx.answerCbQuery("That wallet no longer exists.", { show_alert: true });
     return ctx.editMessageText(`${wallet.label} (${maskAddress(wallet.address)})`, walletDetailMenu(wallet));
   });
@@ -1084,10 +1130,10 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
     const feature = ctx.match[1] as "auto" | "copy";
     const address = ctx.match[2];
     try {
-      const wallet = store.listWallets().find((w) => w.address.toLowerCase() === address.toLowerCase());
+      const wallet = ctx.store.listWallets().find((w) => w.address.toLowerCase() === address.toLowerCase());
       if (!wallet) return ctx.answerCbQuery("That wallet no longer exists.", { show_alert: true });
       const currentlyOn = feature === "auto" ? wallet.includeInAutoMint !== false : wallet.includeInCopyMint !== false;
-      const updated = store.setWalletInclusion(address, feature, !currentlyOn);
+      const updated = ctx.store.setWalletInclusion(address, feature, !currentlyOn);
       return ctx.editMessageText(`${updated.label} (${maskAddress(updated.address)})`, walletDetailMenu(updated));
     } catch (err: any) {
       return ctx.answerCbQuery(err.message, { show_alert: true });
@@ -1104,15 +1150,16 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
 
   bot.action(/^copy:remove:(.+)$/, (ctx) => {
     const address = ctx.match[1];
-    store.removeCopyTarget(address);
-    return ctx.editMessageText("Copy-mint watchlist:", copyMenu(runningCopy !== null, store.listCopyTargets()));
+    ctx.store.removeCopyTarget(address);
+    return ctx.editMessageText("Copy-mint watchlist:", copyMenu(runningCopy !== null, ctx.store.listCopyTargets()));
   });
 
   // Pulled out of the toggle action so start-up can resume it too, without a
   // tap, whenever settings.copyMintEnabled says it was left running — same
   // pattern as Auto Mint's startAuto/stopAuto below.
   function startCopy(chatId: number): { ok: true } | { ok: false; reason: string } {
-    if (runningCopy) return { ok: true }; // already running
+    const store = stores.for(chatId);
+    if (runningCopy.has(chatId)) return { ok: true }; // already running
     const targets = store.listCopyTargets();
     const wallets = store.listWalletsFor("copy");
     if (targets.length === 0) return { ok: false, reason: "Add a wallet to watch first." };
@@ -1158,21 +1205,22 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
       logger,
       stopSignal,
     }).catch((err) => logger.errorBold(`Copy-mint watcher crashed: ${err.message}`));
-    runningCopy = { stopSignal, promise };
+    runningCopy.set(chatId, { stopSignal, promise });
     store.updateSettings({ copyMintEnabled: true });
     return { ok: true };
   }
 
-  function stopCopy(): void {
-    if (!runningCopy) return;
-    runningCopy.stopSignal.stopped = true;
-    runningCopy = null;
-    store.updateSettings({ copyMintEnabled: false });
+  function stopCopy(userId: number): void {
+    const watcher = runningCopy.get(userId);
+    if (!watcher) return;
+    watcher.stopSignal.stopped = true;
+    runningCopy.delete(userId);
+    stores.for(userId).updateSettings({ copyMintEnabled: false });
   }
 
   // ── Copy-mint history ────────────────────────────────────────────────
   bot.action("copy:history", (ctx) => {
-    const attempts = store.listCopyAttempts();
+    const attempts = ctx.store.listCopyAttempts();
     if (attempts.length === 0) {
       return ctx.answerCbQuery(
         "No copy-mint attempts recorded yet. History starts from the first attempt after this update.",
@@ -1185,7 +1233,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
     for (const a of attempts) {
       byWallet.set(a.sourceWallet, (byWallet.get(a.sourceWallet) ?? 0) + 1);
     }
-    const targets = store.listCopyTargets();
+    const targets = ctx.store.listCopyTargets();
     const wallets = [...byWallet.entries()]
       .map(([address, count]) => ({
         address,
@@ -1209,18 +1257,18 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
   });
 
   bot.action("copy:hist:clear", (ctx) => {
-    store.clearCopyHistory();
-    return ctx.editMessageText("📜 Copy-mint history cleared.", copyMenu(runningCopy !== null, store.listCopyTargets()));
+    ctx.store.clearCopyHistory();
+    return ctx.editMessageText("📜 Copy-mint history cleared.", copyMenu(runningCopy !== null, ctx.store.listCopyTargets()));
   });
 
   bot.action(/^copy:hist:(.+)$/, async (ctx) => {
     const address = resolveToken(ctx.session, ctx.match[1]);
     if (!address) return ctx.answerCbQuery("That menu expired — reopen Copy Mint.", { show_alert: true });
 
-    const attempts = store.listCopyAttempts(address);
+    const attempts = ctx.store.listCopyAttempts(address);
     if (attempts.length === 0) return ctx.answerCbQuery("Nothing recorded for that wallet.", { show_alert: true });
 
-    const target = store.listCopyTargets().find((t) => t.address.toLowerCase() === address.toLowerCase());
+    const target = ctx.store.listCopyTargets().find((t) => t.address.toLowerCase() === address.toLowerCase());
     const icon = { success: "✅", failed: "❌", skipped: "↷" } as const;
 
     const lines = attempts.slice(0, 25).map((a) => {
@@ -1263,8 +1311,8 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
   });
 
   bot.action("copy:toggle", async (ctx) => {
-    if (runningCopy) {
-      stopCopy();
+    if (runningCopy.has(ctx.from!.id)) {
+      stopCopy(ctx.from!.id);
       await ctx.answerCbQuery("Stopping...");
     } else {
       const result = startCopy(ctx.chat!.id);
@@ -1273,7 +1321,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
     }
     return ctx.editMessageText(
       `Copy-mint watcher: ${runningCopy ? "🟢 running" : "🔴 stopped"}`,
-      copyMenu(runningCopy !== null, store.listCopyTargets())
+      copyMenu(runningCopy !== null, ctx.store.listCopyTargets())
     );
   });
 
@@ -1281,16 +1329,16 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
   // reasoning as Auto Mint: a restart shouldn't silently turn this off
   // until someone notices and taps the button again. Never let this stop
   // the bot itself from starting.
-  if (store.getSettings().copyMintEnabled) {
+  if (ownerStore.getSettings().copyMintEnabled) {
     try {
       const result = startCopy(ownerId);
       if (result.ok) {
         bot.telegram.sendMessage(ownerId, "🟢 Copy-mint watcher resumed (was on before restart).").catch(() => {});
       } else {
-        store.updateSettings({ copyMintEnabled: false });
+        ownerStore.updateSettings({ copyMintEnabled: false });
       }
     } catch (err: any) {
-      store.updateSettings({ copyMintEnabled: false });
+      ownerStore.updateSettings({ copyMintEnabled: false });
       console.error(`Could not resume copy-mint on startup: ${err.message}`);
     }
   }
@@ -1303,6 +1351,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
   // same "one watcher per chain, prefixed logger" shape as the CLI's
   // comma-separated AUTO_CHAIN.
   function startAuto(chatId: number): { ok: true } | { ok: false; reason: string } {
+    const store = stores.for(chatId);
     const wallets = store.listWalletsFor("auto");
     if (wallets.length === 0) {
       return { ok: false, reason: "No wallets enabled for Auto Mint — enable at least one in Wallets." };
@@ -1312,7 +1361,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
     const chainKeys = settings.autoChainKeys?.length ? settings.autoChainKeys : [settings.chainKey];
 
     for (const key of chainKeys) {
-      if (runningAuto.has(key)) continue; // already running on this chain
+      if (runningAutoFor(chatId).has(key)) continue; // already running on this chain
       const chain = resolveChain(key);
       if (!chain) continue; // shouldn't happen — chosen from CHAINS via buttons
 
@@ -1335,21 +1384,21 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
         logger,
         stopSignal,
       }).catch((err) => logger.errorBold(`Auto-mint watcher crashed: ${err.message}`));
-      runningAuto.set(key, { stopSignal, promise });
+      runningAutoFor(chatId).set(key, { stopSignal, promise });
     }
     store.updateSettings({ autoEnabled: true });
     return { ok: true };
   }
 
-  function stopAuto(): void {
-    for (const watcher of runningAuto.values()) watcher.stopSignal.stopped = true;
-    runningAuto.clear();
-    store.updateSettings({ autoEnabled: false });
+  function stopAuto(userId: number): void {
+    for (const watcher of runningAutoFor(userId).values()) watcher.stopSignal.stopped = true;
+    runningAutoFor(userId).clear();
+    stores.for(userId).updateSettings({ autoEnabled: false });
   }
 
   bot.action("auto:toggle", async (ctx) => {
-    if (runningAuto.size > 0) {
-      stopAuto();
+    if (runningAutoFor(ctx.from!.id).size > 0) {
+      stopAuto(ctx.from!.id);
       await ctx.answerCbQuery("Stopping...");
     } else {
       const result = startAuto(ctx.chat!.id);
@@ -1357,8 +1406,8 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
       await ctx.answerCbQuery("Started.");
     }
     return ctx.editMessageText(
-      `Auto free-mint watcher: ${runningAuto.size > 0 ? `🟢 running on ${[...runningAuto.keys()].join(", ")}` : "🔴 stopped"}`,
-      autoMenu(runningAuto.size > 0)
+      `Auto free-mint watcher: ${runningAutoFor(ctx.from!.id).size > 0 ? `🟢 running on ${[...runningAutoFor(ctx.from!.id).keys()].join(", ")}` : "🔴 stopped"}`,
+      autoMenu(runningAutoFor(ctx.from!.id).size > 0)
     );
   });
 
@@ -1367,18 +1416,18 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
   // auto-mint off until someone notices and taps the button again. Never
   // let this stop the bot itself from starting — worst case, auto-mint
   // just stays off and the owner can turn it back on from the menu.
-  if (store.getSettings().autoEnabled) {
+  if (ownerStore.getSettings().autoEnabled) {
     try {
       const result = startAuto(ownerId);
       if (result.ok) {
         bot.telegram
-          .sendMessage(ownerId, `🟢 Auto free-mint watcher resumed on ${[...runningAuto.keys()].join(", ")} (was on before restart).`)
+          .sendMessage(ownerId, `🟢 Auto free-mint watcher resumed on ${[...runningAutoFor(ownerId).keys()].join(", ")} (was on before restart).`)
           .catch(() => {});
       } else {
-        store.updateSettings({ autoEnabled: false });
+        ownerStore.updateSettings({ autoEnabled: false });
       }
     } catch (err: any) {
-      store.updateSettings({ autoEnabled: false });
+      ownerStore.updateSettings({ autoEnabled: false });
       console.error(`Could not resume auto-mint on startup: ${err.message}`);
     }
   }
@@ -1388,7 +1437,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
     const source = ctx.match[1];
     ctx.session.fundSource = source;
     ctx.session.fundTargets = [];
-    const candidates = store.listWallets().filter((w) => w.address.toLowerCase() !== source.toLowerCase());
+    const candidates = ctx.store.listWallets().filter((w) => w.address.toLowerCase() !== source.toLowerCase());
     return ctx.editMessageText("Send TO which wallet(s)? Tap to select, then Done.", fundTargetsMenu(candidates, new Set()));
   });
 
@@ -1399,7 +1448,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
     else targets.add(address);
     ctx.session.fundTargets = [...targets];
 
-    const candidates = store
+    const candidates = ctx.store
       .listWallets()
       .filter((w) => w.address.toLowerCase() !== (ctx.session.fundSource ?? "").toLowerCase());
     return ctx.editMessageText("Send TO which wallet(s)? Tap to select, then Done.", fundTargetsMenu(candidates, targets));
@@ -1409,7 +1458,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
     if (!ctx.session.fundTargets || ctx.session.fundTargets.length === 0) {
       return ctx.answerCbQuery("Select at least one wallet.", { show_alert: true });
     }
-    const settings = store.getSettings();
+    const settings = ctx.store.getSettings();
     const chain = resolveChain(settings.chainKey)!;
     ctx.session.step = "awaiting_fund_amount";
     return ctx.reply(`How much ${chain.nativeSymbol} to send to EACH of the ${ctx.session.fundTargets.length} selected wallet(s)?`);
@@ -1435,13 +1484,13 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
     await ctx.answerCbQuery("Sending...");
     await ctx.editMessageText("Sending — status below.");
 
-    const settings = store.getSettings();
+    const settings = ctx.store.getSettings();
     const { urls } = resolveRpcsForChain(settings.chainKey);
     const logger = createLogger(createTelegramSink(bot, ctx.chat!.id));
     try {
       await batchTransfer({
         rpcUrl: urls[0],
-        sourceKey: store.getDecryptedKey(fundSource),
+        sourceKey: ctx.store.getDecryptedKey(fundSource),
         targets: fundTargets,
         amountWei: BigInt(fundAmountWei),
         maxFeePerGas: gweiToWei(settings.maxFeeGwei),
@@ -1456,22 +1505,22 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
   // ── Settings ─────────────────────────────────────────────────────────
   bot.action("setting:chain", (ctx) => ctx.editMessageText("Pick a chain:", chainPickerMenu()));
   bot.action(/^setting:chain:(.+)$/, (ctx) => {
-    store.updateSettings({ chainKey: ctx.match[1] });
-    return ctx.editMessageText("Settings:", settingsMenu(store.getSettings()));
+    ctx.store.updateSettings({ chainKey: ctx.match[1] });
+    return ctx.editMessageText("Settings:", settingsMenu(ctx.store.getSettings()));
   });
 
   bot.action("setting:autoChains", (ctx) =>
     ctx.editMessageText(
       "Which chain(s) should Auto Mint watch? Select none to just use the default Chain above.",
-      autoChainsMenu(new Set(store.getSettings().autoChainKeys ?? []))
+      autoChainsMenu(new Set(ctx.store.getSettings().autoChainKeys ?? []))
     )
   );
   bot.action(/^setting:autoChains:toggle:(.+)$/, (ctx) => {
     const key = ctx.match[1];
-    const selected = new Set(store.getSettings().autoChainKeys ?? []);
+    const selected = new Set(ctx.store.getSettings().autoChainKeys ?? []);
     if (selected.has(key)) selected.delete(key);
     else selected.add(key);
-    store.updateSettings({ autoChainKeys: selected.size > 0 ? [...selected] : undefined });
+    ctx.store.updateSettings({ autoChainKeys: selected.size > 0 ? [...selected] : undefined });
     return ctx.editMessageText(
       "Which chain(s) should Auto Mint watch? Select none to just use the default Chain above.",
       autoChainsMenu(selected)
@@ -1521,8 +1570,8 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
       return ctx.reply("Usage: /mint <contract address, OpenSea link, or slug> <quantity> [wallet label(s)] [--dry]");
     }
 
-    const allWallets = store.listWallets();
-    const settings = store.getSettings();
+    const allWallets = ctx.store.listWallets();
+    const settings = ctx.store.getSettings();
     if (allWallets.length === 0) return ctx.reply("Add a wallet first.");
 
     let wallets: WalletRecord[];
@@ -1569,7 +1618,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
       const outcome = await localPublicSnipe({
         nftContract: contract,
         quantity,
-        walletKeys: wallets.map((w) => store.getDecryptedKey(w.address)),
+        walletKeys: wallets.map((w) => ctx.store.getDecryptedKey(w.address)),
         rpcUrls: urls,
         maxFeePerGas: gweiToWei(settings.maxFeeGwei),
         maxPriorityFee: gweiToWei(settings.priorityGwei),
@@ -1578,7 +1627,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
         plan,
         logger,
       });
-      await recordOutcome(store, settings.chainKey, outcome, {
+      await recordOutcome(ctx.store, settings.chainKey, outcome, {
         bot,
         chatId: ctx.chat!.id,
         source: "Manual Mint",
@@ -1600,7 +1649,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
   }
 
   bot.action("menu:sched", (ctx) => {
-    const wallets = store.listWallets();
+    const wallets = ctx.store.listWallets();
     if (wallets.length === 0) return ctx.answerCbQuery("Add a wallet first.", { show_alert: true });
     resetSchedSession(ctx);
     ctx.session.step = "awaiting_sched_link";
@@ -1613,7 +1662,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
     if (selected.has(address)) selected.delete(address);
     else selected.add(address);
     ctx.session.schedWallets = [...selected];
-    return ctx.editMessageText("Mint FROM which wallet(s)? Tap to select, then Done.", schedWalletsMenu(store.listWallets(), selected));
+    return ctx.editMessageText("Mint FROM which wallet(s)? Tap to select, then Done.", schedWalletsMenu(ctx.store.listWallets(), selected));
   });
 
   bot.action("sched:wallets:done", (ctx) => {
@@ -1642,7 +1691,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
       targetStart ? `Scheduled for ${toIST(targetStart)} IST — status below when it fires.` : "Firing — status below."
     );
 
-    const settings = store.getSettings();
+    const settings = ctx.store.getSettings();
     const { urls } = resolveRpcsForChain(settings.chainKey);
     const logger = createLogger(createTelegramSink(bot, ctx.chat!.id));
     try {
@@ -1659,7 +1708,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
       const outcome = await localPublicSnipe({
         nftContract: schedContract,
         quantity: schedQuantity,
-        walletKeys: schedWallets.map((addr) => store.getDecryptedKey(addr)),
+        walletKeys: schedWallets.map((addr) => ctx.store.getDecryptedKey(addr)),
         rpcUrls: urls,
         maxFeePerGas: gweiToWei(settings.maxFeeGwei),
         maxPriorityFee: gweiToWei(settings.priorityGwei),
@@ -1668,7 +1717,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
         plan,
         logger,
       });
-      await recordOutcome(store, settings.chainKey, outcome, {
+      await recordOutcome(ctx.store, settings.chainKey, outcome, {
         bot,
         chatId: ctx.chat!.id,
         source: "Scheduled Mint",
@@ -1727,14 +1776,14 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
       return ctx.answerCbQuery("That request expired — start over from Scheduled Mint.", { show_alert: true });
     }
     await ctx.answerCbQuery("Checking...");
-    const settings = store.getSettings();
+    const settings = ctx.store.getSettings();
     const chain = resolveChain(settings.chainKey)!;
     const { urls } = resolveRpcsForChain(settings.chainKey);
     try {
       const plan = await buildLocalMintPlan(urls[0], schedContract, schedQuantity);
       if (!plan) return ctx.reply("🧪 DRY RUN: drop is not currently resolvable on-chain — a real fire would fail.");
 
-      const wallets = store.listWallets().filter((w) => schedWallets.includes(w.address.toLowerCase()));
+      const wallets = ctx.store.listWallets().filter((w) => schedWallets.includes(w.address.toLowerCase()));
       const perWallet = await previewMint(
         urls[0],
         chain.nativeSymbol,
@@ -1764,7 +1813,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
       await ctx.deleteMessage(ctx.message.message_id).catch(() => {});
       ctx.session.step = undefined;
       try {
-        const record = store.addWallet("", key);
+        const record = ctx.store.addWallet("", key);
         await ctx.reply(`✅ Added ${maskAddress(record.address)} (label: ${record.label}).`, mainMenu());
       } catch (err: any) {
         await ctx.reply(`❌ ${err.message}`);
@@ -1785,7 +1834,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
       let dupes = 0;
       for (const w of derived) {
         try {
-          store.addWallet(`seed-${w.index}`, w.privateKey);
+          ctx.store.addWallet(`seed-${w.index}`, w.privateKey);
           added.push(w.address);
         } catch {
           dupes++; // deriving is deterministic, so re-importing hits this
@@ -1828,7 +1877,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
       let dupes = 0;
       for (const w of deriveWallets(phrase, count)) {
         try {
-          store.addWallet(`seed-${w.index}`, w.privateKey);
+          ctx.store.addWallet(`seed-${w.index}`, w.privateKey);
           added.push(w.address);
         } catch {
           dupes++;
@@ -1847,7 +1896,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
       const [address, ...labelParts] = ctx.message.text.trim().split(/\s+/);
       if (!isAddress(address)) return ctx.reply("That doesn't look like a valid address.");
       try {
-        const target = store.addCopyTarget(labelParts.join(" "), address);
+        const target = ctx.store.addCopyTarget(labelParts.join(" "), address);
         await ctx.reply(`✅ Watching ${target.label} (${maskAddress(target.address)}).`);
       } catch (err: any) {
         await ctx.reply(`❌ ${err.message}`);
@@ -1858,7 +1907,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
     if (step === "awaiting_sched_link") {
       ctx.session.step = undefined;
       const link = ctx.message.text.trim();
-      const settings = store.getSettings();
+      const settings = ctx.store.getSettings();
       try {
         const contract = await resolveMintTarget(link, settings.chainKey);
         const { urls } = resolveRpcsForChain(settings.chainKey);
@@ -1876,7 +1925,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
             `Max per wallet: ${preview.drop.maxTotalMintableByWallet || "unspecified"}\n` +
             `Stage: ${live ? "already live" : `opens ${toIST(new Date(preview.drop.startTime * 1000))} IST`}`
         );
-        await ctx.reply("Mint FROM which wallet(s)? Tap to select, then Done.", schedWalletsMenu(store.listWallets(), new Set()));
+        await ctx.reply("Mint FROM which wallet(s)? Tap to select, then Done.", schedWalletsMenu(ctx.store.listWallets(), new Set()));
       } catch (err: any) {
         await ctx.reply(`❌ ${err.message}`);
       }
@@ -1963,10 +2012,10 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
       }
       ctx.session.fundAmountWei = amountWei.toString();
 
-      const settings = store.getSettings();
+      const settings = ctx.store.getSettings();
       const chain = resolveChain(settings.chainKey)!;
       const worstCase = estimateBatchCost(targets.length, amountWei, gweiToWei(settings.maxFeeGwei));
-      const sourceLabel = store.listWallets().find((w) => w.address.toLowerCase() === source.toLowerCase())?.label ?? source;
+      const sourceLabel = ctx.store.listWallets().find((w) => w.address.toLowerCase() === source.toLowerCase())?.label ?? source;
       return ctx.reply(
         `Send ${formatEther(amountWei)} ${chain.nativeSymbol} from ${sourceLabel} to ${targets.length} wallet(s)?\n` +
           `Worst-case total (including gas): ${formatEther(worstCase)} ${chain.nativeSymbol}`,
@@ -1980,7 +2029,7 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
       const raw = ctx.message.text.trim();
 
       if (CLEARABLE.has(field) && raw.toLowerCase() === "clear") {
-        store.updateSettings({ [field]: undefined } as any);
+        ctx.store.updateSettings({ [field]: undefined } as any);
         return ctx.reply(
           field === "autoMaxQuantity"
             ? "Cleared — auto mint will use each drop's true max per wallet."
@@ -1992,17 +2041,17 @@ export function createBot({ token, ownerId, store }: BotDeps): Telegraf<BotConte
       // which is stored as 0. A fixed limit both over-reserves for a small
       // mint and runs out of gas on a large one.
       if (field === "gasLimit" && raw.toLowerCase() === "auto") {
-        store.updateSettings({ gasLimit: 0 });
+        ctx.store.updateSettings({ gasLimit: 0 });
         return ctx.reply(
           "✅ Gas limit is now sized automatically from the quantity being minted.",
-          settingsMenu(store.getSettings())
+          settingsMenu(ctx.store.getSettings())
         );
       }
 
       const value = Number(raw);
       if (!Number.isFinite(value) || value < 0) return ctx.reply("That's not a valid number.");
-      store.updateSettings({ [field]: value } as any);
-      return ctx.reply(`✅ ${field} set to ${value}.`, settingsMenu(store.getSettings()));
+      ctx.store.updateSettings({ [field]: value } as any);
+      return ctx.reply(`✅ ${field} set to ${value}.`, settingsMenu(ctx.store.getSettings()));
     }
   });
 

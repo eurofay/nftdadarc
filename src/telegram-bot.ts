@@ -6,7 +6,7 @@ import dotenv from "dotenv";
 dotenv.config({ path: path.resolve(process.cwd(), ".env") });
 
 import { createBot } from "./telegram/bot";
-import { TelegramStore } from "./telegram/store";
+import { UserStores } from "./telegram/user-stores";
 
 function required(name: string): string {
   const v = process.env[name];
@@ -27,9 +27,17 @@ async function main(): Promise<void> {
   const encryptionKey = required("WALLET_ENCRYPTION_KEY");
 
   const dataDir = process.env.DATA_DIR || path.join(process.cwd(), "data");
-  const store = new TelegramStore(path.join(dataDir, "telegram-store.json"), encryptionKey);
+  const stores = new UserStores(dataDir, encryptionKey);
 
-  const bot = createBot({ token, ownerId, store });
+  // One-time move of the pre-multi-user store to its owner. Refuses to
+  // overwrite an existing per-user store, so running this twice is safe.
+  const legacy = path.join(dataDir, "telegram-store.json");
+  if (stores.migrateLegacy(legacy, ownerId)) {
+    console.log(`Migrated ${legacy} to the per-user store for owner ${ownerId}.`);
+    console.log("The original file was left in place; delete it once you've confirmed everything is there.");
+  }
+
+  const bot = createBot({ token, ownerId, stores });
 
   process.once("SIGINT", () => bot.stop("SIGINT"));
   process.once("SIGTERM", () => bot.stop("SIGTERM"));
@@ -41,7 +49,10 @@ async function main(): Promise<void> {
   // is what the catch below is for.
   bot
     .launch(() => {
-      console.log(`Telegram bot running. Only replies to owner id ${ownerId} in a private chat.`);
+      console.log(
+        `Telegram bot running. Owner: ${ownerId}. ` +
+          `Other users get their own isolated wallets and settings.`
+      );
     })
     .catch((err: any) => {
       console.error(`Failed to start: ${err.description || err.message}`);
