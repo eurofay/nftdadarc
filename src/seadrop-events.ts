@@ -105,12 +105,26 @@ export async function scanPublicDropUpdates(
 // It also keys off the mint *event* rather than a mintPublic *call*, so it
 // only reports mints that actually succeeded, and it catches allowlist mints
 // too — a watched wallet getting in early is exactly the signal worth copying.
+export interface ScanOpts {
+  /** Pause between chunk requests, so a long scan doesn't trip a rate limit. */
+  chunkDelayMs?: number;
+  /** Attempts per chunk before the scan gives up. */
+  retriesPerChunk?: number;
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// Ethers caches an identical JSON-RPC request for ~250ms. Any retry must
+// outlast that window or it never reaches the node.
+export const RETRY_FLOOR_MS = 300;
+
 export async function scanSeaDropMints(
   rpcUrl: string,
   fromBlock: number,
   toBlock: number,
   minters: string[],
-  chunkBlocks: number = DEFAULT_CHUNK_BLOCKS
+  chunkBlocks: number = DEFAULT_CHUNK_BLOCKS,
+  opts: ScanOpts = {}
 ): Promise<MintSighting[]> {
   if (fromBlock > toBlock || minters.length === 0) return [];
   const provider = createProvider(rpcUrl);
@@ -119,14 +133,40 @@ export async function scanSeaDropMints(
   // An array in a topic slot is an OR filter — one call covers every wallet.
   const minterTopics = minters.map((m) => zeroPadValue(getAddress(m), 32));
 
+  // Public nodes rate-limit sustained eth_getLogs. Measured on Robinhood with
+  // 19 watched wallets: 5 back-to-back calls succeed, 15 do not. A long
+  // backfill is dozens of calls, so it needs both a pause between them and a
+  // retry per chunk — without the retry, one throttled call threw away every
+  // chunk already fetched.
+  const delayMs = opts.chunkDelayMs ?? 120;
+  const attempts = Math.max(1, opts.retriesPerChunk ?? 3);
+  let first = true;
+
   for (let start = fromBlock; start <= toBlock; start += chunkBlocks) {
     const end = Math.min(start + chunkBlocks - 1, toBlock);
-    const logs = await provider.getLogs({
-      address: SEADROP_ADDRESS,
-      topics: [MINT_TOPIC, null, minterTopics],
-      fromBlock: start,
-      toBlock: end,
-    });
+
+    if (!first && delayMs > 0) await sleep(delayMs);
+    first = false;
+
+    let logs;
+    for (let attempt = 1; ; attempt++) {
+      try {
+        logs = await provider.getLogs({
+          address: SEADROP_ADDRESS,
+          topics: [MINT_TOPIC, null, minterTopics],
+          fromBlock: start,
+          toBlock: end,
+        });
+        break;
+      } catch (err) {
+        if (attempt >= attempts) throw err;
+        // Must clear ethers' request cache, which dedupes identical calls for
+        // ~250ms and hands back the SAME failure without touching the network.
+        // A retry inside that window is not a retry at all — it silently
+        // returns the cached error, and the scan dies as if nothing was tried.
+        await sleep(Math.max(RETRY_FLOOR_MS, delayMs * 4 * attempt));
+      }
+    }
 
     for (const log of logs) {
       const parsed = IFACE.parseLog({ topics: [...log.topics], data: log.data });

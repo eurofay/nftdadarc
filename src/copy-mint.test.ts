@@ -1,6 +1,7 @@
 import { describe, it, expect, afterEach } from "vitest";
 import { Interface, Wallet, getAddress, zeroPadValue } from "ethers";
 import { scanWatchedMints } from "./copy-mint";
+import { scanSeaDropMints } from "./seadrop-events";
 import { SEADROP_ADDRESS } from "./seadrop-public";
 import { clearProviderCache } from "./rpc-provider";
 import { startMockRpc, MockRpc } from "./test-support/mock-rpc";
@@ -140,5 +141,51 @@ describe("scanWatchedMints (against a real mock RPC node)", () => {
     expect(await scanWatchedMints(mock.url, 100, 1, [WATCHED])).toEqual([]);
     expect(await scanWatchedMints(mock.url, 1, 100, [])).toEqual([]);
     expect(mock.calls).toHaveLength(0);
+  });
+});
+
+// Measured on Robinhood's public node with 19 watched wallets: 5 back-to-back
+// eth_getLogs succeed, 15 do not. A 12-hour backfill is 44 calls, and before
+// the retry below one throttled call threw away every chunk already fetched —
+// the full scan failed every single time it was attempted.
+describe("scanSeaDropMints resilience to a throttling node", () => {
+  it("retries a throttled chunk instead of losing the whole scan", async () => {
+    let calls = 0;
+    const log = mintLog(NFT, WATCHED, 105);
+    mock = await startMockRpc({
+      eth_chainId: () => "0x2105",
+      eth_getLogs: (params) => {
+        calls++;
+        // Fail the first attempt the way a rate-limited node does.
+        if (calls === 1) throw new Error("log query timed out");
+        return serveLogs([log])(params);
+      },
+    });
+
+    // chunkDelayMs is deliberately tiny; the retry must still outlast ethers'
+    // ~250ms request cache on its own, or it would replay a cached failure.
+    const found = await scanSeaDropMints(mock.url, 100, 110, [WATCHED], 50, {
+      chunkDelayMs: 1,
+      retriesPerChunk: 3,
+    });
+
+    expect(calls).toBeGreaterThan(1); // it really did retry
+    expect(found.map((f) => f.nftContract)).toContain(NFT);
+  });
+
+  it("gives up once the retries are spent, rather than looping forever", async () => {
+    let calls = 0;
+    mock = await startMockRpc({
+      eth_chainId: () => "0x2105",
+      eth_getLogs: () => {
+        calls++;
+        throw new Error("log query timed out");
+      },
+    });
+
+    await expect(
+      scanSeaDropMints(mock.url, 100, 110, [WATCHED], 50, { chunkDelayMs: 1, retriesPerChunk: 2 })
+    ).rejects.toThrow();
+    expect(calls).toBe(2);
   });
 });
