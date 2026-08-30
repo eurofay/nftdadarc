@@ -15,6 +15,7 @@
 // mints — so maxPriceEth is the one guardrail against blindly following it
 // into an expensive mint.
 
+import { Wallet, formatEther } from "ethers";
 import { buildLocalMintPlan } from "./seadrop-public";
 import { scanSeaDropMints } from "./seadrop-events";
 import { localPublicSnipe, SnipeOutcome } from "./local-mint";
@@ -252,11 +253,43 @@ export async function runCopyMintWatcher(opts: CopyMintOpts): Promise<void> {
           continue;
         }
 
+        // A node reserves gasLimit x maxFeePerGas upfront, regardless of what
+        // the transaction actually ends up paying. A wallet below that can't
+        // send at all — and with the backfill above surfacing many drops at
+        // once, an unfunded wallet would otherwise produce one "insufficient
+        // funds" failure per collection. Checked once per copy, not per
+        // collection, so the cost is one balance read.
+        const required = BigInt(gasLimit) * maxFeePerGas + plan.value;
+        const affordable: string[] = [];
+        for (const key of walletKeys) {
+          const address = new Wallet(key).address;
+          let balance = 0n;
+          try {
+            balance = await provider.getBalance(address);
+          } catch {
+            // A balance we can't read is not evidence of an empty wallet;
+            // let the mint proceed and fail honestly if it must.
+            affordable.push(key);
+            continue;
+          }
+          if (balance >= required) affordable.push(key);
+          else
+            log.warn(
+              `     ⚠ ${address.slice(0, 10)}… holds ${formatEther(balance)} ETH, needs ${formatEther(required)} to send — skipping it.`
+            );
+        }
+        if (affordable.length === 0) {
+          const reason = `no wallet can cover ${formatEther(required)} ETH (gas ${gasLimit} x ${formatEther(maxFeePerGas)} + mint price)`;
+          log.error(`     ✗ Skipped — ${reason}.`);
+          await report({ sourceWallet: sighting.from, sourceTxHash: sighting.txHash, nftContract: sighting.nftContract, quantity, outcome: "skipped", reason, txHashes: [] });
+          continue;
+        }
+
         try {
           const outcome = await localPublicSnipe({
             nftContract: sighting.nftContract,
             quantity,
-            walletKeys,
+            walletKeys: affordable,
             rpcUrls,
             maxFeePerGas,
             maxPriorityFee,
