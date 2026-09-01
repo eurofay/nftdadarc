@@ -159,7 +159,9 @@ const DEFAULT_SETTINGS: BotSettings = {
   priorityGwei: 0.05,
   gasLimit: 250_000,
   autoEnabled: false,
-  copyMintEnabled: false,
+  // On by default: the whole point of the bot is that it copies without being
+  // asked each time. Turning it off is a deliberate act and is remembered.
+  copyMintEnabled: true,
   copyMintMaxPriceEth: 0,
   copyBackfillHours: 12,
   activityEnabled: true,

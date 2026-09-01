@@ -431,6 +431,29 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
     return next();
   });
 
+  // Telegram rejects an edit whose text AND markup are byte-identical to what
+  // is already on screen, with "message is not modified". That is a normal
+  // thing to do — tapping Back to a menu already shown, or a toggle that
+  // re-renders the same state — and it surfaced to the user as a scary
+  // "That action failed" from bot.catch. Swallow exactly that one error and
+  // let every other edit failure through.
+  bot.use((ctx, next) => {
+    const original = ctx.editMessageText.bind(ctx);
+    ctx.editMessageText = (async (...args: Parameters<typeof original>) => {
+      try {
+        return await original(...args);
+      } catch (err: any) {
+        if (String(err?.description ?? err?.message ?? "").includes("message is not modified")) {
+          // Nothing changed, so there is nothing to report — the screen
+          // already shows what the user asked for.
+          return true as any;
+        }
+        throw err;
+      }
+    }) as typeof ctx.editMessageText;
+    return next();
+  });
+
   // ── Access control and store binding ──────────────────────────────────
   // Private chats only, and every update is bound to the sender's OWN store
   // before any handler runs. Handlers reach data exclusively through
@@ -533,10 +556,10 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
 
   bot.action("menu:copy", (ctx) =>
     ctx.editMessageText(
-      `Copy-mint watcher: ${runningCopy ? "🟢 running" : "🔴 stopped"}\n` +
+      `Copy-mint watcher: ${runningCopy.has(ctx.from!.id) ? "🟢 running" : "🔴 stopped"}\n` +
         `Wallets enabled: ${ctx.store.listWalletsFor("copy").length}/${ctx.store.listWallets().length} (toggle per wallet in Wallets)\n` +
         "Copies any mintPublic call from a watched wallet, using your own wallets.",
-      copyMenu(runningCopy !== null, ctx.store.listCopyTargets())
+      copyMenu(runningCopy.has(ctx.from!.id), ctx.store.listCopyTargets())
     )
   );
 
@@ -1085,12 +1108,12 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
   bot.action("menu:activity", (ctx) => {
     const tracked = ctx.store.listMints().filter((m) => m.slug).length;
     return ctx.editMessageText(
-      `🔔 Activity alerts: ${runningActivity ? "🟢 running" : "🔴 stopped"}
+      `🔔 Activity alerts: ${runningActivity.has(ctx.from!.id) ? "🟢 running" : "🔴 stopped"}
 ` +
         `Watching ${tracked} portfolio collection(s) for sweeps, floor moves and offers.
 ` +
         "Alerts arrive here automatically; nothing is ever bought or sold.",
-      activityMenu(runningActivity !== null, ctx.store.getSettings())
+      activityMenu(runningActivity.has(ctx.from!.id), ctx.store.getSettings())
     );
   });
 
@@ -1104,8 +1127,8 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
       await ctx.answerCbQuery("Started.");
     }
     return ctx.editMessageText(
-      `🔔 Activity alerts: ${runningActivity ? "🟢 running" : "🔴 stopped"}`,
-      activityMenu(runningActivity !== null, ctx.store.getSettings())
+      `🔔 Activity alerts: ${runningActivity.has(ctx.from!.id) ? "🟢 running" : "🔴 stopped"}`,
+      activityMenu(runningActivity.has(ctx.from!.id), ctx.store.getSettings())
     );
   });
 
@@ -1119,7 +1142,7 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
     void startActivity(ownerId)
       .then((result) => {
         const text = result.ok
-          ? `🔔 Activity alerts running — watching ${runningActivity ? "your holdings" : "nothing"} for sweeps, floor moves and offers.`
+          ? "🔔 Activity alerts running — watching your holdings for sweeps, floor moves and offers."
           : `🔕 Activity alerts are ON but could not start: ${result.reason}\nThey'll start once that's resolved, or use the menu.`;
         return bot.telegram.sendMessage(ownerId, text);
       })
@@ -1155,11 +1178,11 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
       `Chain: ${settings.chainKey}\n` +
         `Wallets: ${wallets.length}${balances}\n` +
         `Auto mint: ${runningAutoFor(ctx.from!.id).size > 0 ? `running on ${[...runningAutoFor(ctx.from!.id).keys()].join(", ")}` : "stopped"}\n` +
-        `Copy mint: ${runningCopy ? "running" : "stopped"} (watching ${ctx.store.listCopyTargets().length})
+        `Copy mint: ${runningCopy.has(ctx.from!.id) ? "running" : "stopped"} (watching ${ctx.store.listCopyTargets().length})
 ` +
         `Portfolio: ${ctx.store.listMints().length} collection(s)
 ` +
-        `Activity alerts: ${runningActivity ? "running" : "stopped"}`,
+        `Activity alerts: ${runningActivity.has(ctx.from!.id) ? "running" : "stopped"}`,
       menuFor(ctx)
     );
   });
@@ -1338,7 +1361,7 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
   bot.action(/^copy:remove:(.+)$/, (ctx) => {
     const address = ctx.match[1];
     ctx.store.removeCopyTarget(address);
-    return ctx.editMessageText("Copy-mint watchlist:", copyMenu(runningCopy !== null, ctx.store.listCopyTargets()));
+    return ctx.editMessageText("Copy-mint watchlist:", copyMenu(runningCopy.has(ctx.from!.id), ctx.store.listCopyTargets()));
   });
 
   // Pulled out of the toggle action so start-up can resume it too, without a
@@ -1445,7 +1468,7 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
 
   bot.action("copy:hist:clear", (ctx) => {
     ctx.store.clearCopyHistory();
-    return ctx.editMessageText("📜 Copy-mint history cleared.", copyMenu(runningCopy !== null, ctx.store.listCopyTargets()));
+    return ctx.editMessageText("📜 Copy-mint history cleared.", copyMenu(runningCopy.has(ctx.from!.id), ctx.store.listCopyTargets()));
   });
 
   bot.action(/^copy:hist:(.+)$/, async (ctx) => {
@@ -1507,8 +1530,8 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
       await ctx.answerCbQuery("Started.");
     }
     return ctx.editMessageText(
-      `Copy-mint watcher: ${runningCopy ? "🟢 running" : "🔴 stopped"}`,
-      copyMenu(runningCopy !== null, ctx.store.listCopyTargets())
+      `Copy-mint watcher: ${runningCopy.has(ctx.from!.id) ? "🟢 running" : "🔴 stopped"}`,
+      copyMenu(runningCopy.has(ctx.from!.id), ctx.store.listCopyTargets())
     );
   });
 
@@ -1532,17 +1555,27 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
   // reasoning as Auto Mint: a restart shouldn't silently turn this off
   // until someone notices and taps the button again. Never let this stop
   // the bot itself from starting.
-  if (ownerStore.getSettings().copyMintEnabled) {
+  // Resume for EVERY user who left it on, not just the owner. Their watcher
+  // used to stay dead until they noticed and tapped the button again, which
+  // for a "runs while you sleep" feature is the same as being broken.
+  for (const userId of stores.listUserIds()) {
+    if (!stores.for(userId).getSettings().copyMintEnabled) continue;
     try {
-      const result = startCopy(ownerId);
+      const result = startCopy(userId);
       if (result.ok) {
-        bot.telegram.sendMessage(ownerId, "🟢 Copy-mint watcher resumed (was on before restart).").catch(() => {});
+        bot.telegram.sendMessage(userId, "🟢 Copy-mint watcher resumed (was on before restart).").catch(() => {});
       } else {
-        ownerStore.updateSettings({ copyMintEnabled: false });
+        // Couldn't start — usually no wallets or no watched wallets yet. Leave
+        // the setting ON so it starts by itself once that's fixed, rather than
+        // silently turning itself off.
+        if (userId === ownerId) {
+          bot.telegram
+            .sendMessage(userId, `🔕 Copy mint is ON but could not start: ${result.reason}`)
+            .catch(() => {});
+        }
       }
     } catch (err: any) {
-      ownerStore.updateSettings({ copyMintEnabled: false });
-      console.error(`Could not resume copy-mint on startup: ${err.message}`);
+      console.error(`Copy mint could not resume for ${userId}: ${err?.message ?? err}`);
     }
   }
 

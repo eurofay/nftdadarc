@@ -267,8 +267,20 @@ describe("TelegramStore settings", () => {
     const store = freshStore();
     const s = store.getSettings();
     expect(s.chainKey).toBe("base");
+    // Auto mint fires on ANY free drop, so it stays opt-in. Copy mint only
+    // acts on wallets the user chose to follow, and the point of the bot is
+    // that it copies without being asked each time — so it starts on.
     expect(s.autoEnabled).toBe(false);
-    expect(s.copyMintEnabled).toBe(false);
+    expect(s.copyMintEnabled).toBe(true);
+  });
+
+  it("remembers a deliberate turn-off across a restart", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "copyoff-"));
+    const file = path.join(dir, "s.json");
+    new TelegramStore(file, "pass").updateSettings({ copyMintEnabled: false });
+    // "On by default" must not mean "back on every restart" — that would
+    // override the one thing the user explicitly asked for.
+    expect(new TelegramStore(file, "pass").getSettings().copyMintEnabled).toBe(false);
   });
 
   it("merges a partial update without clobbering other fields", () => {
