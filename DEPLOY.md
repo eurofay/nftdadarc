@@ -36,6 +36,7 @@ in the dashboard, which is the step below.
    | `RPC_URL_ROBINHOOD` | public endpoint first, then a fallback |
    | `RPC_URL_ETHEREUM` | optional |
    | `OPENSEA_API_KEY` | optional; only for names, art and floors |
+   | `ANTHROPIC_API_KEY` | optional; enables 🛠 Admin -> Ask the assistant |
    | `DATA_DIR` | leave unset — the image sets `/data` |
 
    Do **not** set `AUTO_WALLET_KEYS` in the cloud. It's for the local CLI's
@@ -101,6 +102,23 @@ untouched; a fresh invite gives them everything back.
 
 You are never gated by your own door — the owner id skips the invite check, so
 there is no way to lock yourself away from the wallets.
+
+## The admin panel
+
+The owner sees a 🛠 Admin row on the main menu that nobody else does: issue an
+invite, list invites, revoke one person, revoke everyone, and ask the
+assistant. Everything there is also a command (`/invite`, `/invites`,
+`/revoke`, `/revokeall`, `/users`, `/ask`).
+
+**Ask the assistant** answers questions against the bot's live state - wallet
+balances, whether the watcher is actually running, recent copy attempts and
+why each was skipped. It needs `ANTHROPIC_API_KEY` set, and it costs per
+question at normal API rates.
+
+It is read-only by design: it is handed a snapshot and returns prose. It
+cannot move funds, change a setting, or touch a wallet. An assistant with
+authority over money is a much larger thing to get right than one that
+explains what it sees, and the explaining is the useful part.
 
 ## Cost
 

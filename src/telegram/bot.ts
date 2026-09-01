@@ -12,9 +12,13 @@ import { generateMnemonic, deriveWallets, isValidMnemonic } from "../hd-wallet";
 import { createProvider } from "../rpc-provider";
 import { TelegramStore, WalletRecord } from "./store";
 import { UserStores } from "./user-stores";
+import { ask, BotSnapshot } from "./agent";
 import { AccessControl } from "./access-control";
 import {
   mainMenu,
+  adminMenu,
+  adminRevokeConfirmMenu,
+  adminInvitesMenu,
   walletsMenu,
   walletDetailMenu,
   copyMenu,
@@ -68,13 +72,14 @@ import { renderMintCardPng } from "../mint-card-render";
 import { acceptOfferViaSdk, acceptOfferWithFallback, createListing, parseListingPrice } from "../opensea-sell";
 import { createLogger, withPrefix, LogSink } from "../logger";
 import { istTimeToDate, toIST } from "../time-format";
-import { renderBatch } from "./format";
+import { renderBatch, chunkMessage } from "./format";
 
 interface SessionData {
   step?:
     | "awaiting_wallet_key"
     | "awaiting_seed_count"
     | "awaiting_seed_import"
+    | "awaiting_agent_question"
     | "awaiting_copy_target"
     | "awaiting_fund_amount"
     | "awaiting_sched_link"
@@ -480,7 +485,7 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
     return ctx.reply(
       "✅ You're in.\n\n" +
         "Start by adding a wallet, then choose wallets to copy. Nothing mints until you turn Copy Mint on.",
-      mainMenu()
+      menuFor(ctx)
     );
   });
 
@@ -492,6 +497,9 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
   // Resolved once for the boot-time "always on" restarts below, which run
   // outside any update and so have no ctx to hang a store off.
   const ownerStore = stores.for(ownerId);
+  // The admin row exists only for the owner; nobody else learns it's there.
+  const menuFor = (ctx: BotContext) => mainMenu(ctx.from?.id === ownerId);
+
   const runningAutoFor = (userId: number): Map<string, RunningWatcher> => {
     let m = runningAutoByUser.get(userId);
     if (!m) runningAutoByUser.set(userId, (m = new Map()));
@@ -499,8 +507,8 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
   };
 
   // ── Menu navigation ──────────────────────────────────────────────────
-  bot.start((ctx) => ctx.reply("NFT Public Mint Sniper — choose an action:", mainMenu()));
-  bot.action("menu:main", (ctx) => ctx.editMessageText("Choose an action:", mainMenu()));
+  bot.start((ctx) => ctx.reply("NFT Public Mint Sniper — choose an action:", menuFor(ctx)));
+  bot.action("menu:main", (ctx) => ctx.editMessageText("Choose an action:", menuFor(ctx)));
 
   bot.action("menu:wallets", (ctx) =>
     ctx.editMessageText("Wallets — tap one to manage it. [🎯 Auto] [👀 Copy]:", walletsMenu(ctx.store.listWallets()))
@@ -1007,7 +1015,7 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
   bot.action(/^pf:remove:(.+)$/, (ctx) => {
     ctx.store.removeMint(ctx.match[1]);
     const mints = ctx.store.listMints();
-    if (mints.length === 0) return ctx.editMessageText("Portfolio is empty.", mainMenu());
+    if (mints.length === 0) return ctx.editMessageText("Portfolio is empty.", menuFor(ctx));
     return ctx.editMessageText(`🖼 Portfolio — ${mints.length} collection(s)`, portfolioMenu(mints));
   });
 
@@ -1149,7 +1157,7 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
         `Portfolio: ${ctx.store.listMints().length} collection(s)
 ` +
         `Activity alerts: ${runningActivity ? "running" : "stopped"}`,
-      mainMenu()
+      menuFor(ctx)
     );
   });
 
@@ -1545,7 +1553,7 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
     ctx.session.fundSource = undefined;
     ctx.session.fundTargets = undefined;
     ctx.session.fundAmountWei = undefined;
-    return ctx.editMessageText("Cancelled.", mainMenu());
+    return ctx.editMessageText("Cancelled.", menuFor(ctx));
   });
 
   bot.action("fund:confirm", async (ctx) => {
@@ -1628,6 +1636,166 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
           : "";
       return ctx.reply(`Send the new value for ${field}${hint}:`);
     });
+  }
+
+  // ── Admin panel (owner only) ──────────────────────────────────────────
+  const requireOwner = (ctx: BotContext): boolean => ctx.from?.id === ownerId;
+
+  /** Live state handed to the assistant. Read-only, and gathered per ask. */
+  async function buildSnapshot(ctx: BotContext): Promise<BotSnapshot> {
+    const store = ctx.store;
+    const settings = store.getSettings();
+    const userId = ctx.from!.id;
+    const { urls } = resolveRpcsForChain(settings.chainKey);
+    const provider = createProvider(urls[0]);
+
+    const wallets = await Promise.all(
+      store.listWallets().map(async (w) => {
+        let balanceEth = "unknown";
+        try {
+          balanceEth = formatEther(await provider.getBalance(w.address));
+        } catch {
+          /* a balance we can't read is worth saying so, not worth failing over */
+        }
+        return { address: w.address, balanceEth, copyOn: w.includeInCopyMint !== false };
+      })
+    );
+
+    const when = (ts: number) => new Date(ts).toISOString().replace("T", " ").slice(0, 16);
+    return {
+      chainKey: settings.chainKey,
+      autoEnabled: settings.autoEnabled,
+      copyEnabled: settings.copyMintEnabled,
+      copyWatcherRunning: runningCopy.has(userId),
+      autoChainsRunning: [...runningAutoFor(userId).keys()],
+      maxFeeGwei: settings.maxFeeGwei,
+      gasLimit: settings.gasLimit,
+      copyMaxPriceEth: settings.copyMintMaxPriceEth,
+      copyMaxQuantity: settings.copyMintMaxQuantity,
+      copyBackfillHours: settings.copyBackfillHours,
+      wallets,
+      watchedCount: store.listCopyTargets().length,
+      recentAttempts: store.listCopyAttempts().slice(0, 8).map((a) => ({
+        when: when(a.at),
+        contract: a.nftContract,
+        outcome: a.outcome,
+        reason: a.reason,
+      })),
+      recentMints: store.listMints().slice(0, 8).map((m) => ({
+        when: when(m.lastMintedAt),
+        contract: m.nftContract,
+        quantity: m.quantity,
+      })),
+    };
+  }
+
+  bot.action("menu:admin", (ctx) => {
+    if (!requireOwner(ctx)) return;
+    return ctx.editMessageText(
+      "🛠 Admin — invites, users, and the assistant.",
+      adminMenu(access.listCodes().length, stores.listUserIds().length)
+    );
+  });
+
+  bot.action("admin:invite", async (ctx) => {
+    if (!requireOwner(ctx)) return;
+    const { code, record } = access.createInvite();
+    await ctx.answerCbQuery("Created.");
+    return ctx.reply(
+      `🎟 Invite code:\n\n${code}\n\n` +
+        `Single use. Revoke just this one with /revoke ${record.id}\n` +
+        `Shown once — only its hash is stored.`
+    );
+  });
+
+  bot.action("admin:invites", (ctx) => {
+    if (!requireOwner(ctx)) return;
+    const codes = access.listCodes();
+    if (codes.length === 0) return ctx.editMessageText("No invites yet.", adminMenu(0, stores.listUserIds().length));
+    return ctx.editMessageText("Tap one to revoke that person. Others are unaffected.", adminInvitesMenu(codes));
+  });
+
+  bot.action(/^admin:revoke:(.+)$/, (ctx) => {
+    if (!requireOwner(ctx)) return;
+    const code = access.revokeCode(ctx.match[1]);
+    if (!code) return ctx.answerCbQuery("No such invite.", { show_alert: true });
+    return ctx.editMessageText(
+      `✅ Revoked ${code.label || code.id}.` +
+        (code.redeemedBy ? ` User ${code.redeemedBy} is locked out; their wallets are untouched.` : " It was never used."),
+      adminMenu(access.listCodes().length, stores.listUserIds().length)
+    );
+  });
+
+  bot.action("admin:users", (ctx) => {
+    if (!requireOwner(ctx)) return;
+    const ids = stores.listUserIds();
+    const lines = ids.map((id) => {
+      const inside = id === ownerId || access.hasAccess(id);
+      return `${inside ? "✅" : "🔒"} ${id}${id === ownerId ? " (you)" : ""} — ${stores.for(id).listWallets().length} wallet(s)`;
+    });
+    return ctx.editMessageText(
+      `Users: ${ids.length}\n\n${lines.join("\n") || "(none yet)"}`,
+      adminMenu(access.listCodes().length, ids.length)
+    );
+  });
+
+  bot.action("admin:revokeall", (ctx) => {
+    if (!requireOwner(ctx)) return;
+    const active = access.listCodes().filter((c) => c.redeemedBy && !c.revoked).length;
+    return ctx.editMessageText(
+      `Revoke everyone?\n\n${active} person(s) lose access and every invite code dies. ` +
+        "Nobody's wallets are deleted — they come back with a new code.\n\n" +
+        "Use this when you don't know which code leaked. To remove one person, use Invites.",
+      adminRevokeConfirmMenu()
+    );
+  });
+
+  bot.action("admin:revokeall:confirm", (ctx) => {
+    if (!requireOwner(ctx)) return;
+    access.revokeAll();
+    return ctx.editMessageText(
+      "✅ Everyone revoked and every code killed. Issue fresh invites when you're ready.",
+      adminMenu(access.listCodes().length, stores.listUserIds().length)
+    );
+  });
+
+  bot.action("admin:ask", (ctx) => {
+    if (!requireOwner(ctx)) return;
+    ctx.session.step = "awaiting_agent_question";
+    return ctx.reply(
+      "🤖 What's the question?\n\n" +
+        "I'll answer against the bot's live state — wallets, balances, watcher status, " +
+        "recent attempts. Good for \"why didn't it mint that\" or \"is copy mint actually running\"."
+    );
+  });
+
+  bot.command("ask", async (ctx) => {
+    if (!requireOwner(ctx)) return;
+    const question = ctx.message.text.split(/\s+/).slice(1).join(" ").trim();
+    if (!question) return ctx.reply("Send /ask <question>, or use 🛠 Admin → Ask the assistant.");
+    return runAsk(ctx, question);
+  });
+
+  async function runAsk(ctx: BotContext, question: string): Promise<void> {
+    const thinking = await ctx.reply("🤖 Thinking…");
+    let snapshot: BotSnapshot;
+    try {
+      snapshot = await buildSnapshot(ctx);
+    } catch (err: any) {
+      await ctx.telegram
+        .editMessageText(thinking.chat.id, thinking.message_id, undefined, `Couldn't read the bot's state: ${err?.message ?? err}`)
+        .catch(() => {});
+      return;
+    }
+
+    const result = await ask(question, snapshot);
+    // Chunked: an answer can exceed Telegram's 4096-character limit, and a
+    // send that fails on length would look like the assistant simply died.
+    const parts = chunkMessage(result.text);
+    await ctx.telegram
+      .editMessageText(thinking.chat.id, thinking.message_id, undefined, parts[0])
+      .catch(() => ctx.reply(parts[0]));
+    for (const part of parts.slice(1)) await ctx.reply(part);
   }
 
   // ── Access control (owner only) ───────────────────────────────────────
@@ -1825,7 +1993,7 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
 
   bot.action("sched:cancel", (ctx) => {
     resetSchedSession(ctx);
-    return ctx.editMessageText("Cancelled.", mainMenu());
+    return ctx.editMessageText("Cancelled.", menuFor(ctx));
   });
 
   async function fireScheduled(ctx: BotContext, targetStart: Date | null): Promise<void> {
@@ -1963,7 +2131,7 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
       ctx.session.step = undefined;
       try {
         const record = ctx.store.addWallet("", key);
-        await ctx.reply(`✅ Added ${maskAddress(record.address)} (label: ${record.label}).`, mainMenu());
+        await ctx.reply(`✅ Added ${maskAddress(record.address)} (label: ${record.label}).`, menuFor(ctx));
       } catch (err: any) {
         await ctx.reply(`❌ ${err.message}`);
       }
@@ -2002,7 +2170,7 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
           `${phrase}\n\n` +
           "I do not store it. It is the only way to restore these wallets, and anyone " +
           "who reads it can take everything in them.",
-        mainMenu()
+        menuFor(ctx)
       );
     }
 
@@ -2036,8 +2204,15 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
         `✅ Imported ${added.length} wallet(s)${dupes ? ` (${dupes} already added)` : ""}.\n\n` +
           added.map((a, i) => `${i + 1}. ${a}`).join("\n") +
           "\n\nThey mint on copy signals automatically. Fund them before the next drop.",
-        mainMenu()
+        menuFor(ctx)
       );
+    }
+
+    if (step === "awaiting_agent_question") {
+      ctx.session.step = undefined;
+      if (ctx.from!.id !== ownerId) return;
+      await runAsk(ctx, ctx.message.text.trim());
+      return;
     }
 
     if (step === "awaiting_copy_target") {

@@ -8,14 +8,50 @@ export function maskAddress(addr: string): string {
   return `${addr.slice(0, 6)}…${addr.slice(-4)}`;
 }
 
-export function mainMenu() {
-  return Markup.inlineKeyboard([
+// isAdmin adds the owner-only row; everyone else never sees it exists.
+export function mainMenu(isAdmin = false) {
+  const rows = [
     [Markup.button.callback("💼 Wallets", "menu:wallets"), Markup.button.callback("⚙️ Settings", "menu:settings")],
     [Markup.button.callback("🎯 Auto Mint", "menu:auto"), Markup.button.callback("👀 Copy Mint", "menu:copy")],
     [Markup.button.callback("💸 Fund Wallets", "menu:fund"), Markup.button.callback("⏰ Scheduled Mint", "menu:sched")],
     [Markup.button.callback("🖼 Portfolio", "menu:portfolio"), Markup.button.callback("🔔 Activity Alerts", "menu:activity")],
     [Markup.button.callback("📊 Status", "menu:status")],
+  ];
+  if (isAdmin) rows.push([Markup.button.callback("🛠 Admin", "menu:admin")]);
+  return Markup.inlineKeyboard(rows);
+}
+
+export function adminMenu(inviteCount: number, userCount: number) {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback("🎟 New invite code", "admin:invite")],
+    [Markup.button.callback(`📋 Invites (${inviteCount})`, "admin:invites")],
+    [Markup.button.callback(`👥 Users (${userCount})`, "admin:users")],
+    [Markup.button.callback("🚫 Revoke everyone", "admin:revokeall")],
+    [Markup.button.callback("🤖 Ask the assistant", "admin:ask")],
+    [Markup.button.callback("⬅ Back", "menu:main")],
   ]);
+}
+
+export function adminRevokeConfirmMenu() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback("Yes, revoke everyone", "admin:revokeall:confirm")],
+    [Markup.button.callback("Cancel", "menu:admin")],
+  ]);
+}
+
+/** One button per redeemed invite, so a single person can be removed. */
+export function adminInvitesMenu(codes: { id: string; label?: string; redeemedBy?: number; revoked?: boolean }[]) {
+  const rows = codes
+    .filter((c) => !c.revoked)
+    .slice(0, 20)
+    .map((c) => [
+      Markup.button.callback(
+        `🚫 ${c.label || c.id}${c.redeemedBy ? ` · ${c.redeemedBy}` : " · unused"}`,
+        `admin:revoke:${c.id}`
+      ),
+    ]);
+  rows.push([Markup.button.callback("⬅ Back", "menu:admin")]);
+  return Markup.inlineKeyboard(rows);
 }
 
 export function activityMenu(enabled: boolean, s: BotSettings) {
