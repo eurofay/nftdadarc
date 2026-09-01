@@ -7,6 +7,7 @@ dotenv.config({ path: path.resolve(process.cwd(), ".env") });
 
 import { createBot } from "./telegram/bot";
 import { UserStores } from "./telegram/user-stores";
+import { AccessControl } from "./telegram/access-control";
 
 function required(name: string): string {
   const v = process.env[name];
@@ -37,7 +38,10 @@ async function main(): Promise<void> {
     console.log("The original file was left in place; delete it once you've confirmed everything is there.");
   }
 
-  const bot = createBot({ token, ownerId, stores });
+  // Global for the whole bot, not per user: one password, one revoke.
+  const access = new AccessControl(path.join(dataDir, "access.json"));
+
+  const bot = createBot({ token, ownerId, stores, access });
 
   process.once("SIGINT", () => bot.stop("SIGINT"));
   process.once("SIGTERM", () => bot.stop("SIGTERM"));
@@ -51,7 +55,10 @@ async function main(): Promise<void> {
     .launch(() => {
       console.log(
         `Telegram bot running. Owner: ${ownerId}. ` +
-          `Other users get their own isolated wallets and settings.`
+          `Other users get their own isolated wallets and settings. ` +
+          (access.isConfigured()
+            ? "Access password is set."
+            : "No access password set yet — /password <new> to open the bot to others.")
       );
     })
     .catch((err: any) => {

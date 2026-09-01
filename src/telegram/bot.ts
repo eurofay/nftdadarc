@@ -12,6 +12,7 @@ import { generateMnemonic, deriveWallets, isValidMnemonic } from "../hd-wallet";
 import { createProvider } from "../rpc-provider";
 import { TelegramStore, WalletRecord } from "./store";
 import { UserStores } from "./user-stores";
+import { AccessControl } from "./access-control";
 import {
   mainMenu,
   walletsMenu,
@@ -372,9 +373,10 @@ export interface BotDeps {
   /** Retains admin powers; everyone else gets their own isolated store. */
   ownerId: number;
   stores: UserStores;
+  access: AccessControl;
 }
 
-export function createBot({ token, ownerId, stores }: BotDeps): Telegraf<BotContext> {
+export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf<BotContext> {
   const bot = new Telegraf<BotContext>(token);
 
   // Without this, a throw inside any handler propagates out through
@@ -405,10 +407,57 @@ export function createBot({ token, ownerId, stores }: BotDeps): Telegraf<BotCont
   // ctx.store, so there is no shared store object one user could read
   // another user's wallets out of.
   bot.use((ctx, next) => {
-    const access = resolveAccess(ctx.chat?.type, ctx.from?.id, stores);
-    if (!access.allowed) return;
-    ctx.store = access.store;
+    const resolved = resolveAccess(ctx.chat?.type, ctx.from?.id, stores);
+    if (!resolved.allowed) return;
+    ctx.store = resolved.store;
     return next();
+  });
+
+  // ── The password gate ─────────────────────────────────────────────────
+  // Anyone can find this bot, so the bot is the door. The owner is never
+  // gated: a bot holding real keys must not be lockable by its own door.
+  bot.use(async (ctx, next) => {
+    const userId = ctx.from!.id;
+    if (userId === ownerId) return next();
+
+    if (access.isGrantValid(ctx.store.getAccessEpoch())) return next();
+
+    if (!access.isConfigured()) {
+      return ctx.reply("This bot isn't open yet. The owner hasn't set an access password.");
+    }
+
+    const waitMs = access.lockoutRemainingMs(userId);
+    if (waitMs > 0) {
+      return ctx.reply(`Too many wrong attempts. Try again in ${Math.ceil(waitMs / 60000)} minute(s).`);
+    }
+
+    // Locked out: the only thing a message can be is a password attempt.
+    const text = (ctx.message as any)?.text?.trim();
+    if (!text) {
+      return ctx.reply("🔒 Send the access password to use this bot.");
+    }
+
+    // Whether right or wrong, the password shouldn't linger in the chat.
+    await ctx.deleteMessage(ctx.message!.message_id).catch(() => {});
+
+    if (!access.verify(text)) {
+      const locked = access.recordFailure(userId);
+      return ctx.reply(
+        locked > 0
+          ? `❌ Wrong password. Locked for ${Math.ceil(locked / 60000)} minute(s).`
+          : "❌ Wrong password."
+      );
+    }
+
+    access.clearFailures(userId);
+    ctx.store.grantAccess(access.epoch);
+    return ctx.reply(
+      "✅ Access granted.\n\n" +
+        "Your wallets and settings are your own — nobody else using this bot can see them. " +
+        "Fund a wallet you're willing to risk: keys arrive over Telegram, which isn't " +
+        "end-to-end encrypted for bots.",
+      mainMenu()
+    );
   });
 
   // Watchers are per user: each person's wallets mint on their own signals,
@@ -1556,6 +1605,70 @@ export function createBot({ token, ownerId, stores }: BotDeps): Telegraf<BotCont
       return ctx.reply(`Send the new value for ${field}${hint}:`);
     });
   }
+
+  // ── Access control (owner only) ───────────────────────────────────────
+  // Deliberately commands rather than menu buttons: a password typed into a
+  // chat is bad enough without a tappable button that invites doing it often.
+  bot.command("password", async (ctx) => {
+    if (ctx.from!.id !== ownerId) return;
+    const next = ctx.message.text.split(/\s+/).slice(1).join(" ").trim();
+    await ctx.deleteMessage(ctx.message.message_id).catch(() => {});
+    if (!next) {
+      return ctx.reply(
+        access.isConfigured()
+          ? "A password is set. Send /password <new> to change it — people already in stay in.\nUse /revokeall <new> to change it AND remove everyone."
+          : "No password set. Send /password <new> to open the bot to other people."
+      );
+    }
+    try {
+      access.setPassword(next);
+      return ctx.reply(
+        "✅ Password set. New people can join with it.\n\n" +
+          "Anyone already granted access keeps it — use /revokeall <new> if you need to remove them."
+      );
+    } catch (err: any) {
+      return ctx.reply(`❌ ${err.message}`);
+    }
+  });
+
+  bot.command("revokeall", async (ctx) => {
+    if (ctx.from!.id !== ownerId) return;
+    const next = ctx.message.text.split(/\s+/).slice(1).join(" ").trim();
+    await ctx.deleteMessage(ctx.message.message_id).catch(() => {});
+    if (!next) {
+      return ctx.reply(
+        "Send /revokeall <new password>.\n\n" +
+          "This removes EVERYONE currently using the bot and replaces the password in " +
+          "one step. A new password alone would leave people already inside; kicking " +
+          "them out alone would leave the leaked password working."
+      );
+    }
+    try {
+      const epoch = access.revokeAll(next);
+      const others = stores.listUserIds().filter((id) => id !== ownerId).length;
+      return ctx.reply(
+        `✅ Revoked. ${others} user(s) removed and must enter the new password.\n\n` +
+          "The old password no longer works. Nobody's wallets were touched — their " +
+          `keys and settings are intact behind the door. (access epoch ${epoch})`
+      );
+    } catch (err: any) {
+      return ctx.reply(`❌ ${err.message} — nothing was changed.`);
+    }
+  });
+
+  bot.command("users", (ctx) => {
+    if (ctx.from!.id !== ownerId) return;
+    const ids = stores.listUserIds();
+    const lines = ids.map((id) => {
+      const store = stores.for(id);
+      const inside = id === ownerId || access.isGrantValid(store.getAccessEpoch());
+      return `${inside ? "✅" : "🔒"} ${id}${id === ownerId ? " (you)" : ""} — ${store.listWallets().length} wallet(s)`;
+    });
+    return ctx.reply(
+      `Users with a store on this bot: ${ids.length}\n\n${lines.join("\n") || "(none yet)"}\n\n` +
+        "✅ has access · 🔒 needs the password"
+    );
+  });
 
   // ── Manual one-off mint ──────────────────────────────────────────────
   // /mint <link> <quantity> [wallet labels/addresses, comma-separated]

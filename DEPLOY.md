@@ -72,6 +72,32 @@ funds. Practical consequences:
 - Tell users to fund these wallets with only what they can afford to lose;
   keys arrive over Telegram, which is not end-to-end encrypted for bots.
 
+## Letting other people in
+
+The bot is closed until you set a password:
+
+    /password <something long>
+
+Share that with testers. Anyone who messages the bot is asked for it before
+they can do anything, gets five tries, then a 15-minute lockout. Each person
+who gets in has their own wallets, settings and history — nobody sees anyone
+else's.
+
+If the password leaks:
+
+    /revokeall <a different password>
+
+That removes everyone in one step AND replaces the password. Both halves
+matter: a new password alone leaves the people already inside, and kicking
+people out alone leaves the leaked password working. Nobody's wallets are
+deleted — they're locked out, and get everything back by entering the new
+password.
+
+`/users` lists who has a store and who currently has access.
+
+You are never gated by your own door — the owner id skips the password, so a
+forgotten one can't strand the wallets.
+
 ## Cost
 
 One always-on container plus a small volume. The RPC calls, not the host, are
