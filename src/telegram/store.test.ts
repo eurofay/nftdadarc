@@ -4,6 +4,7 @@ import os from "os";
 import path from "path";
 import { Wallet } from "ethers";
 import { TelegramStore } from "./store";
+import { deriveWallets } from "../hd-wallet";
 
 // Freshly generated for this test file only — not reused anywhere, no funds ever touch them.
 const TEST_KEY_1 = "0xad6c4582d7bae64497e12e590deb375c3e5e1827044300f6a9d98f06c6dae4bd";
@@ -488,5 +489,65 @@ describe("scheduled mints", () => {
 
   it("reports an unknown id rather than pretending it updated", () => {
     expect(fresh().updateScheduled("nope", { status: "fired" })).toBeNull();
+  });
+});
+
+describe("seed phrases", () => {
+  const PHRASE = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+  function fresh(): { store: TelegramStore; file: string } {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "seed-"));
+    const file = path.join(dir, "s.json");
+    return { store: new TelegramStore(file, "pass"), file };
+  }
+
+  it("stores the phrase encrypted, never in the clear", () => {
+    const { store, file } = fresh();
+    store.addSeed(PHRASE);
+    // The whole file is on a volume that gets backed up; a plaintext phrase
+    // there would control every wallet derived from it.
+    expect(fs.readFileSync(file, "utf8")).not.toContain("abandon");
+  });
+
+  it("reads the phrase back — the reason it's stored at all", () => {
+    const { store } = fresh();
+    const rec = store.addSeed(PHRASE);
+    expect(store.getDecryptedSeed(rec.id)).toBe(PHRASE);
+  });
+
+  it("survives a restart", () => {
+    const { store, file } = fresh();
+    const id = store.addSeed(PHRASE).id;
+    expect(new TelegramStore(file, "pass").getDecryptedSeed(id)).toBe(PHRASE);
+  });
+
+  it("links wallets to the seed they came from, in derivation order", () => {
+    const { store } = fresh();
+    const seed = store.addSeed(PHRASE);
+    for (const w of deriveWallets(PHRASE, 3)) {
+      store.addWallet(`seed-${w.index}`, w.privateKey, { seedId: seed.id, derivationIndex: w.index });
+    }
+    const linked = store.walletsFromSeed(seed.id);
+    expect(linked).toHaveLength(3);
+    expect(linked.map((w) => w.derivationIndex)).toEqual([0, 1, 2]);
+  });
+
+  it("keeps a pasted wallet unlinked, so it isn't claimed by a seed", () => {
+    const { store } = fresh();
+    store.addSeed(PHRASE);
+    store.addWallet("pasted", "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
+    expect(store.listWallets()[0].seedId).toBeUndefined();
+  });
+
+  it("refuses an unknown id rather than returning something wrong", () => {
+    expect(() => fresh().store.getDecryptedSeed("nope")).toThrow(/No seed phrase/);
+  });
+
+  it("can be deleted", () => {
+    const { store } = fresh();
+    const rec = store.addSeed(PHRASE);
+    expect(store.removeSeed(rec.id)).toBe(true);
+    expect(store.listSeeds()).toEqual([]);
+    expect(store.removeSeed(rec.id)).toBe(false);
   });
 });

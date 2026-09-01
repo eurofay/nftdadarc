@@ -16,6 +16,8 @@ import { ask, BotSnapshot } from "./agent";
 import { AccessControl } from "./access-control";
 import {
   mainMenu,
+  seedsMenu,
+  seedDetailMenu,
   adminMenu,
   adminRevokeConfirmMenu,
   adminInvitesMenu,
@@ -1163,6 +1165,106 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
   });
 
   // ── Wallets ──────────────────────────────────────────────────────────
+  // Anything that reveals a key or a phrase is sent as its own message and
+  // deleted shortly after. Telegram keeps chat history on its servers, so a
+  // secret left in the thread is a secret stored by Telegram indefinitely.
+  const REVEAL_TTL_MS = 90_000;
+
+  async function revealBriefly(ctx: BotContext, text: string): Promise<void> {
+    const sent = await ctx.reply(text);
+    setTimeout(() => {
+      ctx.telegram.deleteMessage(sent.chat.id, sent.message_id).catch(() => {
+        /* already gone, or the user deleted it first */
+      });
+    }, REVEAL_TTL_MS);
+  }
+
+  bot.action(/^wallet:key:(.+)$/, async (ctx) => {
+    const address = ctx.match[1];
+    let key: string;
+    try {
+      key = ctx.store.getDecryptedKey(address);
+    } catch (err: any) {
+      return ctx.answerCbQuery(err?.message ?? "Couldn't read that key.", { show_alert: true });
+    }
+    await ctx.answerCbQuery("Sent — it self-deletes.");
+    return revealBriefly(
+      ctx,
+      `🔑 Private key for ${address}\n\n${key}\n\n` +
+        `Import it with this; anyone who reads it owns the wallet. ` +
+        `This message deletes itself in ${REVEAL_TTL_MS / 1000}s — copy it now.`
+    );
+  });
+
+  bot.action("menu:seeds", (ctx) => {
+    const seeds = ctx.store.listSeeds();
+    if (seeds.length === 0) {
+      return ctx.editMessageText(
+        "No seed phrases stored yet.\n\nGenerate one from Wallets → 🌱 Generate seed + wallets, " +
+          "or import an existing one. Phrases created before this feature existed weren't stored and can't be recovered.",
+        walletsMenu(ctx.store.listWallets())
+      );
+    }
+    const counts: Record<string, number> = {};
+    for (const seed of seeds) counts[seed.id] = ctx.store.walletsFromSeed(seed.id).length;
+    return ctx.editMessageText("🌱 Seed phrases — one phrase restores every wallet under it.", seedsMenu(seeds, counts));
+  });
+
+  bot.action(/^seed:view:(.+)$/, (ctx) => {
+    const seedId = ctx.match[1];
+    const wallets = ctx.store.walletsFromSeed(seedId);
+    const lines = wallets.map((w) => `  ${w.derivationIndex ?? "?"}. ${w.address}`);
+    return ctx.editMessageText(
+      `🌱 Seed ${seedId}\n\n${wallets.length} wallet(s) derived:\n${lines.join("\n") || "  (none)"}\n\n` +
+        "The phrase restores all of these in MetaMask, Rabby or Ledger.",
+      seedDetailMenu(seedId)
+    );
+  });
+
+  bot.action(/^seed:reveal:(.+)$/, async (ctx) => {
+    let phrase: string;
+    try {
+      phrase = ctx.store.getDecryptedSeed(ctx.match[1]);
+    } catch (err: any) {
+      return ctx.answerCbQuery(err?.message ?? "Couldn't read that phrase.", { show_alert: true });
+    }
+    await ctx.answerCbQuery("Sent — it self-deletes.");
+    return revealBriefly(
+      ctx,
+      `🌱 Seed phrase\n\n${phrase}\n\n` +
+        `This controls EVERY wallet derived from it, including ones not created yet. ` +
+        `Write it down offline. This message deletes itself in ${REVEAL_TTL_MS / 1000}s.`
+    );
+  });
+
+  bot.action(/^seed:more:(.+)$/, async (ctx) => {
+    const seedId = ctx.match[1];
+    let phrase: string;
+    try {
+      phrase = ctx.store.getDecryptedSeed(seedId);
+    } catch (err: any) {
+      return ctx.answerCbQuery(err?.message ?? "Couldn't read that phrase.", { show_alert: true });
+    }
+    // Continue past the highest index already derived, so re-deriving never
+    // collides with a wallet that exists.
+    const existing = ctx.store.walletsFromSeed(seedId);
+    const nextIndex = existing.reduce((max, w) => Math.max(max, (w.derivationIndex ?? -1) + 1), 0);
+    const added: string[] = [];
+    for (const w of deriveWallets(phrase, 5, nextIndex)) {
+      try {
+        ctx.store.addWallet(`seed-${w.index}`, w.privateKey, { seedId, derivationIndex: w.index });
+        added.push(w.address);
+      } catch {
+        /* already present */
+      }
+    }
+    await ctx.answerCbQuery(`Derived ${added.length}.`);
+    return ctx.reply(
+      `✅ Added ${added.length} more wallet(s) from this seed:\n\n${added.join("\n")}\n\n` +
+        "They mint on copy signals automatically. Fund them before the next drop."
+    );
+  });
+
   bot.action("wallet:seed:new", (ctx) => {
     ctx.session.step = "awaiting_seed_count";
     return ctx.reply(
@@ -2261,12 +2363,14 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
       }
 
       const phrase = generateMnemonic();
-      const derived = deriveWallets(phrase, count);
+      // Stored so it can be read back later. A phrase shown once and never
+      // again is not a backup — see SeedRecord in store.ts.
+      const seed = ctx.store.addSeed(phrase);
       const added: string[] = [];
       let dupes = 0;
-      for (const w of derived) {
+      for (const w of deriveWallets(phrase, count)) {
         try {
-          ctx.store.addWallet(`seed-${w.index}`, w.privateKey);
+          ctx.store.addWallet(`seed-${w.index}`, w.privateKey, { seedId: seed.id, derivationIndex: w.index });
           added.push(w.address);
         } catch {
           dupes++; // deriving is deterministic, so re-importing hits this
@@ -2283,8 +2387,9 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
       return ctx.reply(
         "🌱 SEED PHRASE — write this down offline, then DELETE this message:\n\n" +
           `${phrase}\n\n` +
-          "I do not store it. It is the only way to restore these wallets, and anyone " +
-          "who reads it can take everything in them.",
+          "It restores every wallet above in MetaMask, Rabby or Ledger, and anyone who " +
+          "reads it can take everything in them. You can see it again under " +
+          "Wallets → 🌱 Seed phrases — but keep an offline copy anyway.",
         menuFor(ctx)
       );
     }
@@ -2307,9 +2412,10 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
 
       const added: string[] = [];
       let dupes = 0;
+      const seed = ctx.store.addSeed(phrase, "imported");
       for (const w of deriveWallets(phrase, count)) {
         try {
-          ctx.store.addWallet(`seed-${w.index}`, w.privateKey);
+          ctx.store.addWallet(`seed-${w.index}`, w.privateKey, { seedId: seed.id, derivationIndex: w.index });
           added.push(w.address);
         } catch {
           dupes++;

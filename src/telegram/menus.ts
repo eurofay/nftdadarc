@@ -172,6 +172,7 @@ export function walletsMenu(wallets: WalletRecord[]) {
   rows.push([Markup.button.callback("➕ Add wallet (private key)", "wallet:add")]);
   rows.push([Markup.button.callback("🌱 Generate seed + wallets", "wallet:seed:new")]);
   rows.push([Markup.button.callback("📥 Import seed phrase", "wallet:seed:import")]);
+  rows.push([Markup.button.callback("🌱 Seed phrases", "menu:seeds")]);
   rows.push([Markup.button.callback("⬅ Back", "menu:main")]);
   return Markup.inlineKeyboard(rows);
 }
@@ -182,8 +183,29 @@ export function walletDetailMenu(wallet: WalletRecord) {
   return Markup.inlineKeyboard([
     [Markup.button.callback(`🎯 Auto Mint: ${autoOn ? "✅ ON" : "⛔ OFF"}`, `wallet:toggle:auto:${wallet.address}`)],
     [Markup.button.callback(`👀 Copy Mint: ${copyOn ? "✅ ON" : "⛔ OFF"}`, `wallet:toggle:copy:${wallet.address}`)],
+    [Markup.button.callback("🔑 Show private key", `wallet:key:${wallet.address}`)],
     [Markup.button.callback("🗑 Remove wallet", `wallet:remove:${wallet.address}`)],
     [Markup.button.callback("⬅ Back", "menu:wallets")],
+  ]);
+}
+
+// Seed phrases live under Wallets, beside the wallets they produced.
+export function seedsMenu(seeds: { id: string; label?: string; createdAt: number }[], counts: Record<string, number>) {
+  const rows = seeds.map((s) => [
+    Markup.button.callback(
+      `🌱 ${s.label || new Date(s.createdAt).toISOString().slice(0, 10)} · ${counts[s.id] ?? 0} wallet(s)`,
+      `seed:view:${s.id}`
+    ),
+  ]);
+  rows.push([Markup.button.callback("⬅ Back", "menu:wallets")]);
+  return Markup.inlineKeyboard(rows);
+}
+
+export function seedDetailMenu(seedId: string) {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback("🌱 Show seed phrase", `seed:reveal:${seedId}`)],
+    [Markup.button.callback("➕ Derive more wallets", `seed:more:${seedId}`)],
+    [Markup.button.callback("⬅ Back", "menu:seeds")],
   ]);
 }
 

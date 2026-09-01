@@ -13,6 +13,9 @@ export interface WalletRecord {
   address: string;
   encryptedKey: string;
   addedAt: number;
+  /** Set when this wallet was derived from a stored seed phrase. */
+  seedId?: string;
+  derivationIndex?: number;
   // Per-wallet opt-in for the two "use every added wallet" watchers. Default
   // true when unset, so existing wallets keep today's behavior until someone
   // deliberately excludes one — named to avoid colliding with
@@ -121,7 +124,27 @@ export interface ScheduledMint {
   note?: string;
 }
 
+/**
+ * A stored seed phrase.
+ *
+ * Originally the phrase was shown once and never persisted, on the reasoning
+ * that one stolen string controls every wallet derived from it. That reasoning
+ * still holds — but it made the phrase useless as a backup, which is the only
+ * thing a phrase is FOR. A phrase you cannot re-read is strictly worse than
+ * the private keys sitting next to it, which were always stored.
+ *
+ * So it is kept, encrypted with the same key as those private keys, and shown
+ * only on an explicit request that says plainly what it exposes.
+ */
+export interface SeedRecord {
+  id: string;
+  encryptedPhrase: string;
+  label?: string;
+  createdAt: number;
+}
+
 interface StoreData {
+  seeds: SeedRecord[];
   scheduled: ScheduledMint[];
   wallets: WalletRecord[];
   copyTargets: CopyTarget[];
@@ -158,7 +181,7 @@ export class TelegramStore {
 
   private load(): StoreData {
     if (!fs.existsSync(this.filePath)) {
-      return { scheduled: [], wallets: [], copyTargets: [], mints: [], copyHistory: [], settings: { ...DEFAULT_SETTINGS } };
+      return { seeds: [], scheduled: [], wallets: [], copyTargets: [], mints: [], copyHistory: [], settings: { ...DEFAULT_SETTINGS } };
     }
     const raw = JSON.parse(fs.readFileSync(this.filePath, "utf8"));
     return {
@@ -166,6 +189,7 @@ export class TelegramStore {
       copyTargets: raw.copyTargets ?? [],
       mints: raw.mints ?? [],
       copyHistory: raw.copyHistory ?? [],
+      seeds: raw.seeds ?? [],
       scheduled: raw.scheduled ?? [],
       settings: { ...DEFAULT_SETTINGS, ...(raw.settings ?? {}) },
     };
@@ -203,7 +227,11 @@ export class TelegramStore {
   }
 
   // ── Wallets ──────────────────────────────────────────────────────────
-  addWallet(label: string, privateKey: string): WalletRecord {
+  addWallet(
+    label: string,
+    privateKey: string,
+    origin?: { seedId: string; derivationIndex: number }
+  ): WalletRecord {
     const wallet = new Wallet(privateKey); // throws on a malformed key — validate before ever persisting
     if (this.data.wallets.some((w) => w.address.toLowerCase() === wallet.address.toLowerCase())) {
       throw new Error(`Wallet ${wallet.address} is already added.`);
@@ -213,6 +241,8 @@ export class TelegramStore {
       address: wallet.address,
       encryptedKey: encrypt(privateKey, this.passphrase),
       addedAt: Date.now(),
+      seedId: origin?.seedId,
+      derivationIndex: origin?.derivationIndex,
     };
     this.data.wallets.push(record);
     this.save();
@@ -280,6 +310,45 @@ export class TelegramStore {
     const removed = this.data.copyTargets.length !== before;
     if (removed) this.save();
     return removed;
+  }
+
+  // ── Seed phrases ─────────────────────────────────────────────────────
+  addSeed(phrase: string, label?: string): SeedRecord {
+    const record: SeedRecord = {
+      id: randomBytes(4).toString("hex"),
+      encryptedPhrase: encrypt(phrase, this.passphrase),
+      label,
+      createdAt: Date.now(),
+    };
+    this.data.seeds.push(record);
+    this.save();
+    return record;
+  }
+
+  listSeeds(): SeedRecord[] {
+    return [...this.data.seeds].sort((a, b) => b.createdAt - a.createdAt);
+  }
+
+  /** Decrypts on demand — never held in the record the caller can log. */
+  getDecryptedSeed(id: string): string {
+    const record = this.data.seeds.find((s) => s.id === id);
+    if (!record) throw new Error(`No seed phrase with id ${id}.`);
+    return decrypt(record.encryptedPhrase, this.passphrase);
+  }
+
+  removeSeed(id: string): boolean {
+    const before = this.data.seeds.length;
+    this.data.seeds = this.data.seeds.filter((s) => s.id !== id);
+    if (this.data.seeds.length === before) return false;
+    this.save();
+    return true;
+  }
+
+  /** Wallets derived from a given seed, in derivation order. */
+  walletsFromSeed(seedId: string): WalletRecord[] {
+    return this.data.wallets
+      .filter((w) => w.seedId === seedId)
+      .sort((a, b) => (a.derivationIndex ?? 0) - (b.derivationIndex ?? 0));
   }
 
   // ── Scheduled mints ──────────────────────────────────────────────────
