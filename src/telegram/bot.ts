@@ -75,7 +75,7 @@ import { acceptOfferViaSdk, acceptOfferWithFallback, createListing, parseListing
 import { createLogger, withPrefix, LogSink } from "../logger";
 import { istTimeToDate, toIST } from "../time-format";
 import { renderBatch, chunkMessage } from "./format";
-import { measureLatency, renderLatency } from "../rpc-latency";
+import { measureLatency, renderLatency, probeCapability } from "../rpc-latency";
 
 interface SessionData {
   step?:
@@ -1928,8 +1928,15 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
     const settings = ctx.store.getSettings();
     const chain = resolveChain(settings.chainKey);
     const { urls } = resolveRpcsForChain(settings.chainKey);
-    const note = await ctx.reply("📡 Measuring…");
+    const note = await ctx.reply("📡 Measuring latency and scan limits…");
     const samples = await measureLatency(urls);
+    // Latency alone would recommend a fast endpoint that can't scan.
+    for (const sample of samples) {
+      if (sample.medianMs === null) continue;
+      const cap = await probeCapability(sample.url);
+      sample.canRead = cap.canRead;
+      sample.logRange = cap.logRange;
+    }
     return ctx.telegram
       .editMessageText(
         note.chat.id,

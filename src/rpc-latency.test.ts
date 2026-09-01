@@ -19,8 +19,8 @@ describe("labelEndpoint", () => {
 
 describe("renderLatency", () => {
   const samples: LatencySample[] = [
-    { url: "a", label: "sequencer (origin)", medianMs: 40, bestMs: 35 },
-    { url: "b", label: "public rpc (cloudflare)", medianMs: 320, bestMs: 290 },
+    { url: "a", label: "sequencer (origin)", medianMs: 40, bestMs: 35, canRead: false, logRange: 0 },
+    { url: "b", label: "public rpc (cloudflare)", medianMs: 320, bestMs: 290, canRead: true, logRange: 10000 },
     { url: "c", label: "dead", medianMs: null, bestMs: null, error: "timeout" },
   ];
 
@@ -30,10 +30,36 @@ describe("renderLatency", () => {
     expect(out).toContain("3.2 block(s)");
   });
 
-  it("names the fastest endpoint and what to do about it", () => {
+  it("never sends reads to an endpoint that can't scan, however fast it is", () => {
+    // The regression this exists for: ranking on latency alone recommended a
+    // free-tier endpoint capped at 10-block getLogs, which blinds copy mint.
+    const fastButBlind: LatencySample[] = [
+      { url: "a", label: "alchemy", medianMs: 15, bestMs: 12, canRead: true, logRange: 10 },
+      { url: "b", label: "public rpc", medianMs: 320, bestMs: 290, canRead: true, logRange: 10000 },
+    ];
+    const out = renderLatency(fastButBlind, 0.1);
+    expect(out).toContain("Reads → public rpc");
+    expect(out).not.toContain("Reads → alchemy");
+    // The fast one is still worth naming — it just isn't the read endpoint.
+    expect(out).toContain("Closest overall: alchemy");
+  });
+
+  it("marks a send-only endpoint rather than offering it for reads", () => {
     const out = renderLatency(samples, 0.1);
-    expect(out).toContain("Fastest: sequencer (origin)");
-    expect(out).toMatch(/RPC_URL_/);
+    expect(out).toContain("send-only");
+    expect(out).toContain("Reads → public rpc (cloudflare)");
+  });
+
+  it("warns when nothing can scan, instead of picking the least-bad", () => {
+    const out = renderLatency(
+      [{ url: "a", label: "alchemy", medianMs: 15, bestMs: 12, canRead: true, logRange: 10 }],
+      0.1
+    );
+    expect(out).toMatch(/can't see new mints/);
+  });
+
+  it("shows the scan width, so the tradeoff is visible", () => {
+    expect(renderLatency(samples, 0.1)).toContain("scans 10k blocks/call");
   });
 
   it("reports a dead endpoint instead of dropping it silently", () => {

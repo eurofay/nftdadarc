@@ -14,6 +14,10 @@ export interface LatencySample {
   medianMs: number | null;
   bestMs: number | null;
   error?: string;
+  /** Answers reads at all (the sequencer does not — it only takes txs). */
+  canRead?: boolean;
+  /** Widest eth_getLogs range it accepted, 0 if it refuses them. */
+  logRange?: number;
 }
 
 /** Short, recognisable name for an endpoint. */
@@ -47,6 +51,61 @@ async function once(url: string, timeoutMs: number): Promise<number> {
   } finally {
     clearTimeout(timer);
   }
+}
+
+/**
+ * Can this endpoint serve the reads the watchers depend on?
+ *
+ * Latency alone is a trap: the fastest endpoint here is often a free-tier
+ * provider that caps eth_getLogs at 10 blocks, and the copy watcher scans
+ * thousands. Ranking on speed alone would recommend making the bot blind.
+ */
+export async function probeCapability(
+  url: string,
+  timeoutMs = 10_000
+): Promise<{ canRead: boolean; logRange: number }> {
+  const call = async (method: string, params: unknown[]) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", method, params, id: 1 }),
+        signal: controller.signal,
+      });
+      return (await res.json()) as any;
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  let head: number;
+  try {
+    const res = await call("eth_blockNumber", []);
+    if (res?.error || !res?.result) return { canRead: false, logRange: 0 };
+    head = parseInt(res.result, 16);
+  } catch {
+    return { canRead: false, logRange: 0 };
+  }
+
+  // Widest first: the answer we want is the largest range that works, and the
+  // common failure is an explicit "range too large" rather than a timeout.
+  for (const range of [10_000, 2_000, 500, 100, 10]) {
+    try {
+      const res = await call("eth_getLogs", [
+        {
+          fromBlock: `0x${Math.max(0, head - range).toString(16)}`,
+          toBlock: `0x${head.toString(16)}`,
+          address: "0x00005ea00ac477b1030ce78506496e8c2de24bf5",
+        },
+      ]);
+      if (!res?.error) return { canRead: true, logRange: range };
+    } catch {
+      /* try a narrower range */
+    }
+  }
+  return { canRead: true, logRange: 0 };
 }
 
 /**
@@ -89,20 +148,42 @@ export async function measureLatency(
 export function renderLatency(samples: LatencySample[], blockSeconds: number): string {
   const lines = ["📡 Round-trip from the bot to each endpoint:", ""];
   const blockMs = blockSeconds * 1000;
+
   for (const s of samples) {
     if (s.medianMs === null) {
       lines.push(`  ${s.label} — ${s.error ?? "no response"}`);
       continue;
     }
+    const role =
+      s.canRead === false
+        ? " · send-only"
+        : s.logRange !== undefined
+          ? ` · scans ${s.logRange >= 1000 ? `${s.logRange / 1000}k` : s.logRange} blocks/call`
+          : "";
     const blocks = s.medianMs / blockMs;
     lines.push(
-      `  ${s.label}\n     median ${s.medianMs.toFixed(0)}ms · best ${s.bestMs!.toFixed(0)}ms · ${blocks.toFixed(1)} block(s)`
+      `  ${s.label}${role}\n     median ${s.medianMs.toFixed(0)}ms · best ${s.bestMs!.toFixed(0)}ms · ${blocks.toFixed(1)} block(s)`
     );
   }
-  const best = samples.filter((s) => s.medianMs !== null).sort((a, b) => a.medianMs! - b.medianMs!)[0];
-  if (best) {
-    lines.push("", `Fastest: ${best.label}. Put it first in RPC_URL_<CHAIN> — the first entry is used for reads.`);
-    lines.push("Every endpoint is blasted in parallel at fire time, so extra ones cost nothing but add coverage.");
+
+  const answered = samples.filter((s) => s.medianMs !== null);
+  // The read endpoint must be able to SCAN, not merely be quick. Ranking on
+  // latency alone once recommended a free-tier endpoint capped at 10-block
+  // getLogs, which would have made the copy watcher blind.
+  const readable = answered
+    .filter((s) => s.canRead !== false && (s.logRange ?? 0) >= 1000)
+    .sort((a, b) => a.medianMs! - b.medianMs!)[0];
+  const closest = answered.slice().sort((a, b) => a.medianMs! - b.medianMs!)[0];
+
+  lines.push("");
+  if (readable) {
+    lines.push(`Reads → ${readable.label} — put it first in RPC_URL_<CHAIN>. Fastest that can still scan wide ranges.`);
+  } else if (answered.length > 0) {
+    lines.push("⚠ No endpoint here serves wide log scans — copy mint can't see new mints.");
   }
+  if (closest && closest !== readable) {
+    lines.push(`Closest overall: ${closest.label} at ${closest.medianMs!.toFixed(0)}ms, but it isn't the read endpoint.`);
+  }
+  lines.push("Order only decides reads — every endpoint is blasted in parallel when a mint fires.");
   return lines.join("\n");
 }
