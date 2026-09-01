@@ -57,8 +57,8 @@ async function main(): Promise<void> {
         `Telegram bot running. Owner: ${ownerId}. ` +
           `Other users get their own isolated wallets and settings. ` +
           (access.isConfigured()
-            ? "Access password is set."
-            : "No access password set yet — /password <new> to open the bot to others.")
+            ? `${access.listCodes().length} invite(s) issued.`
+            : "No invites issued yet — /invite [name] to let someone in.")
       );
     })
     .catch((err: any) => {

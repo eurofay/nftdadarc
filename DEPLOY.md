@@ -74,29 +74,33 @@ funds. Practical consequences:
 
 ## Letting other people in
 
-The bot is closed until you set a password:
+The bot is closed until you issue an invite:
 
-    /password <something long>
+    /invite alice
 
-Share that with testers. Anyone who messages the bot is asked for it before
-they can do anything, gets five tries, then a 15-minute lockout. Each person
-who gets in has their own wallets, settings and history — nobody sees anyone
-else's.
+That prints a single-use code. Send it to one person. It is shown **once** —
+only its hash is stored, so it cannot be read back, and a copy of the volume
+gives nobody a way in.
 
-If the password leaks:
+A new user messaging the bot sees what it does and what they're risking, then
+is asked for their code. Five wrong tries locks that user out for 15 minutes.
+Everyone who gets in has their own wallets, settings and history.
 
-    /revokeall <a different password>
+    /invites            list codes and who holds them
+    /revoke <id>        lock out one person, nobody else affected
+    /revokeall          lock out everyone and kill every code
+    /users              who has a store, and who currently has access
 
-That removes everyone in one step AND replaces the password. Both halves
-matter: a new password alone leaves the people already inside, and kicking
-people out alone leaves the leaked password working. Nobody's wallets are
-deleted — they're locked out, and get everything back by entering the new
-password.
+`/revoke` is the one to reach for: with a code per person you can remove
+exactly whoever leaked theirs. `/revokeall` is for when you don't know which
+code got out — it marks every code revoked, so re-sending a leaked one does
+nothing, and you issue fresh invites afterwards.
 
-`/users` lists who has a store and who currently has access.
+Revoking never deletes anything. A locked-out user's wallets and settings sit
+untouched; a fresh invite gives them everything back.
 
-You are never gated by your own door — the owner id skips the password, so a
-forgotten one can't strand the wallets.
+You are never gated by your own door — the owner id skips the invite check, so
+there is no way to lock yourself away from the wallets.
 
 ## Cost
 

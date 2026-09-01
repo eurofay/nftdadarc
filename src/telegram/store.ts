@@ -105,12 +105,6 @@ interface StoreData {
   mints: MintRecord[];
   copyHistory: CopyMintAttempt[];
   settings: BotSettings;
-  /**
-   * Which access epoch this user unlocked at. Compared against the global
-   * epoch on every update, so a revoke invalidates it without needing to
-   * touch each user's file. Absent means "never unlocked".
-   */
-  accessGrantedEpoch?: number;
 }
 
 const DEFAULT_SETTINGS: BotSettings = {
@@ -150,7 +144,6 @@ export class TelegramStore {
       mints: raw.mints ?? [],
       copyHistory: raw.copyHistory ?? [],
       settings: { ...DEFAULT_SETTINGS, ...(raw.settings ?? {}) },
-      accessGrantedEpoch: raw.accessGrantedEpoch,
     };
   }
 
@@ -263,15 +256,6 @@ export class TelegramStore {
     const removed = this.data.copyTargets.length !== before;
     if (removed) this.save();
     return removed;
-  }
-
-  getAccessEpoch(): number | undefined {
-    return this.data.accessGrantedEpoch;
-  }
-
-  grantAccess(epoch: number): void {
-    this.data.accessGrantedEpoch = epoch;
-    this.save();
   }
 
   listCopyTargets(): CopyTarget[] {

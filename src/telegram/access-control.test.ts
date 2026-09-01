@@ -6,153 +6,175 @@ import { AccessControl } from "./access-control";
 
 let dir: string;
 let file: string;
+let ac: AccessControl;
 beforeEach(() => {
-  dir = fs.mkdtempSync(path.join(os.tmpdir(), "access-ctl-"));
+  dir = fs.mkdtempSync(path.join(os.tmpdir(), "invite-"));
   file = path.join(dir, "access.json");
+  ac = new AccessControl(file);
 });
 afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
 
-describe("password storage", () => {
-  it("never writes the password itself to disk", () => {
-    const ac = new AccessControl(file);
-    ac.setPassword("correct horse battery");
-    const onDisk = fs.readFileSync(file, "utf8");
-    expect(onDisk).not.toContain("correct horse battery");
-    expect(JSON.parse(onDisk).passwordHash).toBeTruthy();
+const ALICE = 111;
+const BOB = 222;
+
+describe("issuing codes", () => {
+  it("never writes the code itself to disk", () => {
+    const { code } = ac.createInvite("alice");
+    expect(fs.readFileSync(file, "utf8")).not.toContain(code);
+    expect(ac.listCodes()[0].hash).toBeTruthy();
   });
 
-  it("accepts the right password and rejects everything else", () => {
-    const ac = new AccessControl(file);
-    ac.setPassword("letmein-please");
-    expect(ac.verify("letmein-please")).toBe(true);
-    expect(ac.verify("letmein-pleas")).toBe(false);
-    expect(ac.verify("")).toBe(false);
-    expect(ac.verify("LETMEIN-PLEASE")).toBe(false);
+  it("issues a different code every time", () => {
+    const seen = new Set(Array.from({ length: 10 }, () => ac.createInvite().code));
+    expect(seen.size).toBe(10);
   });
 
-  it("salts, so the same password hashes differently in two installs", () => {
-    const a = new AccessControl(file);
-    const b = new AccessControl(path.join(dir, "other.json"));
-    a.setPassword("same-password");
-    b.setPassword("same-password");
-    expect(JSON.parse(fs.readFileSync(file, "utf8")).passwordHash).not.toBe(
-      JSON.parse(fs.readFileSync(path.join(dir, "other.json"), "utf8")).passwordHash
-    );
-  });
-
-  it("refuses a trivially short password", () => {
-    const ac = new AccessControl(file);
-    expect(() => ac.setPassword("abc")).toThrow(/6 characters/);
+  it("is closed until the first invite exists", () => {
     expect(ac.isConfigured()).toBe(false);
-  });
-
-  it("survives a restart", () => {
-    new AccessControl(file).setPassword("persist-me-now");
-    expect(new AccessControl(file).verify("persist-me-now")).toBe(true);
+    ac.createInvite();
+    expect(ac.isConfigured()).toBe(true);
   });
 });
 
-describe("revokeAll", () => {
-  it("invalidates grants that were valid a moment ago", () => {
-    const ac = new AccessControl(file);
-    ac.setPassword("original-pass");
-    const granted = ac.epoch;
-    expect(ac.isGrantValid(granted)).toBe(true);
+describe("redeeming", () => {
+  it("lets the holder in and remembers who they are", () => {
+    const { code, record } = ac.createInvite("alice");
+    expect(ac.hasAccess(ALICE)).toBe(false);
 
-    ac.revokeAll("brand-new-pass");
-    // Everyone already inside is out, in a single write.
-    expect(ac.isGrantValid(granted)).toBe(false);
-    expect(ac.isGrantValid(ac.epoch)).toBe(true);
+    const result = ac.redeem(ALICE, code);
+    expect(result.ok).toBe(true);
+    expect(ac.hasAccess(ALICE)).toBe(true);
+    expect(ac.listCodes().find((c) => c.id === record.id)?.redeemedBy).toBe(ALICE);
   });
 
-  it("stops the leaked password working — the whole point", () => {
-    const ac = new AccessControl(file);
-    ac.setPassword("leaked-everywhere");
-    ac.revokeAll("nobody-knows-this");
-    expect(ac.verify("leaked-everywhere")).toBe(false);
-    expect(ac.verify("nobody-knows-this")).toBe(true);
+  it("rejects a wrong code without granting anything", () => {
+    ac.createInvite();
+    expect(ac.redeem(ALICE, "not-a-real-code")).toEqual({ ok: false, reason: "invalid" });
+    expect(ac.hasAccess(ALICE)).toBe(false);
   });
 
-  it("refuses to revoke into an invalid password, leaving the old gate intact", () => {
-    const ac = new AccessControl(file);
-    ac.setPassword("original-pass");
-    const before = ac.epoch;
-    expect(() => ac.revokeAll("shrt")).toThrow(/6 characters/);
-    // Nothing changed: still the old password, still the old epoch. A failed
-    // revoke must not leave the bot in a half-open state.
-    expect(ac.verify("original-pass")).toBe(true);
-    expect(ac.epoch).toBe(before);
+  it("is single use — passing a code on does not create a second seat", () => {
+    const { code } = ac.createInvite();
+    expect(ac.redeem(ALICE, code).ok).toBe(true);
+    expect(ac.redeem(BOB, code)).toEqual({ ok: false, reason: "already-used" });
+    expect(ac.hasAccess(BOB)).toBe(false);
+  });
+
+  it("lets the same person re-enter their own code, so a re-send isn't a lockout", () => {
+    const { code } = ac.createInvite();
+    ac.redeem(ALICE, code);
+    expect(ac.redeem(ALICE, code).ok).toBe(true);
+  });
+
+  it("survives a restart", () => {
+    const { code } = ac.createInvite();
+    ac.redeem(ALICE, code);
+    expect(new AccessControl(file).hasAccess(ALICE)).toBe(true);
+  });
+});
+
+describe("revoking one person", () => {
+  it("locks out exactly that person and nobody else", () => {
+    const a = ac.createInvite("alice");
+    const b = ac.createInvite("bob");
+    ac.redeem(ALICE, a.code);
+    ac.redeem(BOB, b.code);
+
+    ac.revokeCode(a.record.id);
+
+    // The whole point of codes over one shared password.
+    expect(ac.hasAccess(ALICE)).toBe(false);
+    expect(ac.hasAccess(BOB)).toBe(true);
+  });
+
+  it("stops a revoked code being redeemed again", () => {
+    const { code, record } = ac.createInvite();
+    ac.revokeCode(record.id);
+    expect(ac.redeem(ALICE, code)).toEqual({ ok: false, reason: "revoked" });
+  });
+
+  it("reports an unknown id rather than pretending it worked", () => {
+    expect(ac.revokeCode("nope")).toBeNull();
+  });
+
+  it("can revoke an unused code before anyone gets it", () => {
+    const { code, record } = ac.createInvite();
+    ac.revokeCode(record.id);
+    expect(ac.redeem(ALICE, code).ok).toBe(false);
+  });
+});
+
+describe("revoking everyone", () => {
+  it("kills every grant in one action", () => {
+    const a = ac.createInvite();
+    const b = ac.createInvite();
+    ac.redeem(ALICE, a.code);
+    ac.redeem(BOB, b.code);
+
+    ac.revokeAll();
+
+    expect(ac.hasAccess(ALICE)).toBe(false);
+    expect(ac.hasAccess(BOB)).toBe(false);
+  });
+
+  it("invalidates old codes so a leaked one can't be reused", () => {
+    const { code } = ac.createInvite();
+    ac.redeem(ALICE, code);
+    ac.revokeAll();
+    // Regression: bumping the epoch alone left the code redeemable, so
+    // sending it again re-granted access at the new epoch.
+    expect(ac.redeem(ALICE, code)).toEqual({ ok: false, reason: "revoked" });
+    expect(ac.hasAccess(ALICE)).toBe(false);
   });
 
   it("holds across a restart", () => {
-    const ac = new AccessControl(file);
-    ac.setPassword("first-password");
-    const stale = ac.epoch;
-    ac.revokeAll("second-password");
-    const reloaded = new AccessControl(file);
-    expect(reloaded.isGrantValid(stale)).toBe(false);
-    expect(reloaded.verify("first-password")).toBe(false);
+    const { code } = ac.createInvite();
+    ac.redeem(ALICE, code);
+    ac.revokeAll();
+    expect(new AccessControl(file).hasAccess(ALICE)).toBe(false);
   });
 });
 
 describe("brute-force resistance", () => {
   it("locks a user out after repeated wrong guesses", () => {
-    const ac = new AccessControl(file);
-    ac.setPassword("hard-to-guess");
+    ac.createInvite();
     const now = 1_000_000;
-    for (let i = 0; i < 4; i++) expect(ac.recordFailure(999, now)).toBe(0);
-    expect(ac.recordFailure(999, now)).toBeGreaterThan(0);
-    expect(ac.lockoutRemainingMs(999, now)).toBeGreaterThan(0);
+    for (let i = 0; i < 4; i++) expect(ac.recordFailure(ALICE, now)).toBe(0);
+    expect(ac.recordFailure(ALICE, now)).toBeGreaterThan(0);
+    expect(ac.redeem(ALICE, "guess", now)).toMatchObject({ ok: false, reason: "locked" });
   });
 
-  it("locks only the guessing user, not everyone else", () => {
-    const ac = new AccessControl(file);
-    ac.setPassword("hard-to-guess");
+  it("locks only the guesser", () => {
+    ac.createInvite();
     const now = 1_000_000;
-    for (let i = 0; i < 5; i++) ac.recordFailure(999, now);
-    expect(ac.lockoutRemainingMs(999, now)).toBeGreaterThan(0);
-    expect(ac.lockoutRemainingMs(111, now)).toBe(0);
+    for (let i = 0; i < 5; i++) ac.recordFailure(ALICE, now);
+    expect(ac.lockoutRemainingMs(BOB, now)).toBe(0);
   });
 
-  it("expires the lockout rather than banning forever", () => {
-    const ac = new AccessControl(file);
-    ac.setPassword("hard-to-guess");
+  it("expires rather than banning forever", () => {
+    ac.createInvite();
     const now = 1_000_000;
-    for (let i = 0; i < 5; i++) ac.recordFailure(999, now);
-    expect(ac.lockoutRemainingMs(999, now + 16 * 60 * 1000)).toBe(0);
+    for (let i = 0; i < 5; i++) ac.recordFailure(ALICE, now);
+    expect(ac.lockoutRemainingMs(ALICE, now + 16 * 60 * 1000)).toBe(0);
   });
 
-  it("clears the count once someone gets in", () => {
-    const ac = new AccessControl(file);
-    ac.setPassword("hard-to-guess");
-    ac.recordFailure(999);
-    ac.clearFailures(999);
-    expect(ac.lockoutRemainingMs(999)).toBe(0);
-  });
-
-  it("frees everyone's lockout on revoke, so a revoke can't strand people", () => {
-    const ac = new AccessControl(file);
-    ac.setPassword("hard-to-guess");
-    const now = 1_000_000;
-    for (let i = 0; i < 5; i++) ac.recordFailure(999, now);
-    ac.revokeAll("a-fresh-password");
-    expect(ac.lockoutRemainingMs(999, now)).toBe(0);
+  it("clears the count once a real code lands", () => {
+    const { code } = ac.createInvite();
+    ac.recordFailure(ALICE);
+    ac.redeem(ALICE, code);
+    expect(ac.lockoutRemainingMs(ALICE)).toBe(0);
   });
 });
 
 describe("failure modes", () => {
   it("denies everyone when the gate file is corrupt, rather than opening up", () => {
-    new AccessControl(file).setPassword("real-password");
-    fs.writeFileSync(file, "{ this is not json");
-    const ac = new AccessControl(file);
-    expect(ac.isConfigured()).toBe(false);
-    expect(ac.verify("real-password")).toBe(false);
-  });
+    const { code } = ac.createInvite();
+    ac.redeem(ALICE, code);
+    fs.writeFileSync(file, "{ not json");
 
-  it("reports unconfigured before any password is set", () => {
-    const ac = new AccessControl(file);
-    expect(ac.isConfigured()).toBe(false);
-    expect(ac.verify("anything")).toBe(false);
-    expect(ac.isGrantValid(undefined)).toBe(false);
+    const reloaded = new AccessControl(file);
+    expect(reloaded.isConfigured()).toBe(false);
+    expect(reloaded.hasAccess(ALICE)).toBe(false);
+    expect(reloaded.redeem(ALICE, code).ok).toBe(false);
   });
 });

@@ -5,7 +5,6 @@ import path from "path";
 import { Wallet } from "ethers";
 import { resolveAccess } from "./bot";
 import { UserStores } from "./user-stores";
-import { AccessControl } from "./access-control";
 
 // The rule that keeps one user out of another's wallets. The bot holds other
 // people's private keys, so this boundary carries real money and is asserted
@@ -68,59 +67,5 @@ describe("resolveAccess", () => {
     const a = resolveAccess("private", 111, stores);
     const b = resolveAccess("private", 111, stores);
     expect(a.allowed && b.allowed && a.store === b.store).toBe(true);
-  });
-});
-
-// The revocation path end to end: the grant lives in each user's store, the
-// epoch lives in the gate, and a revoke has to sever them without the bot
-// touching a single user file.
-describe("granting and revoking across store and gate", () => {
-  it("lets a user back in only while their grant matches the gate", () => {
-    const gate = new AccessControl(path.join(dir, "access.json"));
-    gate.setPassword("first-password");
-
-    const alice = stores.for(111);
-    expect(gate.isGrantValid(alice.getAccessEpoch())).toBe(false); // never unlocked
-
-    alice.grantAccess(gate.epoch);
-    expect(gate.isGrantValid(alice.getAccessEpoch())).toBe(true);
-
-    gate.revokeAll("second-password");
-    // No user file was written by the revoke, yet the grant is dead.
-    expect(gate.isGrantValid(alice.getAccessEpoch())).toBe(false);
-  });
-
-  it("revokes everyone at once, not one at a time", () => {
-    const gate = new AccessControl(path.join(dir, "access.json"));
-    gate.setPassword("shared-password");
-    for (const id of [111, 222, 333]) stores.for(id).grantAccess(gate.epoch);
-    expect([111, 222, 333].every((id) => gate.isGrantValid(stores.for(id).getAccessEpoch()))).toBe(true);
-
-    gate.revokeAll("new-shared-password");
-    expect([111, 222, 333].some((id) => gate.isGrantValid(stores.for(id).getAccessEpoch()))).toBe(false);
-  });
-
-  it("leaves wallets untouched when access is revoked", () => {
-    const gate = new AccessControl(path.join(dir, "access.json"));
-    gate.setPassword("shared-password");
-    const bob = stores.for(222);
-    bob.addWallet("bobs", KEY_B.privateKey);
-    bob.grantAccess(gate.epoch);
-
-    gate.revokeAll("new-shared-password");
-    // Locked out, but nothing of theirs was destroyed — they get it back by
-    // entering the new password.
-    expect(gate.isGrantValid(bob.getAccessEpoch())).toBe(false);
-    expect(stores.for(222).listWallets()).toHaveLength(1);
-  });
-
-  it("survives a restart of both the gate and the stores", () => {
-    const gate = new AccessControl(path.join(dir, "access.json"));
-    gate.setPassword("persisted-password");
-    stores.for(111).grantAccess(gate.epoch);
-
-    const gate2 = new AccessControl(path.join(dir, "access.json"));
-    const stores2 = new UserStores(dir, PASS);
-    expect(gate2.isGrantValid(stores2.for(111).getAccessEpoch())).toBe(true);
   });
 });

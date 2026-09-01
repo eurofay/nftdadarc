@@ -368,6 +368,28 @@ export function resolveAccess(
   }
 }
 
+// Shown to someone who has never been through the door. Says what the bot
+// does, and what they're taking on by putting a key into it, BEFORE asking
+// for anything — nobody should hand over a wallet to a bot that hasn't
+// explained itself.
+export const INTRO_MESSAGE = [
+  "*Snake Minter*",
+  "",
+  "It watches wallets that mint NFTs, and mints the same drop with your wallets, seconds later — automatically, while you're asleep.",
+  "",
+  "*What it does*",
+  "• Follows any wallets you choose and copies their mints",
+  "• Mints the maximum each drop allows per wallet",
+  "• Sizes gas from the real cost, so nothing is wasted",
+  "• Sends you a card for every mint, with floor price and offers",
+  "• Lets you list or accept offers on what you minted",
+  "",
+  "*Before you start*",
+  "Your wallets are yours alone — nobody else using this bot can see them. But you add a wallet by pasting its private key into this chat, and Telegram is not end-to-end encrypted for bots. I delete the message immediately; it still passed through Telegram's servers.",
+  "",
+  "So: use a wallet made *for this bot*, funded with only what you'd shrug off losing. Never your main wallet.",
+].join("\n");
+
 export interface BotDeps {
   token: string;
   /** Retains admin powers; everyone else gets their own isolated store. */
@@ -413,49 +435,51 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
     return next();
   });
 
-  // ── The password gate ─────────────────────────────────────────────────
+  // ── The invite gate ───────────────────────────────────────────────────
   // Anyone can find this bot, so the bot is the door. The owner is never
   // gated: a bot holding real keys must not be lockable by its own door.
   bot.use(async (ctx, next) => {
     const userId = ctx.from!.id;
     if (userId === ownerId) return next();
-
-    if (access.isGrantValid(ctx.store.getAccessEpoch())) return next();
+    if (access.hasAccess(userId)) return next();
 
     if (!access.isConfigured()) {
-      return ctx.reply("This bot isn't open yet. The owner hasn't set an access password.");
+      return ctx.reply("This bot isn't open yet — the owner hasn't issued any invites.");
     }
 
-    const waitMs = access.lockoutRemainingMs(userId);
-    if (waitMs > 0) {
-      return ctx.reply(`Too many wrong attempts. Try again in ${Math.ceil(waitMs / 60000)} minute(s).`);
-    }
-
-    // Locked out: the only thing a message can be is a password attempt.
     const text = (ctx.message as any)?.text?.trim();
-    if (!text) {
-      return ctx.reply("🔒 Send the access password to use this bot.");
+
+    // No code yet: explain what this is before asking them for anything.
+    if (!text || text === "/start") {
+      await ctx.reply(INTRO_MESSAGE, { parse_mode: "Markdown" });
+      return ctx.reply("🎟 Send your invite code to continue.");
     }
 
-    // Whether right or wrong, the password shouldn't linger in the chat.
+    // A code is a bearer token — don't leave it sitting in the chat.
     await ctx.deleteMessage(ctx.message!.message_id).catch(() => {});
 
-    if (!access.verify(text)) {
+    const result = access.redeem(userId, text);
+    if (!result.ok) {
+      if (result.reason === "locked") {
+        return ctx.reply(`Too many attempts. Try again in ${Math.ceil((result.waitMs ?? 0) / 60000)} minute(s).`);
+      }
+      if (result.reason === "already-used") {
+        return ctx.reply("That code has already been used by someone else. Ask the owner for your own.");
+      }
+      if (result.reason === "revoked") {
+        return ctx.reply("That code has been revoked. Ask the owner for a new one.");
+      }
       const locked = access.recordFailure(userId);
       return ctx.reply(
         locked > 0
-          ? `❌ Wrong password. Locked for ${Math.ceil(locked / 60000)} minute(s).`
-          : "❌ Wrong password."
+          ? `❌ Invalid code. Locked for ${Math.ceil(locked / 60000)} minute(s).`
+          : "❌ Invalid code."
       );
     }
 
-    access.clearFailures(userId);
-    ctx.store.grantAccess(access.epoch);
     return ctx.reply(
-      "✅ Access granted.\n\n" +
-        "Your wallets and settings are your own — nobody else using this bot can see them. " +
-        "Fund a wallet you're willing to risk: keys arrive over Telegram, which isn't " +
-        "end-to-end encrypted for bots.",
+      "✅ You're in.\n\n" +
+        "Start by adding a wallet, then choose wallets to copy. Nothing mints until you turn Copy Mint on.",
       mainMenu()
     );
   });
@@ -1607,53 +1631,62 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
   }
 
   // ── Access control (owner only) ───────────────────────────────────────
-  // Deliberately commands rather than menu buttons: a password typed into a
-  // chat is bad enough without a tappable button that invites doing it often.
-  bot.command("password", async (ctx) => {
+  bot.command("invite", async (ctx) => {
     if (ctx.from!.id !== ownerId) return;
-    const next = ctx.message.text.split(/\s+/).slice(1).join(" ").trim();
-    await ctx.deleteMessage(ctx.message.message_id).catch(() => {});
-    if (!next) {
-      return ctx.reply(
-        access.isConfigured()
-          ? "A password is set. Send /password <new> to change it — people already in stay in.\nUse /revokeall <new> to change it AND remove everyone."
-          : "No password set. Send /password <new> to open the bot to other people."
-      );
-    }
-    try {
-      access.setPassword(next);
-      return ctx.reply(
-        "✅ Password set. New people can join with it.\n\n" +
-          "Anyone already granted access keeps it — use /revokeall <new> if you need to remove them."
-      );
-    } catch (err: any) {
-      return ctx.reply(`❌ ${err.message}`);
-    }
+    const label = ctx.message.text.split(/\s+/).slice(1).join(" ").trim();
+    const { code, record } = access.createInvite(label);
+    // Sent on its own so it can be forwarded to one person, and shown once:
+    // only the hash is stored, so this cannot be read back later.
+    return ctx.reply(
+      `🎟 Invite code${record.label ? ` for ${record.label}` : ""}:\n\n` +
+        `${code}\n\n` +
+        `Single use — it belongs to whoever redeems it first.\n` +
+        `Revoke just this one later with /revoke ${record.id}\n\n` +
+        `I can't show it again; only its hash is stored.`
+    );
   });
 
-  bot.command("revokeall", async (ctx) => {
+  bot.command("invites", (ctx) => {
     if (ctx.from!.id !== ownerId) return;
-    const next = ctx.message.text.split(/\s+/).slice(1).join(" ").trim();
-    await ctx.deleteMessage(ctx.message.message_id).catch(() => {});
-    if (!next) {
-      return ctx.reply(
-        "Send /revokeall <new password>.\n\n" +
-          "This removes EVERYONE currently using the bot and replaces the password in " +
-          "one step. A new password alone would leave people already inside; kicking " +
-          "them out alone would leave the leaked password working."
-      );
-    }
-    try {
-      const epoch = access.revokeAll(next);
-      const others = stores.listUserIds().filter((id) => id !== ownerId).length;
-      return ctx.reply(
-        `✅ Revoked. ${others} user(s) removed and must enter the new password.\n\n` +
-          "The old password no longer works. Nobody's wallets were touched — their " +
-          `keys and settings are intact behind the door. (access epoch ${epoch})`
-      );
-    } catch (err: any) {
-      return ctx.reply(`❌ ${err.message} — nothing was changed.`);
-    }
+    const codes = access.listCodes();
+    if (codes.length === 0) return ctx.reply("No invites yet. /invite [name] to create one.");
+    const lines = codes.map((c) => {
+      const who = c.redeemedBy ? `user ${c.redeemedBy}` : "unredeemed";
+      const state = c.revoked
+        ? "🚫 revoked"
+        : c.redeemedBy === undefined
+          ? "⏳ unused"
+          : c.epochAtRedeem === access.epoch
+            ? "✅ active"
+            : "🔒 revoked (all)";
+      return `${state} · ${c.id}${c.label ? ` · ${c.label}` : ""} · ${who}`;
+    });
+    return ctx.reply(`Invites (${codes.length}):\n\n${lines.join("\n")}\n\n/revoke <id> removes one.`);
+  });
+
+  bot.command("revoke", (ctx) => {
+    if (ctx.from!.id !== ownerId) return;
+    const id = ctx.message.text.split(/\s+/)[1]?.trim();
+    if (!id) return ctx.reply("Send /revoke <id> — /invites lists the ids.");
+    const code = access.revokeCode(id);
+    if (!code) return ctx.reply(`No invite with id ${id}.`);
+    return ctx.reply(
+      `✅ Revoked ${id}${code.label ? ` (${code.label})` : ""}.\n\n` +
+        (code.redeemedBy
+          ? `User ${code.redeemedBy} is locked out. Nobody else is affected, and their wallets are untouched.`
+          : "That code was never used, so nobody was using it.")
+    );
+  });
+
+  bot.command("revokeall", (ctx) => {
+    if (ctx.from!.id !== ownerId) return;
+    const epoch = access.revokeAll();
+    const others = access.listCodes().filter((c) => c.redeemedBy !== undefined).length;
+    return ctx.reply(
+      `✅ Revoked everyone. ${others} redeemed code(s) are now dead.\n\n` +
+        "Every existing invite is invalid — issue fresh ones with /invite. " +
+        `Nobody's wallets were touched. (epoch ${epoch})`
+    );
   });
 
   bot.command("users", (ctx) => {
@@ -1661,12 +1694,12 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
     const ids = stores.listUserIds();
     const lines = ids.map((id) => {
       const store = stores.for(id);
-      const inside = id === ownerId || access.isGrantValid(store.getAccessEpoch());
+      const inside = id === ownerId || access.hasAccess(id);
       return `${inside ? "✅" : "🔒"} ${id}${id === ownerId ? " (you)" : ""} — ${store.listWallets().length} wallet(s)`;
     });
     return ctx.reply(
-      `Users with a store on this bot: ${ids.length}\n\n${lines.join("\n") || "(none yet)"}\n\n` +
-        "✅ has access · 🔒 needs the password"
+      `Users with a store: ${ids.length}\n\n${lines.join("\n") || "(none yet)"}\n\n` +
+        "✅ has access · 🔒 locked out"
     );
   });
 
