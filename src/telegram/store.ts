@@ -4,6 +4,7 @@
 
 import fs from "fs";
 import path from "path";
+import { randomBytes } from "crypto";
 import { Wallet } from "ethers";
 import { encrypt, decrypt } from "./crypto";
 
@@ -99,7 +100,29 @@ export interface BotSettings {
   activityOfferVsFloorPct: number;
 }
 
+/**
+ * A mint armed for a future stage opening.
+ *
+ * Persisted because the wait is long — hours, usually — and a redeploy or a
+ * crash in the middle of it must not silently drop the mint the user is
+ * counting on. On boot every pending record is re-armed.
+ */
+export interface ScheduledMint {
+  id: string;
+  chainKey: string;
+  nftContract: string;
+  name?: string;
+  slug?: string;
+  quantity: number;
+  wallets: string[];
+  targetStartMs: number;
+  createdAt: number;
+  status: "pending" | "fired" | "failed" | "cancelled";
+  note?: string;
+}
+
 interface StoreData {
+  scheduled: ScheduledMint[];
   wallets: WalletRecord[];
   copyTargets: CopyTarget[];
   mints: MintRecord[];
@@ -135,7 +158,7 @@ export class TelegramStore {
 
   private load(): StoreData {
     if (!fs.existsSync(this.filePath)) {
-      return { wallets: [], copyTargets: [], mints: [], copyHistory: [], settings: { ...DEFAULT_SETTINGS } };
+      return { scheduled: [], wallets: [], copyTargets: [], mints: [], copyHistory: [], settings: { ...DEFAULT_SETTINGS } };
     }
     const raw = JSON.parse(fs.readFileSync(this.filePath, "utf8"));
     return {
@@ -143,6 +166,7 @@ export class TelegramStore {
       copyTargets: raw.copyTargets ?? [],
       mints: raw.mints ?? [],
       copyHistory: raw.copyHistory ?? [],
+      scheduled: raw.scheduled ?? [],
       settings: { ...DEFAULT_SETTINGS, ...(raw.settings ?? {}) },
     };
   }
@@ -256,6 +280,44 @@ export class TelegramStore {
     const removed = this.data.copyTargets.length !== before;
     if (removed) this.save();
     return removed;
+  }
+
+  // ── Scheduled mints ──────────────────────────────────────────────────
+  addScheduled(entry: Omit<ScheduledMint, "id" | "createdAt" | "status">): ScheduledMint {
+    const record: ScheduledMint = {
+      ...entry,
+      id: randomBytes(4).toString("hex"),
+      createdAt: Date.now(),
+      status: "pending",
+    };
+    this.data.scheduled.push(record);
+    this.save();
+    return record;
+  }
+
+  listScheduled(): ScheduledMint[] {
+    return [...this.data.scheduled].sort((a, b) => a.targetStartMs - b.targetStartMs);
+  }
+
+  /** Only the ones still waiting — what a restart needs to re-arm. */
+  listPendingScheduled(): ScheduledMint[] {
+    return this.listScheduled().filter((s) => s.status === "pending");
+  }
+
+  updateScheduled(id: string, patch: Partial<Pick<ScheduledMint, "status" | "note">>): ScheduledMint | null {
+    const record = this.data.scheduled.find((s) => s.id === id);
+    if (!record) return null;
+    Object.assign(record, patch);
+    this.save();
+    return record;
+  }
+
+  removeScheduled(id: string): boolean {
+    const before = this.data.scheduled.length;
+    this.data.scheduled = this.data.scheduled.filter((s) => s.id !== id);
+    if (this.data.scheduled.length === before) return false;
+    this.save();
+    return true;
   }
 
   listCopyTargets(): CopyTarget[] {

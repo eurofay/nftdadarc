@@ -423,3 +423,70 @@ describe("save durability", () => {
     }
   });
 });
+
+describe("scheduled mints", () => {
+  const base = {
+    chainKey: "robinhood",
+    nftContract: "0x922fd5da48db5d65da7804d1bb12712311 13e5b5".replace(/ /g, ""),
+    quantity: 2,
+    wallets: ["0xE607f2b18daE93e1f5D4c5a5C71b1d1070823ba0"],
+    targetStartMs: Date.now() + 3_600_000,
+  };
+
+  function fresh(): TelegramStore {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sched-"));
+    return new TelegramStore(path.join(dir, "s.json"), "pass");
+  }
+
+  it("survives a restart — the whole reason it's persisted", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sched-"));
+    const file = path.join(dir, "s.json");
+    const id = new TelegramStore(file, "pass").addScheduled(base).id;
+    // A redeploy mid-wait used to drop this entirely.
+    const after = new TelegramStore(file, "pass").listPendingScheduled();
+    expect(after.map((r) => r.id)).toEqual([id]);
+  });
+
+  it("starts pending and carries the label fields for a readable notice", () => {
+    const store = fresh();
+    const rec = store.addScheduled({ ...base, name: "GOAT STATE", slug: "goat-state" });
+    expect(rec.status).toBe("pending");
+    expect(rec.name).toBe("GOAT STATE");
+    expect(rec.slug).toBe("goat-state");
+  });
+
+  it("lists soonest first, so the next one to fire is obvious", () => {
+    const store = fresh();
+    const later = store.addScheduled({ ...base, targetStartMs: 3000 });
+    const sooner = store.addScheduled({ ...base, targetStartMs: 1000 });
+    expect(store.listScheduled().map((r) => r.id)).toEqual([sooner.id, later.id]);
+  });
+
+  it("drops fired and failed ones from the pending set", () => {
+    const store = fresh();
+    const a = store.addScheduled(base);
+    const b = store.addScheduled(base);
+    store.updateScheduled(a.id, { status: "fired", note: "1 wallet(s) minted" });
+    expect(store.listPendingScheduled().map((r) => r.id)).toEqual([b.id]);
+    expect(store.listScheduled()).toHaveLength(2); // history is kept
+  });
+
+  it("records why one failed, so the chat message isn't the only trace", () => {
+    const store = fresh();
+    const rec = store.addScheduled(base);
+    store.updateScheduled(rec.id, { status: "failed", note: "missed while the bot was offline" });
+    expect(store.listScheduled()[0].note).toMatch(/offline/);
+  });
+
+  it("can be cancelled before it fires", () => {
+    const store = fresh();
+    const rec = store.addScheduled(base);
+    expect(store.removeScheduled(rec.id)).toBe(true);
+    expect(store.listPendingScheduled()).toEqual([]);
+    expect(store.removeScheduled(rec.id)).toBe(false);
+  });
+
+  it("reports an unknown id rather than pretending it updated", () => {
+    expect(fresh().updateScheduled("nope", { status: "fired" })).toBeNull();
+  });
+});

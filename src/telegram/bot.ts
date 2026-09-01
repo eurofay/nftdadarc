@@ -10,7 +10,7 @@ import { message } from "telegraf/filters";
 import { isAddress, formatEther, parseEther } from "ethers";
 import { generateMnemonic, deriveWallets, isValidMnemonic } from "../hd-wallet";
 import { createProvider } from "../rpc-provider";
-import { TelegramStore, WalletRecord } from "./store";
+import { TelegramStore, WalletRecord, ScheduledMint } from "./store";
 import { UserStores } from "./user-stores";
 import { ask, BotSnapshot } from "./agent";
 import { AccessControl } from "./access-control";
@@ -73,6 +73,7 @@ import { acceptOfferViaSdk, acceptOfferWithFallback, createListing, parseListing
 import { createLogger, withPrefix, LogSink } from "../logger";
 import { istTimeToDate, toIST } from "../time-format";
 import { renderBatch, chunkMessage } from "./format";
+import { measureLatency, renderLatency } from "../rpc-latency";
 
 interface SessionData {
   step?:
@@ -1409,6 +1410,22 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
     );
   });
 
+  // Re-arm every user's pending scheduled mints. A redeploy in the middle of
+  // a long wait used to drop them silently — the record said "pending" and
+  // nothing was waiting on it.
+  for (const userId of stores.listUserIds()) {
+    try {
+      const count = rearmScheduled(userId);
+      if (count > 0 && userId === ownerId) {
+        bot.telegram
+          .sendMessage(ownerId, `⏰ Re-armed ${count} scheduled mint(s) after restart.`)
+          .catch(() => {});
+      }
+    } catch (err: any) {
+      console.error(`Could not re-arm schedules for ${userId}: ${err?.message ?? err}`);
+    }
+  }
+
   // Resume automatically on every bot start if it was left "on" — same
   // reasoning as Auto Mint: a restart shouldn't silently turn this off
   // until someone notices and taps the button again. Never let this stop
@@ -1769,6 +1786,25 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
     );
   });
 
+  // Latency can only be measured from where the bot actually runs — a
+  // laptop's numbers say nothing about the server's.
+  bot.command("latency", async (ctx) => {
+    if (!requireOwner(ctx)) return;
+    const settings = ctx.store.getSettings();
+    const chain = resolveChain(settings.chainKey);
+    const { urls } = resolveRpcsForChain(settings.chainKey);
+    const note = await ctx.reply("📡 Measuring…");
+    const samples = await measureLatency(urls);
+    return ctx.telegram
+      .editMessageText(
+        note.chat.id,
+        note.message_id,
+        undefined,
+        renderLatency(samples, chain?.blockSeconds ?? 12)
+      )
+      .catch(() => {});
+  });
+
   bot.command("ask", async (ctx) => {
     if (!requireOwner(ctx)) return;
     const question = ctx.message.text.split(/\s+/).slice(1).join(" ").trim();
@@ -1996,6 +2032,15 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
     return ctx.editMessageText("Cancelled.", menuFor(ctx));
   });
 
+  /**
+   * Arm a scheduled mint.
+   *
+   * The wait is deliberately NOT awaited here. Telegraf wraps every handler in
+   * a 90-second timeout (`handlerTimeout`), so awaiting a stage that opens
+   * hours from now guaranteed "Promise timed out after 90000 milliseconds" —
+   * the mint kept running in the background, but the user was told it failed.
+   * The work is detached and reports its own progress by message instead.
+   */
   async function fireScheduled(ctx: BotContext, targetStart: Date | null): Promise<void> {
     const { schedContract, schedWallets, schedQuantity } = ctx.session;
     if (!schedContract || !schedWallets?.length || !schedQuantity) {
@@ -2004,28 +2049,74 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
     }
     resetSchedSession(ctx);
     await ctx.answerCbQuery(targetStart ? "Scheduled." : "Firing...");
-    await ctx.editMessageText(
-      targetStart ? `Scheduled for ${toIST(targetStart)} IST — status below when it fires.` : "Firing — status below."
-    );
 
     const settings = ctx.store.getSettings();
-    const { urls } = resolveRpcsForChain(settings.chainKey);
-    const logger = createLogger(createTelegramSink(bot, ctx.chat!.id));
+    const chatId = ctx.chat!.id;
+
+    // Name and link, best-effort: a contract address alone is unreadable when
+    // the confirmation arrives hours later.
+    const info = await openseaContractInfo(settings.chainKey, schedContract, process.env.OPENSEA_API_KEY).catch(
+      () => null
+    );
+
+    const record = ctx.store.addScheduled({
+      chainKey: settings.chainKey,
+      nftContract: schedContract,
+      name: info?.name,
+      slug: info?.slug,
+      quantity: schedQuantity,
+      wallets: [...schedWallets],
+      targetStartMs: targetStart ? targetStart.getTime() : Date.now(),
+    });
+
+    await ctx.editMessageText(
+      describeScheduled(record, targetStart) +
+        (targetStart ? "\n\nIt survives a restart — I'll report here when it fires." : "")
+    );
+
+    void runScheduled(ctx.store, record.id, chatId);
+  }
+
+  /** Human-readable summary of an armed mint. */
+  function describeScheduled(record: ScheduledMint, targetStart: Date | null): string {
+    const lines = [
+      record.name ? `📌 ${record.name}` : `📌 ${record.nftContract}`,
+      record.slug ? openseaCollectionUrl(record.slug) : "",
+      "",
+      `Contract: ${record.nftContract}`,
+      `Quantity: ${record.quantity} per wallet · ${record.wallets.length} wallet(s)`,
+      targetStart ? `Fires: ${toIST(targetStart)} IST` : "Firing now.",
+    ];
+    return lines.filter((l) => l !== "").join("\n");
+  }
+
+  /**
+   * Run one armed mint to completion. Detached from any handler, so it may
+   * wait for hours; every outcome is reported to the chat and written back to
+   * the record, which is what makes a restart able to pick this up again.
+   */
+  async function runScheduled(store: TelegramStore, id: string, chatId: number): Promise<void> {
+    const record = store.listScheduled().find((r) => r.id === id);
+    if (!record || record.status !== "pending") return;
+
+    const settings = store.getSettings();
+    const { urls } = resolveRpcsForChain(record.chainKey);
+    const logger = createLogger(createTelegramSink(bot, chatId));
+    const label = record.name || record.nftContract;
+
     try {
-      const plan = await buildLocalMintPlan(urls[0], schedContract, schedQuantity);
+      const plan = await buildLocalMintPlan(urls[0], record.nftContract, record.quantity);
       if (!plan) {
-        logger.errorBold("Drop is no longer resolvable on-chain — nothing fired.");
+        store.updateScheduled(id, { status: "failed", note: "drop not resolvable on-chain" });
+        logger.errorBold(`${label}: drop is no longer resolvable on-chain — nothing fired.`);
         return;
       }
-      // localPublicSnipe itself waits for targetStart internally (same
-      // engine the CLI's "wait for stage" uses) — awaiting it here just
-      // means this promise resolves whenever it eventually fires, which
-      // can be a long time from now. That's fine: Node doesn't block on a
-      // pending await, so the bot keeps handling everything else meanwhile.
+
+      const targetStart = record.targetStartMs > Date.now() ? new Date(record.targetStartMs) : null;
       const outcome = await localPublicSnipe({
-        nftContract: schedContract,
-        quantity: schedQuantity,
-        walletKeys: schedWallets.map((addr) => ctx.store.getDecryptedKey(addr)),
+        nftContract: record.nftContract,
+        quantity: record.quantity,
+        walletKeys: record.wallets.map((addr) => store.getDecryptedKey(addr)),
         rpcUrls: urls,
         maxFeePerGas: gweiToWei(settings.maxFeeGwei),
         maxPriorityFee: gweiToWei(settings.priorityGwei),
@@ -2034,15 +2125,39 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
         plan,
         logger,
       });
-      await recordOutcome(ctx.store, settings.chainKey, outcome, {
-        bot,
-        chatId: ctx.chat!.id,
-        source: "Scheduled Mint",
+
+      store.updateScheduled(id, {
+        status: outcome.minted.length > 0 ? "fired" : "failed",
+        note: outcome.minted.length > 0 ? `${outcome.minted.length} wallet(s) minted` : "no confirmed mint",
       });
+      await recordOutcome(store, record.chainKey, outcome, { bot, chatId, source: "Scheduled Mint" });
     } catch (err: any) {
-      logger.errorBold(`Scheduled mint failed: ${err.message}`);
+      store.updateScheduled(id, { status: "failed", note: err?.message ?? String(err) });
+      logger.errorBold(`${label}: scheduled mint failed — ${err?.message ?? err}`);
     }
   }
+
+  /**
+   * Re-arm everything still pending after a restart.
+   *
+   * Without this a redeploy silently dropped every armed mint: the record
+   * said "pending" forever and nothing was waiting on it.
+   */
+  function rearmScheduled(userId: number): number {
+    const store = stores.for(userId);
+    const pending = store.listPendingScheduled();
+    for (const record of pending) {
+      // Long past its moment and clearly missed while the process was down —
+      // say so rather than firing into a stage that closed hours ago.
+      if (record.targetStartMs < Date.now() - 60 * 60 * 1000) {
+        store.updateScheduled(record.id, { status: "failed", note: "missed while the bot was offline" });
+        continue;
+      }
+      void runScheduled(store, record.id, userId);
+    }
+    return pending.length;
+  }
+
 
   // Picking a time doesn't fire anything yet — it stages the choice and
   // shows a confirm step, same "always confirm before a deliberate one-off
