@@ -160,3 +160,26 @@ describe("parseAllowListInput", () => {
     expect(() => parseAllowListInput(JSON.stringify({ proof: [keccak256("0x01")] }))).toThrow(/Missing mint param/);
   });
 });
+
+// The confirm step hands these through the session, which is plain JSON —
+// bigints don't survive it, so they go across as strings and come back.
+describe("session round-trip of mint params", () => {
+  it("survives being flattened to JSON and revived", () => {
+    const flat = JSON.stringify(PARAMS, (_k, v) => (typeof v === "bigint" ? v.toString() : v));
+    const raw = JSON.parse(flat);
+    const revived: MintParams = {
+      mintPrice: BigInt(raw.mintPrice),
+      maxTotalMintableByWallet: BigInt(raw.maxTotalMintableByWallet),
+      startTime: BigInt(raw.startTime),
+      endTime: BigInt(raw.endTime),
+      dropStageIndex: BigInt(raw.dropStageIndex),
+      maxTokenSupplyForStage: BigInt(raw.maxTokenSupplyForStage),
+      feeBps: BigInt(raw.feeBps),
+      restrictFeeRecipients: Boolean(raw.restrictFeeRecipients),
+    };
+    expect(revived).toEqual(PARAMS);
+    // The leaf must be identical, or the proof verified before the confirm
+    // would no longer match the one actually sent.
+    expect(allowListLeaf(A, revived)).toBe(allowListLeaf(A, PARAMS));
+  });
+});

@@ -21,6 +21,7 @@ import {
   adminMenu,
   adminRevokeConfirmMenu,
   restoreConfirmMenu,
+  allowlistConfirmMenu,
   adminInvitesMenu,
   walletsMenu,
   walletDetailMenu,
@@ -63,7 +64,7 @@ import {
   groupByCollection,
   openseaCollectionUrl,
 } from "../opensea-market";
-import { buildLocalMintPlan } from "../seadrop-public";
+import { resolveFeeRecipient, buildLocalMintPlan } from "../seadrop-public";
 import { localPublicSnipe } from "../local-mint";
 import { runAutoMintWatcher } from "../auto-mint";
 import { runCopyMintWatcher } from "../copy-mint";
@@ -74,7 +75,13 @@ import { MintCardData } from "../mint-card";
 import { gasLimitForQuantity, upfrontReservation } from "../gas";
 import { raceRead, raceReadOrNull } from "../fast-read";
 import { readStages, describeStages, checkEligibility, describeEligibility } from "../seadrop-stages";
-import { fetchAllowListRoot, checkAllowListProof, parseAllowListInput } from "../seadrop-allowlist";
+import {
+  fetchAllowListRoot,
+  checkAllowListProof,
+  parseAllowListInput,
+  encodeMintAllowList,
+  MintParams,
+} from "../seadrop-allowlist";
 import { renderMintCardPng } from "../mint-card-render";
 import { acceptOfferViaSdk, acceptOfferWithFallback, createListing, parseListingPrice } from "../opensea-sell";
 import { createLogger, withPrefix, LogSink } from "../logger";
@@ -112,7 +119,8 @@ interface SessionData {
   sellSlug?: string;
   sellPriceEth?: number;
   pendingRestore?: string;
-  allowlistContract?: string; // snapshot JSON held between upload and confirm
+  allowlistContract?: string;
+  allowlistReady?: { contract: string; wallets: string[]; params: string; proof: string[]; quantity: number }; // snapshot JSON held between upload and confirm
 }
 interface BotContext extends Context {
   session: SessionData;
@@ -2160,7 +2168,81 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
   // project publishes the list, the holder of a wallet on it can mint without
   // anyone's blessing. Signed stages are a different thing entirely and no
   // amount of this helps them; see seadrop-allowlist.ts.
+  bot.action("allowlist:fire", async (ctx) => {
+    if (!requireOwner(ctx)) return;
+    const ready = ctx.session.allowlistReady;
+    ctx.session.allowlistReady = undefined;
+    if (!ready) return ctx.answerCbQuery("That expired — run /allowlist again.", { show_alert: true });
+
+    await ctx.answerCbQuery("Firing...");
+    const settings = ctx.store.getSettings();
+    const { urls } = resolveRpcsForChain(settings.chainKey);
+    const logger = createLogger(createTelegramSink(bot, ctx.chat!.id));
+
+    // Revive the params the session had to flatten to strings.
+    const raw = JSON.parse(ready.params);
+    const params: MintParams = {
+      mintPrice: BigInt(raw.mintPrice),
+      maxTotalMintableByWallet: BigInt(raw.maxTotalMintableByWallet),
+      startTime: BigInt(raw.startTime),
+      endTime: BigInt(raw.endTime),
+      dropStageIndex: BigInt(raw.dropStageIndex),
+      maxTokenSupplyForStage: BigInt(raw.maxTokenSupplyForStage),
+      feeBps: BigInt(raw.feeBps),
+      restrictFeeRecipients: Boolean(raw.restrictFeeRecipients),
+    };
+
+    try {
+      const fee = await raceRead(urls, (url) => resolveFeeRecipient(url, ready.contract, params.restrictFeeRecipients));
+      if (!fee) {
+        return ctx.reply("Couldn't resolve an allowed fee recipient for that collection — nothing sent.");
+      }
+
+      const encoded = encodeMintAllowList(ready.contract, fee.address, ready.quantity, params, ready.proof);
+
+      // Reuse the public-mint engine: it pre-signs, keeps sockets warm and
+      // blasts every endpoint in parallel. Only the calldata differs, so the
+      // stage terms are presented in the shape it already understands.
+      const outcome = await localPublicSnipe({
+        nftContract: ready.contract,
+        quantity: ready.quantity,
+        walletKeys: ready.wallets.map((a) => ctx.store.getDecryptedKey(a)),
+        rpcUrls: urls,
+        maxFeePerGas: gweiToWei(settings.maxFeeGwei),
+        maxPriorityFee: gweiToWei(settings.priorityGwei),
+        gasLimit: settings.gasLimit,
+        targetStart: null,
+        plan: {
+          to: encoded.to,
+          data: encoded.data,
+          value: encoded.value,
+          feeRecipient: fee.address,
+          drop: {
+            mintPrice: params.mintPrice,
+            startTime: Number(params.startTime),
+            endTime: Number(params.endTime),
+            maxTotalMintableByWallet: Number(params.maxTotalMintableByWallet),
+            feeBps: Number(params.feeBps),
+            restrictFeeRecipients: params.restrictFeeRecipients,
+          },
+        },
+        logger,
+      });
+
+      await recordOutcome(ctx.store, settings.chainKey, outcome, {
+        bot,
+        chatId: ctx.chat!.id,
+        source: "Manual Mint",
+      });
+    } catch (err: any) {
+      logger.errorBold(`Allow-list mint failed: ${err?.message ?? err}`);
+    }
+  });
+
   bot.command("allowlist", async (ctx) => {
+    // Owner only. This spends from wallets against terms pasted in by hand,
+    // with no on-chain price to sanity-check them against.
+    if (!requireOwner(ctx)) return;
     const contract = ctx.message.text.split(/\s+/)[1]?.trim();
     if (!contract || !isAddress(contract)) {
       return ctx.reply(
@@ -2704,6 +2786,7 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
 
     if (step === "awaiting_allowlist_json") {
       ctx.session.step = undefined;
+      if (!requireOwner(ctx)) return;
       const contract = ctx.session.allowlistContract;
       ctx.session.allowlistContract = undefined;
       if (!contract) return ctx.reply("That request expired — run /allowlist <contract> again.");
@@ -2748,10 +2831,22 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
         );
       }
 
+      const quantity = Number(parsed.params.maxTotalMintableByWallet);
+      ctx.session.allowlistReady = {
+        contract,
+        wallets: eligible,
+        // BigInt doesn't survive the session's plain-JSON shape.
+        params: JSON.stringify(parsed.params, (_k, v) => (typeof v === "bigint" ? v.toString() : v)),
+        proof: parsed.proof,
+        quantity,
+      };
+
+      const priceEth = formatEther(parsed.params.mintPrice * BigInt(quantity));
       return ctx.reply(
         `${lines.join("\n")}\n\n` +
-          `Ready to mint from the allow-list stage with ${eligible.length} wallet(s). ` +
-          "Nothing has been sent — allow-list firing from the menu is the next piece."
+          `Mint ${quantity} per wallet from the allow-list stage, ${eligible.length} wallet(s)?\n` +
+          `Cost: ${priceEth} ETH per wallet plus gas.`,
+        allowlistConfirmMenu()
       );
     }
 

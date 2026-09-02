@@ -35,6 +35,13 @@ export function adminMenu(inviteCount: number, userCount: number) {
 
 // A restore destroys whatever is there now, so it asks first — and says what
 // is about to be lost rather than a generic "are you sure".
+export function allowlistConfirmMenu() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback("🔥 Mint now", "allowlist:fire")],
+    [Markup.button.callback("Cancel", "menu:main")],
+  ]);
+}
+
 export function restoreConfirmMenu() {
   return Markup.inlineKeyboard([
     [Markup.button.callback("Yes, replace everything", "admin:restore:confirm")],
