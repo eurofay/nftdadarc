@@ -50,7 +50,7 @@ export interface MintSighting {
 // "fast on a plan the caller might not have." Raise it via the chunkBlocks
 // param (AUTO_LOG_CHUNK_BLOCKS at the CLI layer) if your provider allows more —
 // it only affects catch-up speed after downtime, not steady-state polling.
-const DEFAULT_CHUNK_BLOCKS = 10;
+export const DEFAULT_CHUNK_BLOCKS = 10;
 
 export async function scanPublicDropUpdates(
   rpcUrl: string,
@@ -110,6 +110,21 @@ export interface ScanOpts {
   chunkDelayMs?: number;
   /** Attempts per chunk before the scan gives up. */
   retriesPerChunk?: number;
+  // Called after every chunk that succeeds, with the highest block covered so
+  // far and that chunk's sightings.
+  //
+  // Without this a scan is all-or-nothing: one chunk failing at the end throws
+  // away every chunk already fetched, and the caller can only rescan the whole
+  // range from the start. Over a long backfill — a 12h Robinhood window is
+  // hundreds of thousands of blocks — that is not a slow scan, it is a scan
+  // that mathematically never finishes, because the odds of getting through
+  // every chunk without one transient failure fall to nothing.
+  onProgress?: (scannedThrough: number, found: MintSighting[]) => void;
+  // Checked before each chunk. A long scan is otherwise uninterruptible: a
+  // 12h Robinhood backfill at a small chunk is tens of thousands of sequential
+  // calls, so a watcher told to stop would keep hitting the RPC for as long as
+  // that scan had left to run. Returns what it has covered so far.
+  shouldStop?: () => boolean;
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -143,6 +158,7 @@ export async function scanSeaDropMints(
   let first = true;
 
   for (let start = fromBlock; start <= toBlock; start += chunkBlocks) {
+    if (opts.shouldStop?.()) break;
     const end = Math.min(start + chunkBlocks - 1, toBlock);
 
     if (!first && delayMs > 0) await sleep(delayMs);
@@ -168,16 +184,21 @@ export async function scanSeaDropMints(
       }
     }
 
+    const found: MintSighting[] = [];
     for (const log of logs) {
       const parsed = IFACE.parseLog({ topics: [...log.topics], data: log.data });
       if (!parsed) continue;
-      sightings.push({
+      found.push({
         nftContract: parsed.args.nftContract,
         minter: parsed.args.minter,
         txHash: log.transactionHash,
         blockNumber: log.blockNumber,
       });
     }
+    sightings.push(...found);
+    // Reported per chunk, not at the end, so a caller keeps the work a later
+    // chunk's failure would otherwise discard.
+    opts.onProgress?.(end, found);
   }
 
   return sightings;
