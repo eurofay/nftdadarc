@@ -99,6 +99,10 @@ async function setUp(quantityPerWallet: number | undefined) {
     pollIntervalMs: 30,
     maxPriceEth: 1,
     quantityPerWallet,
+    // These cover the quantity cap, not the backfill. Left at the default the
+    // watcher would scan a 12h window through paced chunks and still be
+    // scanning when the test stops it.
+    backfillBlocks: 0,
   });
 
   // Needs enough ticks to clear the 2-block reorg-safety margin the watcher
