@@ -212,6 +212,19 @@ from Telegram instead of a terminal:
   rebuilds the plan from fresh on-chain state via the same `buildLocalMintPlan`
   everything else uses. Persistent the same way Auto Mint is: turning it on
   survives a bot restart and resumes automatically, no tap needed.
+
+  On startup it backfills (12h by default) so drops a watched wallet minted
+  while the bot was down aren't lost. That backfill is walked with one
+  `eth_getLogs` per block-chunk, and the chunk size matters enormously on a
+  fast chain: Robinhood produces ~10 blocks/second, so 12 hours is ~432,000
+  blocks — 216 calls at its native 2000-block chunk, but **43,200** at 10.
+  Each chain's measured limit is built in, so leave `AUTO_LOG_CHUNK_BLOCKS`
+  unset; setting that global overrides every chain at once, and a value
+  picked for Alchemy's 10-block free tier will silently drop Robinhood to a
+  backfill that takes hours and times out on the way. Use the per-chain form
+  (`AUTO_LOG_CHUNK_BLOCKS_ROBINHOOD=2000`) if you need to override one. If
+  the chunk size is making the backfill unreasonable, the watcher says so in
+  the chat when it starts.
 - **Quantity caps** — "free" still costs gas, and gas scales with how many
   tokens you mint (a drop's stated per-wallet max can be huge — 4000+ isn't
   unusual). Settings has a max-quantity cap for both **Auto max qty** (Auto

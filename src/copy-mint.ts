@@ -17,7 +17,7 @@
 
 import { Wallet, formatEther } from "ethers";
 import { buildLocalMintPlan } from "./seadrop-public";
-import { scanSeaDropMints } from "./seadrop-events";
+import { DEFAULT_CHUNK_BLOCKS, MintSighting, scanSeaDropMints } from "./seadrop-events";
 import { localPublicSnipe, SnipeOutcome } from "./local-mint";
 import { backoffMs, createProvider, describeRpcError } from "./rpc-provider";
 import { ChainProfile, backfillBlocksFor, catchupBlocksFor } from "./chains";
@@ -41,21 +41,54 @@ export interface WatchedMint {
   blockNumber: number;
 }
 
+function toWatchedMint(s: MintSighting): WatchedMint {
+  return {
+    txHash: s.txHash,
+    from: s.minter,
+    nftContract: s.nftContract,
+    blockNumber: s.blockNumber,
+  };
+}
+
+export interface WatchedScanOpts {
+  // Receives each chunk as it lands, so a scan that dies part-way still hands
+  // back the ground it covered. See ScanOpts.onProgress in seadrop-events.ts.
+  onProgress?: (scannedThrough: number, found: WatchedMint[]) => void;
+  /** Checked between chunks, so a long scan can be cut short. */
+  shouldStop?: () => boolean;
+}
+
 export async function scanWatchedMints(
   rpcUrl: string,
   fromBlock: number,
   toBlock: number,
   watchTargets: string[],
-  chunkBlocks?: number
+  chunkBlocks?: number,
+  opts: WatchedScanOpts = {}
 ): Promise<WatchedMint[]> {
-  const sightings = await scanSeaDropMints(rpcUrl, fromBlock, toBlock, watchTargets, chunkBlocks);
-  return sightings.map((s) => ({
-    txHash: s.txHash,
-    from: s.minter,
-    nftContract: s.nftContract,
-    blockNumber: s.blockNumber,
-  }));
+  const { onProgress } = opts;
+  const sightings = await scanSeaDropMints(rpcUrl, fromBlock, toBlock, watchTargets, chunkBlocks, {
+    onProgress: onProgress && ((through, found) => onProgress(through, found.map(toWatchedMint))),
+    shouldStop: opts.shouldStop,
+  });
+  return sightings.map(toWatchedMint);
 }
+
+// Halving the block range only helps when the provider is complaining about
+// the RANGE. A timeout or a rate-limit is the endpoint saying "too many
+// calls", and halving the chunk DOUBLES the call count — strictly the wrong
+// response. Retrying a timeout smaller is how a scan already at the 10-block
+// floor ends up logging "failed at chunk 10 — retrying at 10" on a loop:
+// the resize was both a no-op and the opposite of what the failure asked for.
+const RANGE_LIMIT_ERROR = /block range|range is too|too many blocks|returned more than|response size|exceeds? maximum|query timeout exceeded/i;
+
+export function looksLikeRangeLimit(err: unknown): boolean {
+  return RANGE_LIMIT_ERROR.test(describeRpcError(err));
+}
+
+// Above this many eth_getLogs calls, a backfill is a configuration problem
+// rather than a long wait, and the watcher says so at startup.
+const NOISY_BACKFILL_CALLS = 500;
 
 export interface CopyMintOpts {
   chain: ChainProfile;
@@ -92,6 +125,8 @@ export async function runCopyMintWatcher(opts: CopyMintOpts): Promise<void> {
   log.info(`  Max price accepted: ${opts.maxPriceEth} ETH per wallet`);
   log.warn("  Any mintPublic call from a watched wallet is copied with your own wallets. Ctrl+C to stop.\n");
 
+  const chunkBlocks = opts.logChunkBlocks ?? DEFAULT_CHUNK_BLOCKS;
+
   const copied = new Set<string>(); // dedupe by "nftContract" so a busy source wallet doesn't trigger repeats
   // Established on the first successful poll rather than up front, so a
   // failure reading the chain head is handled by the loop's own retry/backoff
@@ -99,6 +134,9 @@ export async function runCopyMintWatcher(opts: CopyMintOpts): Promise<void> {
   let lastScanned: number | null = null;
   let consecutiveFailures = 0;
   let firstPass = false;
+  // The last scan failure already reported, so a persistent outage doesn't
+  // repeat one line every tick. Cleared on recovery.
+  let scanErrorReported: string | null = null;
   const maxCatchup = catchupBlocksFor(chain.key);
 
   const signal = opts.stopSignal ?? { stopped: false };
@@ -145,6 +183,22 @@ export async function runCopyMintWatcher(opts: CopyMintOpts): Promise<void> {
         if (backfill > 0) {
           const hours = ((backfill * chain.blockSeconds) / 3600).toFixed(1);
           log.info(`  ⏮ Backfilling ${backfill} blocks (~${hours}h) for drops that are still open…`);
+          // The backfill is walked one eth_getLogs per chunk. On a fast chain
+          // with a small chunk that is tens of thousands of sequential calls
+          // — hours before the watcher ever reaches the head, and enough
+          // sustained load to cause the very timeouts that stall it. Say so,
+          // because the fix is configuration, not patience.
+          const calls = Math.ceil(backfill / chunkBlocks);
+          if (calls > NOISY_BACKFILL_CALLS) {
+            const native = chain.rpc.logChunkBlocks;
+            const advice =
+              native && native > chunkBlocks
+                ? `This chain's own RPC serves ${native} blocks per call — set AUTO_LOG_CHUNK_BLOCKS_${chain.key.toUpperCase()}=${native} (a global AUTO_LOG_CHUNK_BLOCKS overrides it).`
+                : `Raise AUTO_LOG_CHUNK_BLOCKS_${chain.key.toUpperCase()} if your RPC allows a wider range, or shorten the backfill.`;
+            log.warn(
+              `  ⚠ That's ${calls} scans at ${chunkBlocks} blocks each. ${advice}`
+            );
+          }
         }
         // Fall through and scan it, rather than `continue` — but suspend the
         // catch-up guard below, which would otherwise discard the backfill as
@@ -178,26 +232,65 @@ export async function runCopyMintWatcher(opts: CopyMintOpts): Promise<void> {
         continue;
       }
 
-      let sightings: WatchedMint[] = [];
-      const chunk = opts.logChunkBlocks;
+      const sightings: WatchedMint[] = [];
+      let scanFailed = false;
+      // The highest block a chunk actually covered. A scan that dies at chunk
+      // 300 of 400 has still done 300 chunks of real work, and keeping it is
+      // the difference between a backfill that finishes and one that cannot:
+      // rescanning the whole range every tick means every tick has to get
+      // through EVERY chunk without a single transient failure, which over
+      // hundreds of thousands of blocks never happens.
+      let scannedThrough: number = lastScanned;
+      const collect = (through: number, found: WatchedMint[]) => {
+        scannedThrough = Math.max(scannedThrough, through);
+        sightings.push(...found);
+      };
+
       try {
         try {
-          sightings = await scanWatchedMints(rpcUrls[0], lastScanned + 1, latest, watchTargets, chunk);
+          await scanWatchedMints(rpcUrls[0], lastScanned + 1, latest, watchTargets, chunkBlocks, {
+            onProgress: collect,
+            shouldStop: () => signal.stopped,
+          });
         } catch (err: any) {
-          // Robinhood's public node answers a 10k-block range in ~300ms when
-          // idle and times out on 2k when busy, so a failure here says more
-          // about load than about the range. One retry at half the chunk
-          // costs a few extra calls and saves the whole range — which for
-          // the startup backfill is hours of signal.
-          const halved = Math.max(10, Math.floor((chunk ?? 10) / 2));
-          log.warn(`  ⚠ scan failed at chunk ${chunk ?? 10} (${describeRpcError(err)}) — retrying at ${halved}`);
-          sightings = await scanWatchedMints(rpcUrls[0], lastScanned + 1, latest, watchTargets, halved);
+          // Retry smaller ONLY if the provider is objecting to the range, and
+          // only if "smaller" is a real change — at the 10-block floor,
+          // Math.max(10, 10/2) is still 10, so this used to re-issue the
+          // identical failing request and announce it as a retry.
+          const halved = Math.max(1, Math.floor(chunkBlocks / 2));
+          if (!looksLikeRangeLimit(err) || halved >= chunkBlocks) throw err;
+          // Routine and self-correcting, so it stays in the local log rather
+          // than being forwarded to the bot's chat. See logger.ts.
+          log.info(
+            `  ↻ chunk ${chunkBlocks} rejected (${describeRpcError(err)}) — rescanning from ${scannedThrough + 1} at ${halved}`
+          );
+          // Resume from what's already covered instead of starting over.
+          await scanWatchedMints(rpcUrls[0], scannedThrough + 1, latest, watchTargets, halved, {
+            onProgress: collect,
+            shouldStop: () => signal.stopped,
+          });
         }
-        // Only mark this range scanned on success — advancing it on failure
-        // would silently skip it forever despite the "retrying" log below.
-        lastScanned = latest;
+        // Only the whole range if the scan wasn't cut short by a stop.
+        lastScanned = signal.stopped ? Math.max(lastScanned, scannedThrough) : latest;
+        if (scanErrorReported) {
+          log.success("  ✓ Block scan recovered.");
+          scanErrorReported = null;
+        }
       } catch (err: any) {
-        log.error(`  ⚠ block scan failed: ${describeRpcError(err)} — retrying next tick`);
+        scanFailed = true;
+        // Keep the ground the scan did cover. Holding lastScanned back would
+        // re-request those blocks on every future tick forever.
+        lastScanned = Math.max(lastScanned, scannedThrough);
+        const reason = describeRpcError(err);
+        // A persistent outage produces this identical line every tick, and at
+        // a 4s poll that is a wall of duplicates in the chat saying one thing.
+        // Report it once, then again only when the failure itself changes.
+        if (scanErrorReported !== reason) {
+          log.error(
+            `  ⚠ Block scan failed: ${reason} — scanned through ${lastScanned}, ${latest - lastScanned} block(s) still behind. Retrying with backoff.`
+          );
+          scanErrorReported = reason;
+        }
       } finally {
         // One backfill attempt only. If it failed, the catch-up guard above
         // takes over next tick and reports honestly what it gives up on,
@@ -206,6 +299,7 @@ export async function runCopyMintWatcher(opts: CopyMintOpts): Promise<void> {
       }
 
       for (const sighting of sightings) {
+        if (signal.stopped) break;
         if (copied.has(sighting.nftContract.toLowerCase())) continue;
         copied.add(sighting.nftContract.toLowerCase());
 
@@ -325,7 +419,11 @@ export async function runCopyMintWatcher(opts: CopyMintOpts): Promise<void> {
         }
       }
 
-      consecutiveFailures = 0;
+      // A failed scan is a failed poll. Resetting the counter here regardless
+      // was why a broken scan retried every 4s forever instead of backing
+      // off — the loop looked healthy because getBlockNumber() had worked.
+      if (scanFailed) consecutiveFailures++;
+      else consecutiveFailures = 0;
     } catch (err: any) {
       consecutiveFailures++;
       log.error(
