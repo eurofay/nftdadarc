@@ -93,9 +93,12 @@ export async function probeCapability(
   // common failure is an explicit "range too large" rather than a timeout.
   for (const range of [10_000, 2_000, 500, 100, 10]) {
     try {
+      // range - 1, because a from..to span is inclusive at both ends. Asking
+      // head-10..head is eleven blocks, which trips a ten-block cap and made
+      // a working endpoint report that it could scan nothing at all.
       const res = await call("eth_getLogs", [
         {
-          fromBlock: `0x${Math.max(0, head - range).toString(16)}`,
+          fromBlock: `0x${Math.max(0, head - (range - 1)).toString(16)}`,
           toBlock: `0x${head.toString(16)}`,
           address: "0x00005ea00ac477b1030ce78506496e8c2de24bf5",
         },

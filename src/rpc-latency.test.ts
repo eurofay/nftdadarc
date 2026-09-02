@@ -1,5 +1,5 @@
-import { describe, it, expect } from "vitest";
-import { labelEndpoint, renderLatency, LatencySample } from "./rpc-latency";
+import { describe, it, expect, vi } from "vitest";
+import { labelEndpoint, renderLatency, probeCapability, LatencySample } from "./rpc-latency";
 
 describe("labelEndpoint", () => {
   it("names the endpoints that matter distinctly", () => {
@@ -68,5 +68,28 @@ describe("renderLatency", () => {
 
   it("scales to a slow chain too", () => {
     expect(renderLatency([samples[1]], 12.12)).toContain("0.0 block(s)");
+  });
+});
+
+describe("probeCapability range arithmetic", () => {
+  it("requests an inclusive span equal to the range, not one more", async () => {
+    // Regression: head-10..head is ELEVEN blocks, so a ten-block cap rejected
+    // even the smallest probe and a working endpoint reported "scans 0".
+    const spans: number[] = [];
+    const spy = vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+      const body = JSON.parse(String((init as RequestInit).body));
+      if (body.method === "eth_blockNumber") {
+        return new Response(JSON.stringify({ result: "0x3e8" })); // 1000
+      }
+      const { fromBlock, toBlock } = body.params[0];
+      spans.push(parseInt(toBlock, 16) - parseInt(fromBlock, 16) + 1);
+      return new Response(JSON.stringify({ error: { message: "range too large" } }));
+    });
+
+    await probeCapability("https://example.com");
+    spy.mockRestore();
+
+    expect(spans).toContain(10);
+    expect(spans).not.toContain(11);
   });
 });
