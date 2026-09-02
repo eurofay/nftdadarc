@@ -51,13 +51,35 @@ Telegram allows a single long-polling consumer per token. A second instance
 fight over updates and drop messages. Keep replicas at 1 and stop the local
 process once the cloud one is live.
 
+## Backups
+
+Admin -> 💾 Backup sends the whole store as a file: wallets, watchlist,
+settings, seed phrases and history.
+
+The secrets inside are encrypted with `WALLET_ENCRYPTION_KEY`, which lives in
+the environment and is **not** in the file — so the backup alone can't spend
+anything. That also means the two halves must be kept apart and both must
+survive: the file without the key is unreadable, permanently.
+
+Admin -> ♻️ Restore takes one back. Every key is decrypted and checked against
+the address it's filed under *before* anything is written, so a backup from an
+install with a different encryption key is refused rather than silently
+restoring wallets nobody can spend from. The store being replaced is kept
+alongside it as `*.pre-restore`.
+
+Take one before any redeploy that touches the volume, and after adding wallets.
+
 ## Moving an existing install
 
-Copy `data/telegram-store.json` into the volume at `/data/telegram-store.json`
-once. On the next start the bot migrates it to `/data/users/<ownerId>.json` and
-leaves the original in place — delete it yourself after confirming your wallets
-are there. Migration will not overwrite an existing per-user store, so a repeat
-start is harmless.
+Simplest route is Backup and Restore: 💾 Backup on the old deployment, create
+the new one with the **same `WALLET_ENCRYPTION_KEY`**, then ♻️ Restore. This is
+also how you move between Railway regions, since a volume is pinned to its
+region and does not travel with the service.
+
+Alternatively, copy `data/telegram-store.json` into the volume at
+`/data/telegram-store.json` once. On the next start the bot migrates it to
+`/data/users/<ownerId>.json` and leaves the original in place. Migration will
+not overwrite an existing per-user store, so a repeat start is harmless.
 
 `WALLET_ENCRYPTION_KEY` must match the machine the store came from. A different
 key leaves the file readable but every private key in it undecryptable.

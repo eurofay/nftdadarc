@@ -20,6 +20,7 @@ import {
   seedDetailMenu,
   adminMenu,
   adminRevokeConfirmMenu,
+  restoreConfirmMenu,
   adminInvitesMenu,
   walletsMenu,
   walletDetailMenu,
@@ -82,6 +83,7 @@ interface SessionData {
     | "awaiting_wallet_key"
     | "awaiting_seed_count"
     | "awaiting_seed_import"
+    | "awaiting_restore_file"
     | "awaiting_agent_question"
     | "awaiting_copy_target"
     | "awaiting_fund_amount"
@@ -104,6 +106,7 @@ interface SessionData {
   sellWallet?: string;
   sellSlug?: string;
   sellPriceEth?: number;
+  pendingRestore?: string; // snapshot JSON held between upload and confirm
 }
 interface BotContext extends Context {
   session: SessionData;
@@ -1891,6 +1894,53 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
     );
   });
 
+  bot.action("admin:backup", async (ctx) => {
+    if (!requireOwner(ctx)) return;
+    await ctx.answerCbQuery("Preparing…");
+    const snapshot = ctx.store.exportSnapshot();
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+    return ctx.replyWithDocument(
+      { source: Buffer.from(snapshot, "utf8"), filename: `snake-minter-backup-${stamp}.json` },
+      {
+        caption:
+          `💾 ${ctx.store.listWallets().length} wallet(s), ${ctx.store.listCopyTargets().length} watched, ` +
+          `${ctx.store.listSeeds().length} seed phrase(s).\n\n` +
+          "Keys inside are encrypted — this file alone can't spend anything. It needs your " +
+          "WALLET_ENCRYPTION_KEY, which is NOT in here. Keep the two apart and restoring works; " +
+          "lose the key and this file is unreadable.",
+      }
+    );
+  });
+
+  bot.action("admin:restore", (ctx) => {
+    if (!requireOwner(ctx)) return;
+    ctx.session.step = "awaiting_restore_file";
+    return ctx.reply(
+      "♻️ Send the backup file.\n\n" +
+        "I'll check every key decrypts with this server's WALLET_ENCRYPTION_KEY before " +
+        "changing anything — a backup from an install with a different key would restore " +
+        "wallets nobody can spend from."
+    );
+  });
+
+  bot.action("admin:restore:confirm", (ctx) => {
+    if (!requireOwner(ctx)) return;
+    const snapshot = ctx.session.pendingRestore;
+    ctx.session.pendingRestore = undefined;
+    if (!snapshot) return ctx.answerCbQuery("That upload expired — send the file again.", { show_alert: true });
+    try {
+      const result = ctx.store.importSnapshot(snapshot);
+      return ctx.editMessageText(
+        `✅ Restored ${result.wallets} wallet(s) and ${result.seeds} seed phrase(s).\n\n` +
+          "Watchers reload on the next restart. The store this replaced is kept on disk as " +
+          "*.pre-restore in case this was the wrong file.",
+        mainMenu()
+      );
+    } catch (err: any) {
+      return ctx.editMessageText(`❌ ${err.message}`, adminMenu(access.listCodes().length, stores.listUserIds().length));
+    }
+  });
+
   bot.action("admin:revokeall", (ctx) => {
     if (!requireOwner(ctx)) return;
     const active = access.listCodes().filter((c) => c.redeemedBy && !c.revoked).length;
@@ -2378,6 +2428,57 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
   });
 
   // ── Text handler: services whatever multi-step flow is in progress ───
+  // Restore uploads. Validation happens on the SNAPSHOT, before anything is
+  // written — see importSnapshot — so a bad file costs nothing but a message.
+  bot.on(message("document"), async (ctx) => {
+    if (ctx.session.step !== "awaiting_restore_file") return;
+    if (!requireOwner(ctx)) return;
+    ctx.session.step = undefined;
+
+    const doc = ctx.message.document;
+    // A store this large is not a store; refuse before pulling it down.
+    if ((doc.file_size ?? 0) > 25 * 1024 * 1024) {
+      return ctx.reply("That file is too large to be a backup of this bot.");
+    }
+
+    let snapshot: string;
+    try {
+      const link = await ctx.telegram.getFileLink(doc.file_id);
+      const res = await fetch(link.toString());
+      snapshot = await res.text();
+    } catch (err: any) {
+      return ctx.reply(`❌ Couldn't download that file: ${err?.message ?? err}`);
+    }
+
+    // Parse and check it now, so the confirmation can state what will happen
+    // rather than asking the user to approve something unexamined.
+    let summary: { wallets: number; targets: number; seeds: number };
+    try {
+      const parsed = JSON.parse(snapshot);
+      if (!Array.isArray(parsed?.wallets)) throw new Error("no wallet list in it");
+      summary = {
+        wallets: parsed.wallets.length,
+        targets: (parsed.copyTargets ?? []).length,
+        seeds: (parsed.seeds ?? []).length,
+      };
+    } catch (err: any) {
+      return ctx.reply(`❌ That doesn't look like a backup of this bot (${err?.message ?? err}).`);
+    }
+
+    ctx.session.pendingRestore = snapshot;
+    const current = ctx.store.listWallets().length;
+    return ctx.reply(
+      `♻️ This backup holds ${summary.wallets} wallet(s), ${summary.targets} watched wallet(s), ` +
+        `${summary.seeds} seed phrase(s).\n\n` +
+        (current > 0
+          ? `⚠️ It REPLACES the ${current} wallet(s) currently here. The replaced store is kept on disk, but ` +
+            "anything added since your last backup is gone."
+          : "Nothing here yet, so nothing is lost.") +
+        "\n\nKeys are verified against this server's encryption key before anything changes.",
+      restoreConfirmMenu()
+    );
+  });
+
   bot.on(message("text"), async (ctx) => {
     const step = ctx.session.step;
     if (!step) return; // not mid-flow — ignore free text rather than guess intent

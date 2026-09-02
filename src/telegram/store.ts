@@ -314,6 +314,87 @@ export class TelegramStore {
     return removed;
   }
 
+  // ── Backup and restore ───────────────────────────────────────────────
+  /**
+   * The store exactly as it sits on disk.
+   *
+   * Private keys and seed phrases inside are encrypted with
+   * WALLET_ENCRYPTION_KEY, which lives in the environment and never in this
+   * file — so the export is inert on its own. That is what makes it safe to
+   * carry through a chat or a backup service.
+   */
+  exportSnapshot(): string {
+    return JSON.stringify(this.data, null, 2);
+  }
+
+  /**
+   * Replace everything with a previously exported snapshot.
+   *
+   * Every encrypted secret is decrypted BEFORE anything is written. A
+   * snapshot from an install with a different WALLET_ENCRYPTION_KEY parses
+   * perfectly and looks healthy, but every private key in it is unreadable —
+   * restoring it would replace working wallets with dead ones and the damage
+   * would only surface at mint time. Refusing up front is the whole point of
+   * this method.
+   */
+  importSnapshot(json: string): { wallets: number; seeds: number; replaced: number } {
+    let parsed: any;
+    try {
+      parsed = JSON.parse(json);
+    } catch {
+      throw new Error("That file isn't valid JSON.");
+    }
+    if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.wallets)) {
+      throw new Error("That doesn't look like a backup of this bot — no wallet list in it.");
+    }
+
+    for (const w of parsed.wallets) {
+      if (!w?.address || !w?.encryptedKey) {
+        throw new Error("The backup has a wallet entry with no address or key — refusing to restore it.");
+      }
+      let key: string;
+      try {
+        key = decrypt(w.encryptedKey, this.passphrase);
+      } catch {
+        throw new Error(
+          `Can't decrypt ${w.address} — this backup was made with a different WALLET_ENCRYPTION_KEY. ` +
+            "Restoring it would give you wallets nobody can spend from. Nothing was changed."
+        );
+      }
+      // Decrypting is not enough: it must also be the key for that address.
+      if (new Wallet(key).address.toLowerCase() !== String(w.address).toLowerCase()) {
+        throw new Error(`The key stored for ${w.address} doesn't control it. Nothing was changed.`);
+      }
+    }
+
+    for (const seed of parsed.seeds ?? []) {
+      try {
+        decrypt(seed.encryptedPhrase, this.passphrase);
+      } catch {
+        throw new Error("A seed phrase in the backup can't be decrypted with this key. Nothing was changed.");
+      }
+    }
+
+    // Keep what is being replaced. A restore is the one operation here that
+    // destroys data, and "I restored the wrong file" needs a way back.
+    const replaced = this.data.wallets.length;
+    if (fs.existsSync(this.filePath)) {
+      fs.copyFileSync(this.filePath, `${this.filePath}.pre-restore`);
+    }
+
+    this.data = {
+      seeds: parsed.seeds ?? [],
+      scheduled: parsed.scheduled ?? [],
+      wallets: parsed.wallets,
+      copyTargets: parsed.copyTargets ?? [],
+      mints: parsed.mints ?? [],
+      copyHistory: parsed.copyHistory ?? [],
+      settings: { ...DEFAULT_SETTINGS, ...(parsed.settings ?? {}) },
+    };
+    this.save();
+    return { wallets: this.data.wallets.length, seeds: this.data.seeds.length, replaced };
+  }
+
   // ── Seed phrases ─────────────────────────────────────────────────────
   addSeed(phrase: string, label?: string): SeedRecord {
     const record: SeedRecord = {

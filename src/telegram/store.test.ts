@@ -563,3 +563,105 @@ describe("seed phrases", () => {
     expect(store.removeSeed(rec.id)).toBe(false);
   });
 });
+
+describe("backup and restore", () => {
+  const KEY_A = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+  const KEY_B = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
+  const PHRASE = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+  function at(dir: string, pass = "pass"): TelegramStore {
+    return new TelegramStore(path.join(dir, "s.json"), pass);
+  }
+  function tmp(): string {
+    return fs.mkdtempSync(path.join(os.tmpdir(), "backup-"));
+  }
+
+  it("round-trips wallets, targets and history to a new install", () => {
+    const a = tmp();
+    const source = at(a);
+    source.addWallet("one", KEY_A);
+    source.addCopyTarget("whale", "0x3A24615eED0dA3821409d3aCB22643B9b43F9Fae");
+    source.addSeed(PHRASE);
+    const snapshot = source.exportSnapshot();
+
+    // A different directory, same encryption key — the migration case.
+    const restored = at(tmp());
+    const result = restored.importSnapshot(snapshot);
+
+    expect(result.wallets).toBe(1);
+    expect(restored.listWallets()[0].address).toBe(source.listWallets()[0].address);
+    expect(restored.listCopyTargets()).toHaveLength(1);
+    expect(restored.getDecryptedSeed(restored.listSeeds()[0].id)).toBe(PHRASE);
+  });
+
+  it("keeps the keys usable, which is the only thing that really matters", () => {
+    const source = at(tmp());
+    source.addWallet("one", KEY_A);
+    const restored = at(tmp());
+    restored.importSnapshot(source.exportSnapshot());
+
+    const address = restored.listWallets()[0].address;
+    expect(new Wallet(restored.getDecryptedKey(address)).address).toBe(address);
+  });
+
+  it("refuses a backup encrypted with a different key, and changes nothing", () => {
+    // The failure this exists to prevent: the file parses, looks healthy, and
+    // every wallet in it is unspendable. It would only surface at mint time.
+    const foreign = at(tmp(), "a-different-encryption-key");
+    foreign.addWallet("theirs", KEY_A);
+
+    const mine = at(tmp());
+    mine.addWallet("mine", KEY_B);
+    const before = mine.listWallets()[0].address;
+
+    expect(() => mine.importSnapshot(foreign.exportSnapshot())).toThrow(/different WALLET_ENCRYPTION_KEY/);
+    expect(mine.listWallets()[0].address).toBe(before);
+  });
+
+  it("refuses a key that doesn't control the address it's filed under", () => {
+    const source = at(tmp());
+    source.addWallet("one", KEY_A);
+    const tampered = JSON.parse(source.exportSnapshot());
+    tampered.wallets[0].address = new Wallet(KEY_B).address;
+
+    expect(() => at(tmp()).importSnapshot(JSON.stringify(tampered))).toThrow(/doesn't control it/);
+  });
+
+  it("rejects junk rather than wiping the store with it", () => {
+    const store = at(tmp());
+    store.addWallet("keeper", KEY_A);
+    expect(() => store.importSnapshot("not json at all")).toThrow(/valid JSON/);
+    expect(() => store.importSnapshot('{"hello":"world"}')).toThrow(/doesn't look like a backup/);
+    expect(store.listWallets()).toHaveLength(1);
+  });
+
+  it("keeps the replaced store on disk, so a wrong restore isn't final", () => {
+    const dir = tmp();
+    const store = at(dir);
+    store.addWallet("original", KEY_A);
+
+    const other = at(tmp());
+    other.addWallet("incoming", KEY_B);
+    store.importSnapshot(other.exportSnapshot());
+
+    const backup = path.join(dir, "s.json.pre-restore");
+    expect(fs.existsSync(backup)).toBe(true);
+    expect(JSON.parse(fs.readFileSync(backup, "utf8")).wallets[0].label).toBe("original");
+  });
+
+  it("reports what it replaced, so the message can say what was lost", () => {
+    const store = at(tmp());
+    store.addWallet("a", KEY_A);
+    const other = at(tmp());
+    other.addWallet("b", KEY_B);
+    expect(store.importSnapshot(other.exportSnapshot()).replaced).toBe(1);
+  });
+
+  it("survives a restart after restoring", () => {
+    const dir = tmp();
+    const source = at(tmp());
+    source.addWallet("one", KEY_A);
+    at(dir).importSnapshot(source.exportSnapshot());
+    expect(at(dir).listWallets()).toHaveLength(1);
+  });
+});

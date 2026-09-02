@@ -28,7 +28,17 @@ export function adminMenu(inviteCount: number, userCount: number) {
     [Markup.button.callback(`👥 Users (${userCount})`, "admin:users")],
     [Markup.button.callback("🚫 Revoke everyone", "admin:revokeall")],
     [Markup.button.callback("🤖 Ask the assistant", "admin:ask")],
+    [Markup.button.callback("💾 Backup", "admin:backup"), Markup.button.callback("♻️ Restore", "admin:restore")],
     [Markup.button.callback("⬅ Back", "menu:main")],
+  ]);
+}
+
+// A restore destroys whatever is there now, so it asks first — and says what
+// is about to be lost rather than a generic "are you sure".
+export function restoreConfirmMenu() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback("Yes, replace everything", "admin:restore:confirm")],
+    [Markup.button.callback("Cancel", "menu:admin")],
   ]);
 }
 
