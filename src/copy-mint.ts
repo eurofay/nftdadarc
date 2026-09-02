@@ -17,6 +17,7 @@
 
 import { Wallet, formatEther } from "ethers";
 import { buildLocalMintPlan } from "./seadrop-public";
+import { raceReadOrNull } from "./fast-read";
 import { DEFAULT_CHUNK_BLOCKS, MintSighting, scanSeaDropMints } from "./seadrop-events";
 import { localPublicSnipe, SnipeOutcome } from "./local-mint";
 import { backoffMs, createProvider, describeRpcError } from "./rpc-provider";
@@ -322,7 +323,15 @@ export async function runCopyMintWatcher(opts: CopyMintOpts): Promise<void> {
           `\n  👀 ${sighting.from} minted ${sighting.nftContract} (block ${sighting.blockNumber}) — copying`
         );
 
-        const drop = await buildLocalMintPlan(rpcUrls[0], sighting.nftContract, 1);
+        // Raced across every endpoint rather than pinned to rpcUrls[0]. That
+        // one is chosen for scan width, which is not the same as being quick:
+        // measured at 1609ms where another endpoint answered in 18ms, and
+        // this sits directly between seeing a mint and sending one.
+        const drop = await raceReadOrNull(
+          rpcUrls,
+          (url) => buildLocalMintPlan(url, sighting.nftContract, 1),
+          log
+        );
         if (!drop) {
           const reason = "no public drop resolvable for this contract";
           log.error(`     ✗ Skipped — ${reason}.`);
@@ -344,7 +353,16 @@ export async function runCopyMintWatcher(opts: CopyMintOpts): Promise<void> {
         const quantity = opts.quantityPerWallet
           ? Math.min(drop.drop.maxTotalMintableByWallet, opts.quantityPerWallet)
           : drop.drop.maxTotalMintableByWallet;
-        const plan = await buildLocalMintPlan(rpcUrls[0], sighting.nftContract, quantity);
+        // Reuse the drop already fetched: only the encoded quantity differs,
+        // and re-reading it was two more round trips on the critical path.
+        const plan =
+          quantity === 1
+            ? drop
+            : await raceReadOrNull(
+                rpcUrls,
+                (url) => buildLocalMintPlan(url, sighting.nftContract, quantity),
+                log
+              );
         if (!plan) {
           const reason = `drop no longer resolvable at quantity ${quantity}`;
           log.error(`     ✗ Skipped — ${reason}.`);
