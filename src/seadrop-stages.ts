@@ -48,6 +48,10 @@ export interface Stage {
   maxPerWallet?: number;
 }
 
+const TOKEN_IFACE = new Interface([
+  "function getMintStats(address minter) view returns (uint256 minterNumMinted, uint256 currentTotalSupply, uint256 maxSupply)",
+]);
+
 const ZERO_ROOT = "0x0000000000000000000000000000000000000000000000000000000000000000";
 
 async function call<T>(rpcUrl: string, fn: string, nftContract: string): Promise<T | null> {
@@ -141,4 +145,64 @@ export function describeStages(stages: Stage[]): string {
     );
   }
   return lines.join("\n");
+}
+
+export interface Eligibility {
+  /** Already minted by this wallet on this collection. */
+  alreadyMinted: number;
+  /** The drop's per-wallet cap for the public stage. */
+  maxPerWallet: number;
+  /** Left in the collection overall. */
+  supplyRemaining: number;
+  /** What this wallet can actually mint right now — the smaller limit wins. */
+  canMint: number;
+  reason?: string;
+}
+
+/**
+ * What this specific wallet can mint from the PUBLIC stage right now.
+ *
+ * Both limits are on-chain and both bind: the drop's per-wallet cap, and
+ * whatever supply is left. Minting the per-wallet max into a collection with
+ * three left reverts, so the smaller number is the real answer.
+ *
+ * This only speaks for the public stage. Eligibility for an allow list is a
+ * proof the project issues off-chain — a wallet does not carry it, and no
+ * amount of reading the chain reveals whether one exists for you.
+ */
+export async function checkEligibility(
+  rpcUrl: string,
+  nftContract: string,
+  wallet: string,
+  maxPerWallet: number
+): Promise<Eligibility> {
+  const provider = createProvider(rpcUrl);
+  const res = await provider.call({
+    to: nftContract,
+    data: TOKEN_IFACE.encodeFunctionData("getMintStats", [wallet]),
+  });
+  const [minted, supply, maxSupply] = TOKEN_IFACE.decodeFunctionResult("getMintStats", res);
+
+  const alreadyMinted = Number(minted);
+  const supplyRemaining = Number(maxSupply) - Number(supply);
+  const walletRemaining = Math.max(0, maxPerWallet - alreadyMinted);
+  const canMint = Math.max(0, Math.min(walletRemaining, supplyRemaining));
+
+  let reason: string | undefined;
+  if (canMint === 0) {
+    reason =
+      walletRemaining === 0
+        ? `this wallet already minted its limit of ${maxPerWallet}`
+        : "the collection is sold out";
+  } else if (supplyRemaining < walletRemaining) {
+    reason = `only ${supplyRemaining} left in the collection`;
+  }
+
+  return { alreadyMinted, maxPerWallet, supplyRemaining, canMint, reason };
+}
+
+/** One line per wallet, for a pre-mint check. */
+export function describeEligibility(wallet: string, e: Eligibility): string {
+  const head = `${wallet.slice(0, 8)}… ${e.canMint > 0 ? `✅ can mint ${e.canMint}` : "⛔ can't mint"}`;
+  return e.reason ? `${head} — ${e.reason}` : head;
 }

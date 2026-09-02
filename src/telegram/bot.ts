@@ -73,7 +73,7 @@ import { fetchOnChainHoldings } from "../nft-holdings";
 import { MintCardData } from "../mint-card";
 import { gasLimitForQuantity, upfrontReservation } from "../gas";
 import { raceRead } from "../fast-read";
-import { readStages, describeStages } from "../seadrop-stages";
+import { readStages, describeStages, checkEligibility, describeEligibility } from "../seadrop-stages";
 import { renderMintCardPng } from "../mint-card-render";
 import { acceptOfferViaSdk, acceptOfferWithFallback, createListing, parseListingPrice } from "../opensea-sell";
 import { createLogger, withPrefix, LogSink } from "../logger";
@@ -2258,13 +2258,35 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
     return ctx.editMessageText("Mint FROM which wallet(s)? Tap to select, then Done.", schedWalletsMenu(ctx.store.listWallets(), selected));
   });
 
-  bot.action("sched:wallets:done", (ctx) => {
+  bot.action("sched:wallets:done", async (ctx) => {
     if (!ctx.session.schedWallets || ctx.session.schedWallets.length === 0) {
       return ctx.answerCbQuery("Select at least one wallet.", { show_alert: true });
     }
     ctx.session.step = "awaiting_sched_quantity";
     const max = ctx.session.schedDropMax ?? 0;
-    return ctx.reply(`How many per wallet? (drop's real max is ${max > 0 ? max : "unspecified"} — you'll never exceed it)`);
+
+    // Per-wallet eligibility, read from the chain before anything is armed.
+    // The cap is only half the story: a wallet that already minted its limit,
+    // or a collection with less supply left than the cap, both revert.
+    let eligibility = "";
+    const contract = ctx.session.schedContract;
+    if (contract && max > 0) {
+      const { urls } = resolveRpcsForChain(ctx.store.getSettings().chainKey);
+      const lines: string[] = [];
+      for (const address of ctx.session.schedWallets ?? []) {
+        try {
+          const e = await raceRead(urls, (url) => checkEligibility(url, contract, address, max));
+          lines.push("  " + describeEligibility(address, e));
+        } catch {
+          lines.push(`  ${address.slice(0, 8)}… (couldn't check)`);
+        }
+      }
+      if (lines.length > 0) eligibility = `\n\nEligibility right now:\n${lines.join("\n")}`;
+    }
+
+    return ctx.reply(
+      `How many per wallet? (drop's real max is ${max > 0 ? max : "unspecified"} — you'll never exceed it)${eligibility}`
+    );
   });
 
   bot.action("sched:cancel", (ctx) => {
