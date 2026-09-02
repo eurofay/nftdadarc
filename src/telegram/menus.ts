@@ -193,6 +193,7 @@ export function walletDetailMenu(wallet: WalletRecord) {
   return Markup.inlineKeyboard([
     [Markup.button.callback(`🎯 Auto Mint: ${autoOn ? "✅ ON" : "⛔ OFF"}`, `wallet:toggle:auto:${wallet.address}`)],
     [Markup.button.callback(`👀 Copy Mint: ${copyOn ? "✅ ON" : "⛔ OFF"}`, `wallet:toggle:copy:${wallet.address}`)],
+    [Markup.button.callback("💰 Refresh balance", `wallet:bal:${wallet.address}`)],
     [Markup.button.callback("🔑 Show private key", `wallet:key:${wallet.address}`)],
     [Markup.button.callback("🗑 Remove wallet", `wallet:remove:${wallet.address}`)],
     [Markup.button.callback("⬅ Back", "menu:wallets")],

@@ -9,7 +9,7 @@ import { Telegraf, Markup, Context } from "telegraf";
 import { message } from "telegraf/filters";
 import { isAddress, formatEther, parseEther } from "ethers";
 import { generateMnemonic, deriveWallets, isValidMnemonic } from "../hd-wallet";
-import { createProvider } from "../rpc-provider";
+import { createProvider, describeRpcError } from "../rpc-provider";
 import { TelegramStore, WalletRecord, ScheduledMint } from "./store";
 import { UserStores } from "./user-stores";
 import { ask, BotSnapshot } from "./agent";
@@ -71,6 +71,9 @@ import { runActivityWatcher } from "../activity-watcher";
 import { batchTransfer, estimateBatchCost } from "../fund-transfer";
 import { fetchOnChainHoldings } from "../nft-holdings";
 import { MintCardData } from "../mint-card";
+import { gasLimitForQuantity, upfrontReservation } from "../gas";
+import { raceRead } from "../fast-read";
+import { readStages, describeStages } from "../seadrop-stages";
 import { renderMintCardPng } from "../mint-card-render";
 import { acceptOfferViaSdk, acceptOfferWithFallback, createListing, parseListingPrice } from "../opensea-sell";
 import { createLogger, withPrefix, LogSink } from "../logger";
@@ -1330,10 +1333,55 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
     return ctx.editMessageText("Wallets — tap one to manage it. [🎯 Auto] [👀 Copy]:", walletsMenu(ctx.store.listWallets()));
   });
 
-  bot.action(/^wallet:manage:(.+)$/, (ctx) => {
-    const wallet = ctx.store.listWallets().find((w) => w.address.toLowerCase() === ctx.match[1].toLowerCase());
+  /**
+   * Full address in a code block — Telegram renders those tap-to-copy on
+   * mobile, which is the only "copy button" the platform offers. A masked
+   * address is fine in a list and useless when you need to fund the thing.
+   */
+  async function showWallet(ctx: BotContext, address: string, balance?: bigint): Promise<unknown> {
+    const wallet = ctx.store.listWallets().find((w) => w.address.toLowerCase() === address.toLowerCase());
     if (!wallet) return ctx.answerCbQuery("That wallet no longer exists.", { show_alert: true });
-    return ctx.editMessageText(`${wallet.label} (${maskAddress(wallet.address)})`, walletDetailMenu(wallet));
+
+    const settings = ctx.store.getSettings();
+    const chain = resolveChain(settings.chainKey);
+    const lines = [
+      `${wallet.label}`,
+      "",
+      "```",
+      wallet.address,
+      "```",
+      balance === undefined
+        ? "Balance: tap 💰 Refresh balance"
+        : `Balance: ${formatEther(balance)} ${chain?.nativeSymbol ?? "ETH"} on ${chain?.name ?? settings.chainKey}`,
+    ];
+    if (balance !== undefined) {
+      // What stops an underfunded wallet is the upfront reservation, not the
+      // mint price — see gas.ts.
+      const needed = upfrontReservation(gasLimitForQuantity(1), gweiToWei(settings.maxFeeGwei));
+      lines.push(
+        balance >= needed
+          ? `✅ Covers ~${balance / needed} mint(s) in flight`
+          : `⚠️ Under the ${formatEther(needed)} one mint reserves — it can't send yet`
+      );
+    }
+    return ctx.editMessageText(lines.join("\n"), {
+      parse_mode: "Markdown",
+      ...walletDetailMenu(wallet),
+    });
+  }
+
+  bot.action(/^wallet:manage:(.+)$/, (ctx) => showWallet(ctx, ctx.match[1]));
+
+  bot.action(/^wallet:bal:(.+)$/, async (ctx) => {
+    const address = ctx.match[1];
+    await ctx.answerCbQuery("Checking…");
+    const { urls } = resolveRpcsForChain(ctx.store.getSettings().chainKey);
+    try {
+      const balance = await raceRead(urls, (url) => createProvider(url).getBalance(address));
+      return showWallet(ctx, address, balance);
+    } catch (err: any) {
+      return ctx.answerCbQuery(`Couldn't read the balance: ${describeRpcError(err)}`, { show_alert: true });
+    }
   });
 
   bot.action(/^wallet:toggle:(auto|copy):(.+)$/, (ctx) => {
@@ -2132,7 +2180,7 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
       const { urls } = resolveRpcsForChain(settings.chainKey);
 
       const preview = await buildLocalMintPlan(urls[0], contract, 1);
-      if (!preview) return ctx.reply("No public drop found for that contract on the configured chain.");
+      if (!preview) return ctx.reply(await explainNoPublicDrop(ctx.store.getSettings().chainKey, contract));
       const dropMax = preview.drop.maxTotalMintableByWallet;
       const quantity = dropMax > 0 ? Math.min(dropMax, requestedQuantity) : requestedQuantity;
       if (quantity < requestedQuantity) {
@@ -2140,7 +2188,7 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
       }
 
       const plan = await buildLocalMintPlan(urls[0], contract, quantity);
-      if (!plan) return ctx.reply("No public drop found for that contract on the configured chain.");
+      if (!plan) return ctx.reply(await explainNoPublicDrop(ctx.store.getSettings().chainKey, contract));
 
       if (dryRun) {
         const chain = resolveChain(settings.chainKey)!;
@@ -2430,6 +2478,23 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
   // ── Text handler: services whatever multi-step flow is in progress ───
   // Restore uploads. Validation happens on the SNAPSHOT, before anything is
   // written — see importSnapshot — so a bad file costs nothing but a message.
+  /**
+   * Why a contract has no public drop, in terms the user can act on.
+   *
+   * "No public drop found" is true and useless: the collection often has an
+   * allow-list or signed stage that is live right now. Naming it turns a dead
+   * end into "go and get the signature".
+   */
+  async function explainNoPublicDrop(chainKey: string, nftContract: string): Promise<string> {
+    const { urls } = resolveRpcsForChain(chainKey);
+    try {
+      const stages = await raceRead(urls, (url) => readStages(url, nftContract));
+      return `No public stage on that contract.\n\n${describeStages(stages)}`;
+    } catch {
+      return "No public drop found for that contract on the configured chain.";
+    }
+  }
+
   bot.on(message("document"), async (ctx) => {
     if (ctx.session.step !== "awaiting_restore_file") return;
     if (!requireOwner(ctx)) return;
@@ -2623,7 +2688,7 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
         const contract = await resolveMintTarget(link, settings.chainKey);
         const { urls } = resolveRpcsForChain(settings.chainKey);
         const preview = await buildLocalMintPlan(urls[0], contract, 1);
-        if (!preview) return ctx.reply("No public drop found for that contract on the configured chain.");
+        if (!preview) return ctx.reply(await explainNoPublicDrop(ctx.store.getSettings().chainKey, contract));
 
         ctx.session.schedContract = contract;
         ctx.session.schedDropMax = preview.drop.maxTotalMintableByWallet;
