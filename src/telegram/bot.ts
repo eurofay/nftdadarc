@@ -72,8 +72,9 @@ import { batchTransfer, estimateBatchCost } from "../fund-transfer";
 import { fetchOnChainHoldings } from "../nft-holdings";
 import { MintCardData } from "../mint-card";
 import { gasLimitForQuantity, upfrontReservation } from "../gas";
-import { raceRead } from "../fast-read";
+import { raceRead, raceReadOrNull } from "../fast-read";
 import { readStages, describeStages, checkEligibility, describeEligibility } from "../seadrop-stages";
+import { fetchAllowListRoot, checkAllowListProof, parseAllowListInput } from "../seadrop-allowlist";
 import { renderMintCardPng } from "../mint-card-render";
 import { acceptOfferViaSdk, acceptOfferWithFallback, createListing, parseListingPrice } from "../opensea-sell";
 import { createLogger, withPrefix, LogSink } from "../logger";
@@ -87,6 +88,7 @@ interface SessionData {
     | "awaiting_seed_count"
     | "awaiting_seed_import"
     | "awaiting_restore_file"
+    | "awaiting_allowlist_json"
     | "awaiting_agent_question"
     | "awaiting_copy_target"
     | "awaiting_fund_amount"
@@ -109,7 +111,8 @@ interface SessionData {
   sellWallet?: string;
   sellSlug?: string;
   sellPriceEth?: number;
-  pendingRestore?: string; // snapshot JSON held between upload and confirm
+  pendingRestore?: string;
+  allowlistContract?: string; // snapshot JSON held between upload and confirm
 }
 interface BotContext extends Context {
   session: SessionData;
@@ -2153,6 +2156,41 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
   // fire now with this one wallet" — one message, no menu taps, no
   // confirmation, so it's the fastest thing this bot can do for a
   // genuinely contested public stage.
+  // Merkle allow-list mints. A proof is maths, not permission — if the
+  // project publishes the list, the holder of a wallet on it can mint without
+  // anyone's blessing. Signed stages are a different thing entirely and no
+  // amount of this helps them; see seadrop-allowlist.ts.
+  bot.command("allowlist", async (ctx) => {
+    const contract = ctx.message.text.split(/\s+/)[1]?.trim();
+    if (!contract || !isAddress(contract)) {
+      return ctx.reply(
+        "Usage: /allowlist <contract address>\n\n" +
+          "For a Merkle allow-list stage. I'll ask for the proof your project published, " +
+          "check it against the stage's on-chain root, and only then offer to mint."
+      );
+    }
+
+    const { urls } = resolveRpcsForChain(ctx.store.getSettings().chainKey);
+    const root = await raceReadOrNull(urls, (url) => fetchAllowListRoot(url, contract));
+    if (!root) {
+      const stages = await explainNoPublicDrop(ctx.store.getSettings().chainKey, contract);
+      return ctx.reply(
+        "That collection has no Merkle allow-list stage.\n\n" + stages
+      );
+    }
+
+    ctx.session.allowlistContract = contract;
+    ctx.session.step = "awaiting_allowlist_json";
+    return ctx.reply(
+      `Allow-list stage found (root ${root.slice(0, 14)}…).\n\n` +
+        "Send the proof and stage terms as JSON — the project publishes these:\n\n" +
+        '{"proof":["0x…","0x…"],"mintParams":{"mintPrice":"0","maxTotalMintableByWallet":2,' +
+        '"startTime":0,"endTime":0,"dropStageIndex":1,"maxTokenSupplyForStage":0,"feeBps":1000,' +
+        '"restrictFeeRecipients":true}}\n\n' +
+        "I'll verify it against that root before anything is sent."
+    );
+  });
+
   bot.command("mint", async (ctx) => {
     const rawArgs = ctx.message.text.split(/\s+/).slice(1);
     const dryRun = rawArgs.includes("--dry");
@@ -2662,6 +2700,59 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
       if (ctx.from!.id !== ownerId) return;
       await runAsk(ctx, ctx.message.text.trim());
       return;
+    }
+
+    if (step === "awaiting_allowlist_json") {
+      ctx.session.step = undefined;
+      const contract = ctx.session.allowlistContract;
+      ctx.session.allowlistContract = undefined;
+      if (!contract) return ctx.reply("That request expired — run /allowlist <contract> again.");
+
+      let parsed;
+      try {
+        parsed = parseAllowListInput(ctx.message.text);
+      } catch (err: any) {
+        return ctx.reply(`❌ ${err.message}`);
+      }
+
+      const settings = ctx.store.getSettings();
+      const { urls } = resolveRpcsForChain(settings.chainKey);
+      const wallets = ctx.store.listWallets();
+      if (wallets.length === 0) return ctx.reply("Add a wallet first.");
+
+      // Checked per wallet: a proof is issued for one address, so the answer
+      // differs across your wallets and the wrong one reverts.
+      const lines: string[] = [];
+      const eligible: string[] = [];
+      for (const wallet of wallets) {
+        try {
+          const check = await raceRead(urls, (url) =>
+            checkAllowListProof(url, contract, wallet.address, parsed.params, parsed.proof)
+          );
+          if (check.ok) {
+            eligible.push(wallet.address);
+            lines.push(`  ✅ ${maskAddress(wallet.address)} — proof valid`);
+          } else {
+            lines.push(`  ⛔ ${maskAddress(wallet.address)} — ${check.reason}`);
+          }
+        } catch (err: any) {
+          lines.push(`  ? ${maskAddress(wallet.address)} — couldn't check (${describeRpcError(err)})`);
+        }
+      }
+
+      if (eligible.length === 0) {
+        return ctx.reply(
+          `No wallet here matches that proof.\n\n${lines.join("\n")}\n\n` +
+            "A proof is issued for one specific address and one set of stage terms — check you " +
+            "pasted the one for a wallet this bot holds."
+        );
+      }
+
+      return ctx.reply(
+        `${lines.join("\n")}\n\n` +
+          `Ready to mint from the allow-list stage with ${eligible.length} wallet(s). ` +
+          "Nothing has been sent — allow-list firing from the menu is the next piece."
+      );
     }
 
     if (step === "awaiting_copy_target") {
