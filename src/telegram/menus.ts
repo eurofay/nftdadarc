@@ -66,6 +66,15 @@ export function quickWalletsMenu(
     const tail = r.canMint === 0 ? (r.reason ?? "can't mint") : `${r.canMint} available`;
     return [Markup.button.callback(`${mark} ${r.label} — ${tail}`, `quick:w:${r.address}`)];
   });
+  // Select-all is the common intent for a public mint, and tapping ten
+  // wallets while a stage is live is the wrong use of those seconds.
+  const eligible = rows.filter((r) => r.canMint > 0);
+  if (eligible.length > 1) {
+    const allOn = eligible.every((r) => chosen.has(r.address.toLowerCase()));
+    buttons.push([
+      Markup.button.callback(allOn ? "◻️ Select none" : "☑️ Select all", "quick:all"),
+    ]);
+  }
   buttons.push([Markup.button.callback("➡️ Continue", "quick:go")]);
   buttons.push([Markup.button.callback("Cancel", "menu:main")]);
   return Markup.inlineKeyboard(buttons);

@@ -14,7 +14,7 @@
 // requires as a mint parameter (see seadrop-public.ts) — not a network call.
 
 import { performance } from "perf_hooks";
-import { Wallet, formatEther } from "ethers";
+import { Wallet, formatEther, formatUnits } from "ethers";
 import { blastToAll, parseRpcEndpoints, prepareBlast, waitForReceipt, PreparedBlast } from "./rpc-blast";
 import { warmConnections, startWarmKeeper } from "./connection-warmer";
 import { waitForMintTime } from "./timer";
@@ -22,6 +22,7 @@ import { explorerTx } from "./chains";
 import { LocalMintPlan } from "./seadrop-public";
 import { defaultLogger, Logger } from "./logger";
 import { gasLimitForQuantity } from "./gas";
+import { fitFeeToBalance, fitPriority } from "./gas-fit";
 import { createProvider } from "./rpc-provider";
 
 export interface LocalSnipeOpts {
@@ -71,32 +72,76 @@ export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<SnipeOutco
   // ── Warm sockets and pre-fetch everything the signature depends on ──
   await warmConnections(rpcUrls, log);
 
-  const [nonces, network] = await Promise.all([
+  const [nonces, network, balances, head] = await Promise.all([
     Promise.all(wallets.map((w) => provider.getTransactionCount(w.address, "pending"))),
     provider.getNetwork(),
+    // Balances and base fee feed the per-wallet fee fitting below. Fetched
+    // here, with the nonces, so none of it lands on the critical path.
+    Promise.all(wallets.map((w) => provider.getBalance(w.address).catch(() => null))),
+    provider.getBlock("latest").catch(() => null),
   ]);
   const chainId = network.chainId;
+  const baseFee = head?.baseFeePerGas ?? 0n;
   log.info(`  Nonces: [${nonces.join(", ")}] | chainId: ${chainId}`);
 
   // ── Sign everything now, well before the stage opens ──
   const signStart = performance.now();
+  const effectiveGasLimit = gasLimit > 0 ? gasLimit : gasLimitForQuantity(quantity);
   const prepared: { idx: number; address: string; blast: PreparedBlast }[] = [];
 
   for (let i = 0; i < wallets.length; i++) {
+    // The configured maxFee is a worst-case allowance, and a node reserves it
+    // in full — so a wallet holding the price plus modest gas is refused by
+    // the protocol before the mint is ever attempted. Where that wallet can
+    // still cover a viable fee, sign it at the lower ceiling rather than lose
+    // the mint. A wallet that can afford the configured fee is untouched.
+    let walletMaxFee = maxFeePerGas;
+    let walletPriority = maxPriorityFee;
+
+    const balance = balances[i];
+    if (balance !== null) {
+      const fit = fitFeeToBalance({
+        balanceWei: balance,
+        mintValueWei: plan.value,
+        gasLimit: effectiveGasLimit,
+        configuredMaxFeeWei: maxFeePerGas,
+        baseFeeWei: baseFee,
+        priorityWei: maxPriorityFee,
+      });
+      if (!fit) {
+        log.error(
+          `    [W${i}] ${wallets[i].address} skipped — ${formatEther(balance)} won't cover the mint plus a viable fee.`
+        );
+        continue;
+      }
+      if (fit.reduced) {
+        walletMaxFee = fit.maxFeePerGas;
+        walletPriority = fitPriority(fit.maxFeePerGas, maxPriorityFee);
+        log.warn(
+          `    [W${i}] fee ceiling lowered to ${formatUnits(walletMaxFee, "gwei")} gwei to fit this balance.`
+        );
+      }
+    }
+
     const rawTx = await wallets[i].signTransaction({
       to: plan.to,
       data: plan.data,
       value: plan.value,
       nonce: nonces[i],
-      maxFeePerGas,
-      maxPriorityFeePerGas: maxPriorityFee,
+      maxFeePerGas: walletMaxFee,
+      maxPriorityFeePerGas: walletPriority,
       // 0 (or unset) means "size it from the quantity" — see gas.ts. A
       // non-zero value is an explicit override and is honoured as given.
-      gasLimit: gasLimit > 0 ? gasLimit : gasLimitForQuantity(quantity),
+      gasLimit: effectiveGasLimit,
       type: 2,
       chainId,
     });
     prepared.push({ idx: i, address: wallets[i].address, blast: prepareBlast(rawTx) });
+  }
+
+  if (prepared.length === 0) {
+    log.errorBold("  No wallet could cover this mint — nothing signed, nothing sent.");
+    return { nftContract, quantity, chainId: Number(chainId), minted: [] };
   }
 
   log.success(

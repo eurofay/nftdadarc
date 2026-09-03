@@ -2222,6 +2222,15 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
     return ctx.editMessageReplyMarkup(quickWalletsMenu(q.ready, new Set(q.chosen)).reply_markup);
   });
 
+  bot.action("quick:all", (ctx) => {
+    const q = ctx.session.quick;
+    if (!q) return ctx.answerCbQuery("That expired — start again.", { show_alert: true });
+    const eligible = q.ready.filter((r) => r.canMint > 0).map((r) => r.address.toLowerCase());
+    const allOn = eligible.every((a) => q.chosen.includes(a));
+    q.chosen = allOn ? [] : eligible;
+    return ctx.editMessageReplyMarkup(quickWalletsMenu(q.ready, new Set(q.chosen)).reply_markup);
+  });
+
   bot.action("quick:go", async (ctx) => {
     const q = ctx.session.quick;
     if (!q) return ctx.answerCbQuery("That expired — start again.", { show_alert: true });
