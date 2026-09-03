@@ -20,6 +20,7 @@ export function mainMenu(isAdmin = false) {
   ];
   if (isAdmin) {
     rows.push([Markup.button.callback("⚡ FCFS / Allowlist", "menu:fcfs")]);
+    rows.push([Markup.button.callback("🔐 OpenSea Mint", "menu:osmint")]);
     rows.push([Markup.button.callback("🛠 Admin", "menu:admin")]);
   }
   return Markup.inlineKeyboard(rows);
@@ -85,6 +86,25 @@ export function quickConfirmMenu() {
     [Markup.button.callback("🔥 MINT NOW", "quick:fire")],
     [Markup.button.callback("Cancel", "menu:main")],
   ]);
+}
+
+// Stages OpenSea says these wallets may mint. Only eligible rows are
+// selectable — offering one OpenSea has already refused just wastes a tap and
+// ends in a protocol error.
+export function osMintStagesMenu(
+  rows: { wallet: string; label: string; stageType: string; canMint: number; reason?: string }[]
+) {
+  const buttons = rows.map((r) => [
+    Markup.button.callback(
+      r.canMint > 0
+        ? `✅ ${r.label} — ${r.stageType} ×${r.canMint}`
+        : `⛔ ${r.label} — ${r.reason ?? "not eligible"}`,
+      r.canMint > 0 ? `osmint:go:${r.wallet}` : "osmint:noop"
+    ),
+  ]);
+  buttons.push([Markup.button.callback("🔥 Mint with all eligible", "osmint:all")]);
+  buttons.push([Markup.button.callback("⬅ Back", "menu:main")]);
+  return Markup.inlineKeyboard(buttons);
 }
 
 export function adminMenu(inviteCount: number, userCount: number) {

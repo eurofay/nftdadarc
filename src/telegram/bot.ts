@@ -7,7 +7,7 @@
 
 import { Telegraf, Markup, Context } from "telegraf";
 import { message } from "telegraf/filters";
-import { isAddress, formatEther, parseEther } from "ethers";
+import { isAddress, formatEther, parseEther, Wallet } from "ethers";
 import { generateMnemonic, deriveWallets, isValidMnemonic } from "../hd-wallet";
 import { createProvider, describeRpcError } from "../rpc-provider";
 import { TelegramStore, WalletRecord, ScheduledMint } from "./store";
@@ -27,6 +27,7 @@ import {
   fcfsViewMenu,
   quickWalletsMenu,
   quickConfirmMenu,
+  osMintStagesMenu,
   adminInvitesMenu,
   walletsMenu,
   walletDetailMenu,
@@ -81,6 +82,7 @@ import { gasLimitForQuantity, upfrontReservation } from "../gas";
 import { raceRead, raceReadOrNull } from "../fast-read";
 import { readStages, describeStages, checkEligibility, describeEligibility } from "../seadrop-stages";
 import { stageWindow, assessWallet } from "../mint-readiness";
+import { OpenSeaMintClient, OpenSeaMintError } from "../opensea-mint";
 import {
   fetchAllowListRoot,
   checkAllowListProof,
@@ -105,6 +107,7 @@ interface SessionData {
     | "awaiting_allowlist_json"
     | "awaiting_quick_target"
     | "awaiting_quick_quantity"
+    | "awaiting_osmint_target"
     | "awaiting_agent_question"
     | "awaiting_copy_target"
     | "awaiting_fund_amount"
@@ -129,6 +132,12 @@ interface SessionData {
   sellPriceEth?: number;
   pendingRestore?: string;
   allowlistContract?: string;
+  osmint?: {
+    contract: string;
+    slug: string;
+    name?: string;
+    rows: { wallet: string; label: string; stageType: string; canMint: number; reason?: string }[];
+  };
   quick?: {
     contract: string;
     name?: string;
@@ -2323,6 +2332,116 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
     }
   });
 
+  // ── OpenSea Mint, owner only ──────────────────────────────────────────
+  // The one path that reaches stages whose permission is not on-chain. Each
+  // wallet signs in to OpenSea as itself, OpenSea says which stages it may
+  // mint, and hands back the transaction — signature or proof already inside
+  // the calldata. Firing still goes through the local engine, so the speed
+  // work applies here too.
+  bot.action("menu:osmint", (ctx) => {
+    if (!requireOwner(ctx)) return;
+    ctx.session.osmint = undefined;
+    ctx.session.step = "awaiting_osmint_target";
+    return ctx.editMessageText(
+      "🔐 OpenSea Mint\n\n" +
+        "Send an OpenSea link or contract address.\n\n" +
+        "Each wallet signs in to OpenSea as itself, then I ask which stages it can " +
+        "mint — allow-list and signed stages included, since OpenSea issues the " +
+        "signature to wallets it considers eligible.\n\n" +
+        "Signing in proves ownership only. It moves nothing and approves no spend.",
+      Markup.inlineKeyboard([[Markup.button.callback("Cancel", "menu:main")]])
+    );
+  });
+
+  bot.action("osmint:noop", (ctx) =>
+    ctx.answerCbQuery("OpenSea says that wallet isn't eligible.", { show_alert: true })
+  );
+
+  bot.action(/^osmint:go:(.+)$/, (ctx) => fireOpenSeaMint(ctx, [ctx.match[1]]));
+
+  bot.action("osmint:all", (ctx) => {
+    const eligible = (ctx.session.osmint?.rows ?? []).filter((r) => r.canMint > 0).map((r) => r.wallet);
+    if (eligible.length === 0) {
+      return ctx.answerCbQuery("No eligible wallet to mint with.", { show_alert: true });
+    }
+    return fireOpenSeaMint(ctx, eligible);
+  });
+
+  /**
+   * Fetch fresh calldata and fire it.
+   *
+   * The calldata is fetched at fire time rather than reused from the
+   * eligibility check: it carries a signature that OpenSea issues for a
+   * specific wallet and moment, and a stale one is refused on-chain.
+   */
+  async function fireOpenSeaMint(ctx: BotContext, wallets: string[]): Promise<unknown> {
+    if (!requireOwner(ctx)) return;
+    const session = ctx.session.osmint;
+    if (!session) return ctx.answerCbQuery("That expired — start again.", { show_alert: true });
+
+    await ctx.answerCbQuery("Fetching calldata…");
+    const settings = ctx.store.getSettings();
+    const chain = resolveChain(settings.chainKey);
+    const { urls } = resolveRpcsForChain(settings.chainKey);
+    const logger = createLogger(createTelegramSink(bot, ctx.chat!.id));
+
+    for (const address of wallets) {
+      const row = session.rows.find((r) => r.wallet.toLowerCase() === address.toLowerCase());
+      if (!row || row.canMint < 1) continue;
+      try {
+        const wallet = new Wallet(ctx.store.getDecryptedKey(address));
+        const client = new OpenSeaMintClient();
+        await client.login(wallet, chain?.chainId ?? 1);
+
+        const calldata = await client.mintCalldata({
+          address: wallet.address,
+          contractAddress: session.contract,
+          chainIdentifier: settings.chainKey,
+          tokenId: "0",
+          quantity: row.canMint,
+        });
+
+        const outcome = await localPublicSnipe({
+          nftContract: session.contract,
+          quantity: row.canMint,
+          walletKeys: [ctx.store.getDecryptedKey(address)],
+          rpcUrls: urls,
+          maxFeePerGas: gweiToWei(settings.maxFeeGwei),
+          maxPriorityFee: gweiToWei(settings.priorityGwei),
+          gasLimit: settings.gasLimit,
+          targetStart: null,
+          // OpenSea returned a complete transaction, so there is no public
+          // drop to read — the engine only needs somewhere to send bytes.
+          plan: {
+            to: calldata.to,
+            data: calldata.data,
+            value: calldata.value,
+            feeRecipient: calldata.to,
+            drop: {
+              mintPrice: row.canMint > 0 ? calldata.value / BigInt(row.canMint) : 0n,
+              startTime: 0,
+              endTime: 0,
+              maxTotalMintableByWallet: row.canMint,
+              feeBps: 0,
+              restrictFeeRecipients: false,
+            },
+          },
+          logger,
+        });
+
+        await recordOutcome(ctx.store, settings.chainKey, outcome, {
+          bot,
+          chatId: ctx.chat!.id,
+          source: "Manual Mint",
+        });
+      } catch (err: any) {
+        const kind = err instanceof OpenSeaMintError ? ` (${err.kind})` : "";
+        logger.errorBold(`${maskAddress(address)}: ${err?.message ?? err}${kind}`);
+      }
+    }
+    return undefined;
+  }
+
   bot.action("menu:fcfs", (ctx) => {
     if (!requireOwner(ctx)) return;
     const armed = ctx.store.listPendingScheduled().filter((r) => r.allowlist);
@@ -3148,6 +3267,87 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
       if (ctx.from!.id !== ownerId) return;
       await runAsk(ctx, ctx.message.text.trim());
       return;
+    }
+
+    if (step === "awaiting_osmint_target") {
+      ctx.session.step = undefined;
+      if (!requireOwner(ctx)) return;
+
+      const settings = ctx.store.getSettings();
+      const chain = resolveChain(settings.chainKey);
+      const note = await ctx.reply("Signing in and checking eligibility…");
+      const say = (text: string, extra?: any) =>
+        ctx.telegram.editMessageText(note.chat.id, note.message_id, undefined, text, extra).catch(() => {});
+
+      let contract: string;
+      try {
+        contract = await resolveMintTarget(ctx.message.text.trim(), settings.chainKey);
+      } catch (err: any) {
+        return say(`Couldn't read that as a collection: ${err?.message ?? err}`);
+      }
+
+      const info = await openseaContractInfo(settings.chainKey, contract, process.env.OPENSEA_API_KEY).catch(
+        () => null
+      );
+      if (!info?.slug) {
+        return say(
+          "OpenSea doesn't have a collection slug for that contract, and the eligibility " +
+            "query is keyed by slug. Send the OpenSea collection link instead."
+        );
+      }
+
+      const wallets = ctx.store.listWallets();
+      if (wallets.length === 0) return say("Add a wallet first.");
+
+      // One sign-in per wallet: eligibility is a property of the address, so
+      // each has to authenticate as itself. Done sequentially to stay well
+      // inside OpenSea's rate limit — this runs before the race, not during.
+      const rows: { wallet: string; label: string; stageType: string; canMint: number; reason?: string }[] = [];
+      for (const w of wallets) {
+        try {
+          const client = new OpenSeaMintClient();
+          await client.login(new Wallet(ctx.store.getDecryptedKey(w.address)), chain?.chainId ?? 1);
+          const stages = await client.eligibility(info.slug, w.address);
+          const usable = stages.filter((s) => s.isEligible);
+          if (usable.length === 0) {
+            rows.push({ wallet: w.address, label: w.label, stageType: "—", canMint: 0, reason: "no eligible stage" });
+            continue;
+          }
+          // Best available: the stage allowing the most, since they are
+          // mutually exclusive at any one moment anyway.
+          const best = usable.reduce((a, b) =>
+            (b.eligibleMaxTotalMintableByWallet ?? b.maxTotalMintableByWallet ?? 1) >
+            (a.eligibleMaxTotalMintableByWallet ?? a.maxTotalMintableByWallet ?? 1)
+              ? b
+              : a
+          );
+          rows.push({
+            wallet: w.address,
+            label: w.label,
+            stageType: best.stageType,
+            canMint: best.eligibleMaxTotalMintableByWallet ?? best.maxTotalMintableByWallet ?? 1,
+          });
+        } catch (err: any) {
+          rows.push({
+            wallet: w.address,
+            label: w.label,
+            stageType: "—",
+            canMint: 0,
+            reason: err instanceof OpenSeaMintError ? err.kind : "check failed",
+          });
+        }
+      }
+
+      ctx.session.osmint = { contract, slug: info.slug, name: info.name, rows };
+      const eligible = rows.filter((r) => r.canMint > 0).length;
+      return say(
+        `🔐 ${info.name ?? info.slug}\n\n` +
+          (eligible > 0
+            ? `${eligible} of ${rows.length} wallet(s) eligible. Calldata is fetched fresh when you fire — ` +
+              "a signature is issued for one wallet and moment."
+            : "No wallet is eligible for any stage right now."),
+        osMintStagesMenu(rows)
+      );
     }
 
     if (step === "awaiting_quick_target") {
