@@ -3509,7 +3509,7 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
         // 0 means "read the base fee at signing time". A hand-set ceiling is
         // a guess that ages: too low and nothing lands, too high and every
         // wallet reserves more than the block costs.
-        store.updateSettings({ maxFeeGwei: 0 });
+        ctx.store.updateSettings({ maxFeeGwei: 0 });
         return ctx.reply(
           "✅ Max fee now follows the chain — read fresh at signing time, with headroom for it rising.\n\n" +
             "This also lowers what each wallet must hold, since the ceiling is what gets reserved.",
