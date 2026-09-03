@@ -25,6 +25,8 @@ import {
   fcfsMenu,
   fcfsArmMenu,
   fcfsViewMenu,
+  quickWalletsMenu,
+  quickConfirmMenu,
   adminInvitesMenu,
   walletsMenu,
   walletDetailMenu,
@@ -78,6 +80,7 @@ import { MintCardData } from "../mint-card";
 import { gasLimitForQuantity, upfrontReservation } from "../gas";
 import { raceRead, raceReadOrNull } from "../fast-read";
 import { readStages, describeStages, checkEligibility, describeEligibility } from "../seadrop-stages";
+import { stageWindow, assessWallet } from "../mint-readiness";
 import {
   fetchAllowListRoot,
   checkAllowListProof,
@@ -100,6 +103,8 @@ interface SessionData {
     | "awaiting_seed_import"
     | "awaiting_restore_file"
     | "awaiting_allowlist_json"
+    | "awaiting_quick_target"
+    | "awaiting_quick_quantity"
     | "awaiting_agent_question"
     | "awaiting_copy_target"
     | "awaiting_fund_amount"
@@ -124,6 +129,16 @@ interface SessionData {
   sellPriceEth?: number;
   pendingRestore?: string;
   allowlistContract?: string;
+  quick?: {
+    contract: string;
+    name?: string;
+    slug?: string;
+    priceWei: string;
+    maxPerWallet: number;
+    ready: { address: string; label: string; canMint: number; reason?: string }[];
+    chosen: string[];
+    quantity?: number;
+  };
   allowlistReady?: { contract: string; wallets: string[]; params: string; proof: string[]; quantity: number }; // snapshot JSON held between upload and confirm
 }
 interface BotContext extends Context {
@@ -2177,6 +2192,126 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
   // where the bot's speed work gives a real edge. This one mints against
   // terms that came from a published list, and belongs to whoever runs the
   // bot rather than to a tester.
+  // ── Quick Mint ────────────────────────────────────────────────────────
+  // For a stage that is live NOW. Paste a link, pick wallets, fire. Every
+  // check that would otherwise show up as a revert happens before the button
+  // appears: is the stage open, can each wallet still mint, and can it cover
+  // the reservation rather than merely the price.
+  bot.action("menu:quick", (ctx) => {
+    ctx.session.quick = undefined;
+    ctx.session.step = "awaiting_quick_target";
+    return ctx.editMessageText(
+      "⚡ Quick Mint\n\n" +
+        "Send an OpenSea link or a contract address for a stage that's live now.\n\n" +
+        "I'll check which of your wallets can mint it and how many, then it's one button.",
+      Markup.inlineKeyboard([[Markup.button.callback("Cancel", "menu:main")]])
+    );
+  });
+
+  bot.action(/^quick:w:(.+)$/, (ctx) => {
+    const q = ctx.session.quick;
+    if (!q) return ctx.answerCbQuery("That expired — start again.", { show_alert: true });
+    const address = ctx.match[1].toLowerCase();
+    const row = q.ready.find((r) => r.address.toLowerCase() === address);
+    if (!row || row.canMint === 0) {
+      return ctx.answerCbQuery(row?.reason ?? "That wallet can't mint this.", { show_alert: true });
+    }
+    q.chosen = q.chosen.includes(address)
+      ? q.chosen.filter((a) => a !== address)
+      : [...q.chosen, address];
+    return ctx.editMessageReplyMarkup(quickWalletsMenu(q.ready, new Set(q.chosen)).reply_markup);
+  });
+
+  bot.action("quick:go", async (ctx) => {
+    const q = ctx.session.quick;
+    if (!q) return ctx.answerCbQuery("That expired — start again.", { show_alert: true });
+    if (q.chosen.length === 0) return ctx.answerCbQuery("Pick at least one wallet.", { show_alert: true });
+
+    const usable = q.ready.filter((r) => q.chosen.includes(r.address.toLowerCase()));
+    const most = Math.max(...usable.map((r) => r.canMint));
+
+    // One mintable item means there is nothing to ask, and asking anyway puts
+    // a tap between the user and a live stage.
+    if (most <= 1) {
+      q.quantity = 1;
+      return showQuickConfirm(ctx);
+    }
+    ctx.session.step = "awaiting_quick_quantity";
+    await ctx.answerCbQuery();
+    return ctx.reply(`How many per wallet? Up to ${most}. Send a number, or "max".`);
+  });
+
+  async function showQuickConfirm(ctx: BotContext): Promise<unknown> {
+    const q = ctx.session.quick!;
+    const usable = q.ready.filter((r) => q.chosen.includes(r.address.toLowerCase()));
+    const price = BigInt(q.priceWei);
+    const lines = usable.map((r) => {
+      const n = Math.min(r.canMint, q.quantity ?? r.canMint);
+      return `  ${r.label} — ${n}`;
+    });
+    const total = usable.reduce(
+      (sum, r) => sum + price * BigInt(Math.min(r.canMint, q.quantity ?? r.canMint)),
+      0n
+    );
+    return ctx.reply(
+      `⚡ ${q.name ?? q.contract}\n\n` +
+        `${lines.join("\n")}\n\n` +
+        `Price: ${price === 0n ? "FREE" : formatEther(price) + " ETH each"}\n` +
+        `Total: ${total === 0n ? "gas only" : formatEther(total) + " ETH + gas"}`,
+      quickConfirmMenu()
+    );
+  }
+
+  bot.action("quick:fire", async (ctx) => {
+    const q = ctx.session.quick;
+    ctx.session.quick = undefined;
+    if (!q) return ctx.answerCbQuery("That expired — start again.", { show_alert: true });
+
+    await ctx.answerCbQuery("Firing...");
+    const settings = ctx.store.getSettings();
+    const { urls } = resolveRpcsForChain(settings.chainKey);
+    const logger = createLogger(createTelegramSink(bot, ctx.chat!.id));
+    const usable = q.ready.filter((r) => q.chosen.includes(r.address.toLowerCase()));
+
+    // Wallets can differ in how many they may take, and one plan carries one
+    // quantity — so they are grouped and each group fired with its own.
+    const byQuantity = new Map<number, string[]>();
+    for (const r of usable) {
+      const n = Math.min(r.canMint, q.quantity ?? r.canMint);
+      if (n < 1) continue;
+      byQuantity.set(n, [...(byQuantity.get(n) ?? []), r.address]);
+    }
+
+    for (const [quantity, addresses] of byQuantity) {
+      try {
+        const plan = await raceReadOrNull(urls, (url) => buildLocalMintPlan(url, q.contract, quantity), logger);
+        if (!plan) {
+          logger.errorBold(`${q.name ?? q.contract}: drop not resolvable — nothing sent.`);
+          continue;
+        }
+        const outcome = await localPublicSnipe({
+          nftContract: q.contract,
+          quantity,
+          walletKeys: addresses.map((a) => ctx.store.getDecryptedKey(a)),
+          rpcUrls: urls,
+          maxFeePerGas: gweiToWei(settings.maxFeeGwei),
+          maxPriorityFee: gweiToWei(settings.priorityGwei),
+          gasLimit: settings.gasLimit,
+          targetStart: null,
+          plan,
+          logger,
+        });
+        await recordOutcome(ctx.store, settings.chainKey, outcome, {
+          bot,
+          chatId: ctx.chat!.id,
+          source: "Manual Mint",
+        });
+      } catch (err: any) {
+        logger.errorBold(`Quick mint failed: ${err?.message ?? err}`);
+      }
+    }
+  });
+
   bot.action("menu:fcfs", (ctx) => {
     if (!requireOwner(ctx)) return;
     const armed = ctx.store.listPendingScheduled().filter((r) => r.allowlist);
@@ -3002,6 +3137,109 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
       if (ctx.from!.id !== ownerId) return;
       await runAsk(ctx, ctx.message.text.trim());
       return;
+    }
+
+    if (step === "awaiting_quick_target") {
+      ctx.session.step = undefined;
+      const note = await ctx.reply("Checking the stage and your wallets…");
+
+      const settings = ctx.store.getSettings();
+      const { urls } = resolveRpcsForChain(settings.chainKey);
+      const say = (text: string, extra?: any) =>
+        ctx.telegram.editMessageText(note.chat.id, note.message_id, undefined, text, extra).catch(() => {});
+
+      let contract: string;
+      try {
+        contract = await resolveMintTarget(ctx.message.text.trim(), settings.chainKey);
+      } catch (err: any) {
+        return say(`Couldn't read that as a collection: ${err?.message ?? err}`);
+      }
+
+      const plan = await raceReadOrNull(urls, (url) => buildLocalMintPlan(url, contract, 1));
+      if (!plan) {
+        return say(await explainNoPublicDrop(settings.chainKey, contract));
+      }
+
+      // A stage that hasn't opened is not a Quick Mint — it's a scheduled one,
+      // and saying so is more useful than a revert.
+      const window = stageWindow(plan.drop.startTime, plan.drop.endTime);
+      if (!window.live) {
+        return say(
+          window.ended
+            ? "That stage has already ended."
+            : `That stage opens in ${Math.ceil(window.opensInMs / 60000)} minute(s). ` +
+                "Use Scheduled Mint to arm it instead."
+        );
+      }
+
+      const wallets = ctx.store.listWallets();
+      if (wallets.length === 0) return say("Add a wallet first.");
+
+      const ready = await Promise.all(
+        wallets.map(async (w) => {
+          const [balance, elig] = await Promise.all([
+            raceRead(urls, (url) => createProvider(url).getBalance(w.address)).catch(() => null),
+            raceRead(urls, (url) =>
+              checkEligibility(url, contract, w.address, plan.drop.maxTotalMintableByWallet)
+            ).catch(() => null),
+          ]);
+          const r = assessWallet(w.address, {
+            balanceWei: balance,
+            mintPriceWei: plan.drop.mintPrice,
+            maxFeePerGas: gweiToWei(settings.maxFeeGwei),
+            gasLimit: settings.gasLimit,
+            maxPerWallet: plan.drop.maxTotalMintableByWallet,
+            alreadyMinted: elig?.alreadyMinted ?? 0,
+            supplyRemaining: elig?.supplyRemaining ?? plan.drop.maxTotalMintableByWallet,
+          });
+          return { address: w.address, label: w.label, canMint: r.canMint, reason: r.reason };
+        })
+      );
+
+      const info = await openseaContractInfo(settings.chainKey, contract, process.env.OPENSEA_API_KEY).catch(
+        () => null
+      );
+      ctx.session.quick = {
+        contract,
+        name: info?.name,
+        slug: info?.slug,
+        priceWei: plan.drop.mintPrice.toString(),
+        maxPerWallet: plan.drop.maxTotalMintableByWallet,
+        ready,
+        chosen: ready.filter((r) => r.canMint > 0).map((r) => r.address.toLowerCase()),
+      };
+
+      const usable = ready.filter((r) => r.canMint > 0).length;
+      if (usable === 0) {
+        return say(
+          `🔴 No wallet can mint ${info?.name ?? contract} right now:\n\n` +
+            ready.map((r) => `  ⛔ ${r.label} — ${r.reason ?? "can't mint"}`).join("\n")
+        );
+      }
+
+      // Every eligible wallet is pre-selected: the common case is "all of
+      // them", and a live stage is the wrong moment to make someone tick boxes.
+      return say(
+        `🟢 LIVE — ${info?.name ?? contract}\n` +
+          `${plan.drop.mintPrice === 0n ? "FREE" : formatEther(plan.drop.mintPrice) + " ETH"} · ` +
+          `max ${plan.drop.maxTotalMintableByWallet} per wallet\n\n` +
+          "Tap to deselect any wallet, then Continue.",
+        quickWalletsMenu(ready, new Set(ctx.session.quick.chosen))
+      );
+    }
+
+    if (step === "awaiting_quick_quantity") {
+      ctx.session.step = undefined;
+      const q = ctx.session.quick;
+      if (!q) return ctx.reply("That expired — start Quick Mint again.");
+      const raw = ctx.message.text.trim().toLowerCase();
+      const usable = q.ready.filter((r) => q.chosen.includes(r.address.toLowerCase()));
+      const most = Math.max(...usable.map((r) => r.canMint));
+      const wanted = raw === "max" ? most : parseInt(raw, 10);
+      if (!Number.isFinite(wanted) || wanted < 1) return ctx.reply('Send a number, or "max".');
+      q.quantity = Math.min(wanted, most);
+      if (wanted > most) await ctx.reply(`Capped to ${most} — that's the most any chosen wallet can take.`);
+      return showQuickConfirm(ctx);
     }
 
     if (step === "awaiting_allowlist_json") {

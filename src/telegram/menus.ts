@@ -15,6 +15,7 @@ export function mainMenu(isAdmin = false) {
     [Markup.button.callback("🎯 Auto Mint", "menu:auto"), Markup.button.callback("👀 Copy Mint", "menu:copy")],
     [Markup.button.callback("💸 Fund Wallets", "menu:fund"), Markup.button.callback("⏰ Scheduled Mint", "menu:sched")],
     [Markup.button.callback("🖼 Portfolio", "menu:portfolio"), Markup.button.callback("🔔 Activity Alerts", "menu:activity")],
+    [Markup.button.callback("⚡ Quick Mint", "menu:quick")],
     [Markup.button.callback("📊 Status", "menu:status")],
   ];
   if (isAdmin) {
@@ -51,6 +52,29 @@ export function fcfsViewMenu(id: string) {
   return Markup.inlineKeyboard([
     [Markup.button.callback("🗑 Cancel this", `fcfs:cancel:${id}`)],
     [Markup.button.callback("⬅ Back", "menu:fcfs")],
+  ]);
+}
+
+// Wallet picker for Quick Mint. Only wallets that can actually mint are
+// selectable — offering one that will revert is worse than not offering it.
+export function quickWalletsMenu(
+  rows: { address: string; label: string; canMint: number; reason?: string }[],
+  chosen: Set<string>
+) {
+  const buttons = rows.map((r) => {
+    const mark = r.canMint === 0 ? "⛔" : chosen.has(r.address.toLowerCase()) ? "✅" : "⬜";
+    const tail = r.canMint === 0 ? (r.reason ?? "can't mint") : `${r.canMint} available`;
+    return [Markup.button.callback(`${mark} ${r.label} — ${tail}`, `quick:w:${r.address}`)];
+  });
+  buttons.push([Markup.button.callback("➡️ Continue", "quick:go")]);
+  buttons.push([Markup.button.callback("Cancel", "menu:main")]);
+  return Markup.inlineKeyboard(buttons);
+}
+
+export function quickConfirmMenu() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback("🔥 MINT NOW", "quick:fire")],
+    [Markup.button.callback("Cancel", "menu:main")],
   ]);
 }
 
