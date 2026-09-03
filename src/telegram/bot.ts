@@ -82,6 +82,7 @@ import {
   encodeMintAllowList,
   MintParams,
 } from "../seadrop-allowlist";
+import { findAllowListUri, fetchAllowList, parseAllowList, deriveProof } from "../allowlist-fetch";
 import { renderMintCardPng } from "../mint-card-render";
 import { acceptOfferViaSdk, acceptOfferWithFallback, createListing, parseListingPrice } from "../opensea-sell";
 import { createLogger, withPrefix, LogSink } from "../logger";
@@ -2259,6 +2260,62 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
       return ctx.reply(
         "That collection has no Merkle allow-list stage.\n\n" + stages
       );
+    }
+
+    // Try to derive it ourselves first. SeaDrop puts a pointer to the
+    // published list on-chain, so in the common case the user never has to
+    // find a proof at all.
+    const note = await ctx.reply("Looking for the published allow list on-chain…");
+    const found = await raceReadOrNull(urls, (url) => findAllowListUri(url, contract));
+    if (found) {
+      try {
+        const entries = parseAllowList(await fetchAllowList(found.uri));
+        const lines: string[] = [];
+        let ready: { wallet: string; derived: NonNullable<ReturnType<typeof deriveProof>> } | null = null;
+
+        for (const wallet of ctx.store.listWallets()) {
+          const derived = deriveProof(entries, wallet.address, root);
+          if (!derived) {
+            lines.push(`  ⛔ ${maskAddress(wallet.address)} — not on the list`);
+          } else if (!derived.matchesChain) {
+            // Our tree doesn't reproduce the stored root, so the proof would
+            // revert. Either the list moved on or the encoding is off.
+            lines.push(`  ⚠️ ${maskAddress(wallet.address)} — list doesn't match the on-chain root`);
+          } else {
+            lines.push(`  ✅ ${maskAddress(wallet.address)} — proof derived`);
+            if (!ready) ready = { wallet: wallet.address, derived };
+          }
+        }
+
+        if (ready) {
+          const quantity = Number(ready.derived.params.maxTotalMintableByWallet);
+          ctx.session.allowlistReady = {
+            contract,
+            wallets: [ready.wallet],
+            params: JSON.stringify(ready.derived.params, (_k, v) =>
+              typeof v === "bigint" ? v.toString() : v
+            ),
+            proof: ready.derived.proof,
+            quantity,
+          };
+          return ctx.telegram
+            .editMessageText(
+              note.chat.id,
+              note.message_id,
+              undefined,
+              `Found the list (${entries.length} entries).\n\n${lines.join("\n")}\n\n` +
+                `Mint ${quantity} from the allow-list stage?`,
+              allowlistConfirmMenu()
+            )
+            .catch(() => {});
+        }
+
+        await ctx.reply(
+          `Found the list (${entries.length} entries), but no wallet here can use it:\n\n${lines.join("\n")}`
+        );
+      } catch (err: any) {
+        await ctx.reply(`Found a list at ${found.uri} but couldn't use it: ${err?.message ?? err}`);
+      }
     }
 
     ctx.session.allowlistContract = contract;
