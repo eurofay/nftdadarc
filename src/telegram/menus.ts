@@ -17,8 +17,41 @@ export function mainMenu(isAdmin = false) {
     [Markup.button.callback("🖼 Portfolio", "menu:portfolio"), Markup.button.callback("🔔 Activity Alerts", "menu:activity")],
     [Markup.button.callback("📊 Status", "menu:status")],
   ];
-  if (isAdmin) rows.push([Markup.button.callback("🛠 Admin", "menu:admin")]);
+  if (isAdmin) {
+    rows.push([Markup.button.callback("⚡ FCFS / Allowlist", "menu:fcfs")]);
+    rows.push([Markup.button.callback("🛠 Admin", "menu:admin")]);
+  }
   return Markup.inlineKeyboard(rows);
+}
+
+// Armed allow-list mints. Kept apart from Scheduled Mint on purpose: that one
+// fires the public stage and is the path with a real speed edge, and mixing a
+// pasted-proof flow into it would put risk on the path that already works.
+export function fcfsMenu(armed: { id: string; name?: string; nftContract: string; targetStartMs: number }[]) {
+  const rows = armed.slice(0, 10).map((a) => [
+    Markup.button.callback(
+      `⚡ ${a.name || maskAddress(a.nftContract)} — ${new Date(a.targetStartMs).toISOString().slice(11, 16)}Z`,
+      `fcfs:view:${a.id}`
+    ),
+  ]);
+  rows.push([Markup.button.callback("➕ Arm a collection", "fcfs:add")]);
+  rows.push([Markup.button.callback("⬅ Back", "menu:main")]);
+  return Markup.inlineKeyboard(rows);
+}
+
+export function fcfsArmMenu() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback("⏰ Arm for stage start", "fcfs:arm")],
+    [Markup.button.callback("🔥 Mint now instead", "allowlist:fire")],
+    [Markup.button.callback("Cancel", "menu:fcfs")],
+  ]);
+}
+
+export function fcfsViewMenu(id: string) {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback("🗑 Cancel this", `fcfs:cancel:${id}`)],
+    [Markup.button.callback("⬅ Back", "menu:fcfs")],
+  ]);
 }
 
 export function adminMenu(inviteCount: number, userCount: number) {

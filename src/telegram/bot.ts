@@ -22,6 +22,9 @@ import {
   adminRevokeConfirmMenu,
   restoreConfirmMenu,
   allowlistConfirmMenu,
+  fcfsMenu,
+  fcfsArmMenu,
+  fcfsViewMenu,
   adminInvitesMenu,
   walletsMenu,
   walletDetailMenu,
@@ -64,7 +67,7 @@ import {
   groupByCollection,
   openseaCollectionUrl,
 } from "../opensea-market";
-import { resolveFeeRecipient, buildLocalMintPlan } from "../seadrop-public";
+import { resolveFeeRecipient, buildLocalMintPlan, LocalMintPlan } from "../seadrop-public";
 import { localPublicSnipe } from "../local-mint";
 import { runAutoMintWatcher } from "../auto-mint";
 import { runCopyMintWatcher } from "../copy-mint";
@@ -2169,6 +2172,96 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
   // project publishes the list, the holder of a wallet on it can mint without
   // anyone's blessing. Signed stages are a different thing entirely and no
   // amount of this helps them; see seadrop-allowlist.ts.
+  // ── FCFS / allow-list, owner only ─────────────────────────────────────
+  // Separate from Scheduled Mint deliberately: that fires the public stage,
+  // where the bot's speed work gives a real edge. This one mints against
+  // terms that came from a published list, and belongs to whoever runs the
+  // bot rather than to a tester.
+  bot.action("menu:fcfs", (ctx) => {
+    if (!requireOwner(ctx)) return;
+    const armed = ctx.store.listPendingScheduled().filter((r) => r.allowlist);
+    return ctx.editMessageText(
+      armed.length > 0
+        ? `⚡ ${armed.length} allow-list mint(s) armed. They fire on their own and survive a restart.`
+        : "⚡ FCFS / Allowlist\n\nArm a collection and it fires the moment its stage opens — " +
+            "no website, no wallet connect. Merkle stages only; a signed stage needs a " +
+            "signature only the project can issue.",
+      fcfsMenu(armed)
+    );
+  });
+
+  bot.action("fcfs:add", (ctx) => {
+    if (!requireOwner(ctx)) return;
+    ctx.session.step = "awaiting_allowlist_json";
+    ctx.session.allowlistContract = undefined;
+    return ctx.reply(
+      "Send the contract address.\n\n" +
+        "I'll look for the published allow list on-chain and derive your proof. " +
+        "If the project publishes no URI, paste the proof JSON instead."
+    );
+  });
+
+  bot.action(/^fcfs:view:(.+)$/, (ctx) => {
+    if (!requireOwner(ctx)) return;
+    const record = ctx.store.listScheduled().find((r) => r.id === ctx.match[1]);
+    if (!record) return ctx.answerCbQuery("That's gone.", { show_alert: true });
+    const when = new Date(record.targetStartMs);
+    return ctx.editMessageText(
+      `⚡ ${record.name || record.nftContract}\n\n` +
+        `Contract: ${record.nftContract}\n` +
+        `Quantity: ${record.quantity} x ${record.wallets.length} wallet(s)\n` +
+        `Fires: ${toIST(when)} IST\n` +
+        `Proof: ${record.allowlist?.proof.length ?? 0} hashes, verified against the on-chain root`,
+      fcfsViewMenu(record.id)
+    );
+  });
+
+  bot.action(/^fcfs:cancel:(.+)$/, (ctx) => {
+    if (!requireOwner(ctx)) return;
+    ctx.store.removeScheduled(ctx.match[1]);
+    const armed = ctx.store.listPendingScheduled().filter((r) => r.allowlist);
+    return ctx.editMessageText("Cancelled.", fcfsMenu(armed));
+  });
+
+  bot.action("fcfs:arm", async (ctx) => {
+    if (!requireOwner(ctx)) return;
+    const ready = ctx.session.allowlistReady;
+    ctx.session.allowlistReady = undefined;
+    if (!ready) return ctx.answerCbQuery("That expired — arm it again.", { show_alert: true });
+
+    const params = JSON.parse(ready.params);
+    const startMs = Number(params.startTime) * 1000;
+    // The stage carries its own opening time, so there is nothing to ask for:
+    // if it has already opened, firing now IS the right target.
+    const targetStartMs = startMs > Date.now() ? startMs : Date.now();
+
+    const settings = ctx.store.getSettings();
+    const info = await openseaContractInfo(settings.chainKey, ready.contract, process.env.OPENSEA_API_KEY).catch(
+      () => null
+    );
+
+    const record = ctx.store.addScheduled({
+      chainKey: settings.chainKey,
+      nftContract: ready.contract,
+      name: info?.name,
+      slug: info?.slug,
+      quantity: ready.quantity,
+      wallets: ready.wallets,
+      targetStartMs,
+      allowlist: { proof: ready.proof, params: ready.params },
+    });
+
+    void runScheduled(ctx.store, record.id, ctx.chat!.id);
+
+    await ctx.answerCbQuery("Armed.");
+    return ctx.editMessageText(
+      `⚡ Armed: ${record.name || record.nftContract}\n\n` +
+        `Fires ${toIST(new Date(targetStartMs))} IST with ${record.wallets.length} wallet(s).\n` +
+        "Pre-signed and sockets held warm through the wait. Survives a restart.",
+      fcfsMenu(ctx.store.listPendingScheduled().filter((r) => r.allowlist))
+    );
+  });
+
   bot.action("allowlist:fire", async (ctx) => {
     if (!requireOwner(ctx)) return;
     const ready = ctx.session.allowlistReady;
@@ -2240,18 +2333,13 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
     }
   });
 
-  bot.command("allowlist", async (ctx) => {
-    // Owner only. This spends from wallets against terms pasted in by hand,
-    // with no on-chain price to sanity-check them against.
-    if (!requireOwner(ctx)) return;
-    const contract = ctx.message.text.split(/\s+/)[1]?.trim();
-    if (!contract || !isAddress(contract)) {
-      return ctx.reply(
-        "Usage: /allowlist <contract address>\n\n" +
-          "For a Merkle allow-list stage. I'll ask for the proof your project published, " +
-          "check it against the stage's on-chain root, and only then offer to mint."
-      );
-    }
+  /**
+   * Look up a collection's allow list and derive a proof for our wallets.
+   *
+   * Shared by /allowlist and the FCFS menu, which differ only in how the
+   * contract address arrives.
+   */
+  async function startAllowListFlow(ctx: BotContext, contract: string): Promise<unknown> {
 
     const { urls } = resolveRpcsForChain(ctx.store.getSettings().chainKey);
     const root = await raceReadOrNull(urls, (url) => fetchAllowListRoot(url, contract));
@@ -2305,7 +2393,7 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
               undefined,
               `Found the list (${entries.length} entries).\n\n${lines.join("\n")}\n\n` +
                 `Mint ${quantity} from the allow-list stage?`,
-              allowlistConfirmMenu()
+              fcfsArmMenu()
             )
             .catch(() => {});
         }
@@ -2328,6 +2416,21 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
         '"restrictFeeRecipients":true}}\n\n' +
         "I'll verify it against that root before anything is sent."
     );
+  }
+
+  bot.command("allowlist", async (ctx) => {
+    // Owner only: this mints against terms from a published list rather
+    // than from the chain's own public drop.
+    if (!requireOwner(ctx)) return;
+    const contract = ctx.message.text.split(/\s+/)[1]?.trim();
+    if (!contract || !isAddress(contract)) {
+      return ctx.reply(
+        "Usage: /allowlist <contract address>\n\n" +
+          "I look for the published allow list on-chain and derive your proof. " +
+          "If the project publishes no URI, I'll ask you to paste it."
+      );
+    }
+    return startAllowListFlow(ctx, contract);
   });
 
   bot.command("mint", async (ctx) => {
@@ -2534,6 +2637,59 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
    * wait for hours; every outcome is reported to the chat and written back to
    * the record, which is what makes a restart able to pick this up again.
    */
+  /** Revive stored allow-list terms — the store flattens bigints to strings. */
+  function revivedParams(json: string): MintParams {
+    const raw = JSON.parse(json);
+    return {
+      mintPrice: BigInt(raw.mintPrice),
+      maxTotalMintableByWallet: BigInt(raw.maxTotalMintableByWallet),
+      startTime: BigInt(raw.startTime),
+      endTime: BigInt(raw.endTime),
+      dropStageIndex: BigInt(raw.dropStageIndex),
+      maxTokenSupplyForStage: BigInt(raw.maxTokenSupplyForStage),
+      feeBps: BigInt(raw.feeBps),
+      restrictFeeRecipients: Boolean(raw.restrictFeeRecipients),
+    };
+  }
+
+  /**
+   * A mint plan for an allow-list stage, shaped like the public one so the
+   * same firing engine handles both. Only the calldata differs.
+   */
+  async function buildAllowListPlan(
+    urls: string[],
+    record: ScheduledMint
+  ): Promise<LocalMintPlan | null> {
+    if (!record.allowlist) return null;
+    const params = revivedParams(record.allowlist.params);
+    const fee = await raceRead(urls, (url) =>
+      resolveFeeRecipient(url, record.nftContract, params.restrictFeeRecipients)
+    );
+    if (!fee) return null;
+
+    const encoded = encodeMintAllowList(
+      record.nftContract,
+      fee.address,
+      record.quantity,
+      params,
+      record.allowlist.proof
+    );
+    return {
+      to: encoded.to,
+      data: encoded.data,
+      value: encoded.value,
+      feeRecipient: fee.address,
+      drop: {
+        mintPrice: params.mintPrice,
+        startTime: Number(params.startTime),
+        endTime: Number(params.endTime),
+        maxTotalMintableByWallet: Number(params.maxTotalMintableByWallet),
+        feeBps: Number(params.feeBps),
+        restrictFeeRecipients: params.restrictFeeRecipients,
+      },
+    };
+  }
+
   async function runScheduled(store: TelegramStore, id: string, chatId: number): Promise<void> {
     const record = store.listScheduled().find((r) => r.id === id);
     if (!record || record.status !== "pending") return;
@@ -2544,7 +2700,14 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
     const label = record.name || record.nftContract;
 
     try {
-      const plan = await buildLocalMintPlan(urls[0], record.nftContract, record.quantity);
+      // An allow-list record carries its own proof and stage terms, so the
+      // plan is built from those rather than read from the public drop.
+      // Nothing is fetched at fire time: a list lookup on the critical path
+      // would undo the whole point of arming it in advance.
+      const plan = record.allowlist
+        ? await buildAllowListPlan(urls, record)
+        : await buildLocalMintPlan(urls[0], record.nftContract, record.quantity);
+
       if (!plan) {
         store.updateScheduled(id, { status: "failed", note: "drop not resolvable on-chain" });
         logger.errorBold(`${label}: drop is no longer resolvable on-chain — nothing fired.`);
@@ -2844,9 +3007,21 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
     if (step === "awaiting_allowlist_json") {
       ctx.session.step = undefined;
       if (!requireOwner(ctx)) return;
+      const typed = ctx.message.text.trim();
+
+      // Arriving from the FCFS menu there is no contract yet — a bare address
+      // means "go and find the list yourself", which is the common case.
+      if (!ctx.session.allowlistContract && isAddress(typed)) {
+        return startAllowListFlow(ctx, typed);
+      }
+
       const contract = ctx.session.allowlistContract;
       ctx.session.allowlistContract = undefined;
-      if (!contract) return ctx.reply("That request expired — run /allowlist <contract> again.");
+      if (!contract) {
+        return ctx.reply(
+          "Send a contract address to look the list up, or run /allowlist <contract> first to paste a proof."
+        );
+      }
 
       let parsed;
       try {
@@ -2903,7 +3078,7 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
         `${lines.join("\n")}\n\n` +
           `Mint ${quantity} per wallet from the allow-list stage, ${eligible.length} wallet(s)?\n` +
           `Cost: ${priceEth} ETH per wallet plus gas.`,
-        allowlistConfirmMenu()
+        fcfsArmMenu()
       );
     }
 

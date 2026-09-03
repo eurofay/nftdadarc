@@ -122,6 +122,17 @@ export interface ScheduledMint {
   createdAt: number;
   status: "pending" | "fired" | "failed" | "cancelled";
   note?: string;
+  /**
+   * Present when this is an allow-list mint rather than a public one.
+   *
+   * The proof and stage terms are stored with the record because they are
+   * what makes the mint possible, and re-deriving them at fire time would put
+   * a list fetch on the critical path — the opposite of the point.
+   *
+   * params is JSON with bigints as strings; they don't survive the store's
+   * plain-JSON round trip. See seadrop-allowlist.MintParams.
+   */
+  allowlist?: { proof: string[]; params: string };
 }
 
 /**
