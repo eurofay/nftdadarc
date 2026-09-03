@@ -348,7 +348,10 @@ export function settingsMenu(s: BotSettings) {
   return Markup.inlineKeyboard([
     [Markup.button.callback(`Chain: ${s.chainKey}`, "setting:chain")],
     [Markup.button.callback(`Auto-mint chains: ${autoChainsLabel}`, "setting:autoChains")],
-    [Markup.button.callback(`Max fee: ${s.maxFeeGwei} gwei`, "setting:maxFeeGwei")],
+    [Markup.button.callback(
+      `Max fee: ${s.maxFeeGwei > 0 ? `${s.maxFeeGwei} gwei` : "auto (follows the chain)"}`,
+      "setting:maxFeeGwei"
+    )],
     [Markup.button.callback(`Priority fee: ${s.priorityGwei} gwei`, "setting:priorityGwei")],
     [Markup.button.callback(`Gas limit: ${s.gasLimit > 0 ? s.gasLimit : "auto (sized per quantity)"}`, "setting:gasLimit")],
     [Markup.button.callback(`Auto max qty: ${s.autoMaxQuantity ?? "unlimited (true max)"}`, "setting:autoMaxQuantity")],

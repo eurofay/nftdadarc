@@ -22,7 +22,7 @@ import { explorerTx } from "./chains";
 import { LocalMintPlan } from "./seadrop-public";
 import { defaultLogger, Logger } from "./logger";
 import { gasLimitForQuantity } from "./gas";
-import { fitFeeToBalance, fitPriority } from "./gas-fit";
+import { fitFeeToBalance, fitPriority, resolveMaxFee } from "./gas-fit";
 import { createProvider } from "./rpc-provider";
 
 export interface LocalSnipeOpts {
@@ -87,6 +87,18 @@ export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<SnipeOutco
   // ── Sign everything now, well before the stage opens ──
   const signStart = performance.now();
   const effectiveGasLimit = gasLimit > 0 ? gasLimit : gasLimitForQuantity(quantity);
+
+  // The ceiling follows the chain unless one was set deliberately. A fee
+  // picked once and left is wrong in both directions as the base fee moves:
+  // too low and nothing is ever included, too high and every wallet is asked
+  // to reserve far more than the block actually costs.
+  const { maxFeePerGas: ceiling, fromMarket } = resolveMaxFee(maxFeePerGas, baseFee, maxPriorityFee);
+  if (baseFee > 0n) {
+    log.info(
+      `  Base fee ${formatUnits(baseFee, "gwei")} gwei · ceiling ${formatUnits(ceiling, "gwei")} gwei` +
+        (fromMarket ? " (from the chain)" : " (your setting)")
+    );
+  }
   const prepared: { idx: number; address: string; blast: PreparedBlast }[] = [];
 
   for (let i = 0; i < wallets.length; i++) {
@@ -95,7 +107,7 @@ export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<SnipeOutco
     // the protocol before the mint is ever attempted. Where that wallet can
     // still cover a viable fee, sign it at the lower ceiling rather than lose
     // the mint. A wallet that can afford the configured fee is untouched.
-    let walletMaxFee = maxFeePerGas;
+    let walletMaxFee = ceiling;
     let walletPriority = maxPriorityFee;
 
     const balance = balances[i];
@@ -104,7 +116,7 @@ export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<SnipeOutco
         balanceWei: balance,
         mintValueWei: plan.value,
         gasLimit: effectiveGasLimit,
-        configuredMaxFeeWei: maxFeePerGas,
+        configuredMaxFeeWei: ceiling,
         baseFeeWei: baseFee,
         priorityWei: maxPriorityFee,
       });

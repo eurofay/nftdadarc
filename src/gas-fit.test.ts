@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { fitFeeToBalance, fitPriority, minimumViableFee } from "./gas-fit";
+import { fitFeeToBalance, fitPriority, minimumViableFee, marketFee, resolveMaxFee } from "./gas-fit";
 
 const GWEI = 1_000_000_000n;
 const BASE = 323_096_000n; // 0.323 gwei, measured on Robinhood
@@ -89,5 +89,40 @@ describe("fitPriority", () => {
 
   it("clamps the tip to the ceiling — a node rejects a tip above it", () => {
     expect(fitPriority(TIP / 2n, TIP)).toBe(TIP / 2n);
+  });
+});
+
+describe("marketFee / resolveMaxFee", () => {
+  it("derives a ceiling from the block, with headroom for base rising", () => {
+    const fee = marketFee(BASE, TIP);
+    expect(fee).toBeGreaterThan(BASE);
+    expect(fee).toBe(BASE * 2n + TIP);
+  });
+
+  it("follows the chain when no ceiling is configured", () => {
+    // 0 means "use whatever the block costs" — the reservation then tracks
+    // reality instead of a number picked days ago.
+    const r = resolveMaxFee(0n, BASE, TIP);
+    expect(r.fromMarket).toBe(true);
+    expect(r.maxFeePerGas).toBe(marketFee(BASE, TIP));
+  });
+
+  it("honours an explicit ceiling that clears the base fee", () => {
+    const r = resolveMaxFee(GWEI, BASE, TIP);
+    expect(r.fromMarket).toBe(false);
+    expect(r.maxFeePerGas).toBe(GWEI);
+  });
+
+  it("overrides a configured ceiling that could never be included", () => {
+    // Set below base fee, the transaction is not slow — it is never mined.
+    const tooLow = BASE / 2n;
+    const r = resolveMaxFee(tooLow, BASE, TIP);
+    expect(r.fromMarket).toBe(true);
+    expect(r.maxFeePerGas).toBeGreaterThan(tooLow);
+  });
+
+  it("keeps a configured ceiling when the chain reports no base fee", () => {
+    // Nothing to compare against; trust what was set rather than invent one.
+    expect(resolveMaxFee(GWEI, 0n, TIP).maxFeePerGas).toBe(GWEI);
   });
 });

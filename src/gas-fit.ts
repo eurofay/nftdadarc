@@ -76,3 +76,41 @@ export function fitFeeToBalance(opts: {
 export function fitPriority(maxFeeWei: bigint, configuredPriorityWei: bigint): bigint {
   return configuredPriorityWei <= maxFeeWei ? configuredPriorityWei : maxFeeWei;
 }
+
+/**
+ * A ceiling derived from the block rather than from a setting.
+ *
+ * A static maxFee is a guess made once and then wrong in both directions: too
+ * low and nothing is included, too high and every wallet is asked to reserve
+ * far more than the block actually costs. Reading the base fee at signing time
+ * gives a ceiling that matches the moment, which is both cheaper to reserve
+ * and likelier to land.
+ *
+ * The multiplier is headroom for the base fee rising between signing and
+ * inclusion — it can move up to 12.5% per block, so 2x covers several blocks
+ * of climb while still being far under a hand-set worst case.
+ */
+export function marketFee(baseFeeWei: bigint, priorityWei: bigint, multiplier = 2n): bigint {
+  return baseFeeWei * multiplier + priorityWei;
+}
+
+/**
+ * The ceiling to sign with, given what the chain costs now.
+ *
+ * A configured ceiling of 0 means "follow the chain". Anything else is an
+ * explicit cap and is honoured — but never signed BELOW the market rate,
+ * since a ceiling under base fee is a transaction that is never included.
+ */
+export function resolveMaxFee(
+  configuredWei: bigint,
+  baseFeeWei: bigint,
+  priorityWei: bigint
+): { maxFeePerGas: bigint; fromMarket: boolean } {
+  const market = marketFee(baseFeeWei, priorityWei);
+  if (configuredWei <= 0n) return { maxFeePerGas: market, fromMarket: true };
+  // A hand-set ceiling below what the block costs would simply never land.
+  if (baseFeeWei > 0n && configuredWei < minimumViableFee(baseFeeWei, priorityWei)) {
+    return { maxFeePerGas: market, fromMarket: true };
+  }
+  return { maxFeePerGas: configuredWei, fromMarket: false };
+}

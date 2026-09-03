@@ -1866,7 +1866,9 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
         ? ' (or "clear" for unlimited)'
         : field === "gasLimit"
           ? ' (or "auto" to size it from the quantity — recommended)'
-          : "";
+          : field === "maxFeeGwei"
+            ? ' (or "auto" to follow the chain base fee — recommended, and reserves less)'
+            : "";
       return ctx.reply(`Send the new value for ${field}${hint}:`);
     });
   }
@@ -3503,6 +3505,18 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
       // "auto" on the gas limit means size it from the quantity being minted,
       // which is stored as 0. A fixed limit both over-reserves for a small
       // mint and runs out of gas on a large one.
+      if (field === "maxFeeGwei" && raw.toLowerCase() === "auto") {
+        // 0 means "read the base fee at signing time". A hand-set ceiling is
+        // a guess that ages: too low and nothing lands, too high and every
+        // wallet reserves more than the block costs.
+        store.updateSettings({ maxFeeGwei: 0 });
+        return ctx.reply(
+          "✅ Max fee now follows the chain — read fresh at signing time, with headroom for it rising.\n\n" +
+            "This also lowers what each wallet must hold, since the ceiling is what gets reserved.",
+          settingsMenu(ctx.store.getSettings())
+        );
+      }
+
       if (field === "gasLimit" && raw.toLowerCase() === "auto") {
         ctx.store.updateSettings({ gasLimit: 0 });
         return ctx.reply(
