@@ -8,10 +8,11 @@
   },
   "scripts": {
     "build": "tsc",
-    "start": "node dist/index.js",
+    "start": "node dist/telegram-bot.js",
     "dev": "ts-node src/index.ts",
     "bot": "node dist/telegram-bot.js",
-    "test": "vitest run"
+    "test": "vitest run",
+    "cli": "node dist/index.js"
   },
   "keywords": [
     "nft",

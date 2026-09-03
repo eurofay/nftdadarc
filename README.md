@@ -40,7 +40,7 @@ Before running `npm install`, check your prompt ends in `nft-public-mint` — if
 Then confirm the build worked:
 
 ```bash
-npm start -- --help
+npm run cli -- --help
 ```
 
 <details>
@@ -82,7 +82,7 @@ nodes.
 ## Step 3 — Run it
 
 ```bash
-npm start
+npm run cli
 ```
 
 The wizard asks you seven things:
@@ -116,7 +116,7 @@ Two things to get right if you're leaving it running:
 ## Step 5 — Auto mode: unattended free-mint watcher
 
 ```bash
-npm start -- --auto
+npm run cli -- --auto
 ```
 
 Instead of minting one collection you point it at, this watches the whole

@@ -14,6 +14,24 @@ every automatic restart — silently deletes every wallet in the bot. There is n
 warning and no recovery. The encrypted store is the only copy of those keys
 unless you separately kept the seed phrase.
 
+### If the container starts and immediately exits
+
+A log that lists the package's scripts and stops:
+
+    Lifecycle scripts included in nft-public-mint@1.0.0:
+      start
+        node dist/telegram-bot.js
+      ...
+
+is `npm run` being run with **no script name**. That prints the script list,
+exits 0, and Railway treats it as a clean run — no error anywhere, and the bot
+never polls.
+
+The cause is a **Custom Start Command** on the service, which overrides both
+the Dockerfile's CMD and railway.json. Clear it, or set it to:
+
+    node dist/telegram-bot.js
+
 Note: the Dockerfile deliberately contains no `VOLUME` instruction — Railway
 rejects an image that declares one. The mount is created by attaching a volume
 in the dashboard, which is the step below.
