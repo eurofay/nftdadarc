@@ -401,9 +401,37 @@ export function autoChainsMenu(selected: Set<string>) {
 }
 
 // Pick the ONE wallet to send from.
-// Consolidation picks a destination and sweeps every OTHER wallet into it, so
-// unlike the funding flow there is nothing to exclude here — whichever wallet
-// is tapped becomes the one thing the collection ends up in.
+// Only wallets that actually hold the collection, each with how many it has.
+// Picking sources out of the full wallet list would mean guessing which ones
+// minted, which is the thing the scan just answered.
+export function consolidateSourcesMenu(
+  found: { address: string; label: string; count: number }[],
+  selected: Set<string>
+) {
+  const rows = found.map((h) => {
+    const checked = selected.has(h.address.toLowerCase());
+    return [
+      Markup.button.callback(
+        `${checked ? "✅" : "⬜"} ${h.label} — ${h.count}`,
+        `consol:src:toggle:${h.address}`
+      ),
+    ];
+  });
+  const allSelected = selected.size === found.length;
+  rows.push([
+    Markup.button.callback(allSelected ? "⬜ Select none" : "✅ Select all", "consol:src:all"),
+  ]);
+  const total = found
+    .filter((h) => selected.has(h.address.toLowerCase()))
+    .reduce((sum, h) => sum + h.count, 0);
+  rows.push([Markup.button.callback(`➡️ Done (${total} NFT${total === 1 ? "" : "s"})`, "consol:src:done")]);
+  rows.push([Markup.button.callback("❌ Cancel", "consol:cancel")]);
+  return Markup.inlineKeyboard(rows);
+}
+
+// Any wallet can receive, including one that was selected as a source — that
+// is the common case, sweeping the rest into whichever wallet already holds
+// the most. Its own tokens simply stay put.
 export function consolidateDestMenu(wallets: WalletRecord[]) {
   const rows = wallets.map((w) => [
     Markup.button.callback(`${w.label} (${maskAddress(w.address)})`, `consol:dest:${w.address}`),

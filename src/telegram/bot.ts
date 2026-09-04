@@ -39,6 +39,7 @@ import {
   fundSourceMenu,
   fundTargetsMenu,
   fundConfirmMenu,
+  consolidateSourcesMenu,
   consolidateDestMenu,
   consolidateConfirmMenu,
   schedWalletsMenu,
@@ -79,7 +80,9 @@ import { runCopyMintWatcher } from "../copy-mint";
 import { runActivityWatcher } from "../activity-watcher";
 import { batchTransfer, estimateBatchCost } from "../fund-transfer";
 import {
-  planConsolidation,
+  scanHoldings,
+  holders,
+  buildPlan,
   consolidate,
   estimateConsolidationCost,
   summarise as summariseConsolidation,
@@ -132,9 +135,10 @@ interface SessionData {
   fundAmountWei?: string; // bigint as string — kept out of the type so session stays plain-JSON-shaped
   consolidate?: {
     contract: string;
+    /** The scan, held across source picking, destination picking and confirm. */
+    found?: { owner: string; label: string; tokenIds: string[] }[];
+    selected?: string[]; // lowercased owner addresses
     destination?: string;
-    /** Planned moves, held between the preview and the confirm tap. */
-    tokens?: { owner: string; tokenId: string }[];
   };
   schedContract?: string;
   schedWallets?: string[]; // lowercased addresses
@@ -639,8 +643,9 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
 
   // ── Consolidate ──────────────────────────────────────────────────────
   // Minting from many wallets is the point; owning from many wallets is not.
-  // This reads holdings straight off the chain and moves them into one
-  // wallet, so it works on collections no marketplace has indexed yet.
+  // Paste a contract, see which of your wallets hold it, pick the ones to
+  // empty and the one to fill. Holdings are read straight off the chain, so
+  // this works on collections no marketplace has indexed yet.
   bot.action("menu:consolidate", (ctx) => {
     const wallets = ctx.store.listWallets();
     if (wallets.length < 2) {
@@ -652,72 +657,116 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
     ctx.session.step = "awaiting_consolidate_contract";
     return ctx.editMessageText(
       "📦 *Consolidate a collection*\n\n" +
-        "Send the contract address or OpenSea link of the collection you want gathered up.\n\n" +
-        "Every one of your wallets holding it will send its tokens to whichever wallet you pick next. " +
-        "Gas comes out of each sending wallet.",
+        "Send the contract address or OpenSea link of the collection you want swept up.\n\n" +
+        `I'll check all ${wallets.length} of your wallets, show you which ones hold it, ` +
+        "and let you pick what to move and where.",
       { parse_mode: "Markdown" }
+    );
+  });
+
+  /** The source picker, redrawn after every toggle. */
+  function consolidateSourcesView(ctx: BotContext) {
+    const pending = ctx.session.consolidate!;
+    const selected = new Set(pending.selected ?? []);
+    const rows = (pending.found ?? []).map((h) => ({
+      address: h.owner,
+      label: h.label,
+      count: h.tokenIds.length,
+    }));
+    const total = rows.filter((r) => selected.has(r.address.toLowerCase())).reduce((s, r) => s + r.count, 0);
+    const text =
+      `📦 Found *${rows.reduce((s, r) => s + r.count, 0)}* NFT(s) across *${rows.length}* wallet(s).\n\n` +
+      "Tap to choose which wallets to sweep, then Done." +
+      (total === 0 ? "\n\n_Nothing selected yet._" : "");
+    return { text, keyboard: consolidateSourcesMenu(rows, selected) };
+  }
+
+  bot.action(/^consol:src:toggle:(.+)$/, (ctx) => {
+    const pending = ctx.session.consolidate;
+    if (!pending?.found) {
+      return ctx.answerCbQuery("That request expired — start over from Consolidate.", { show_alert: true });
+    }
+    const address = ctx.match[1].toLowerCase();
+    const selected = new Set(pending.selected ?? []);
+    if (selected.has(address)) selected.delete(address);
+    else selected.add(address);
+    pending.selected = [...selected];
+    const view = consolidateSourcesView(ctx);
+    return ctx.editMessageText(view.text, { parse_mode: "Markdown", ...view.keyboard });
+  });
+
+  bot.action("consol:src:all", (ctx) => {
+    const pending = ctx.session.consolidate;
+    if (!pending?.found) {
+      return ctx.answerCbQuery("That request expired — start over from Consolidate.", { show_alert: true });
+    }
+    const all = pending.found.map((h) => h.owner.toLowerCase());
+    // Toggles both ways, so the same button clears a full selection.
+    pending.selected = (pending.selected?.length ?? 0) === all.length ? [] : all;
+    const view = consolidateSourcesView(ctx);
+    return ctx.editMessageText(view.text, { parse_mode: "Markdown", ...view.keyboard });
+  });
+
+  bot.action("consol:src:done", (ctx) => {
+    const pending = ctx.session.consolidate;
+    if (!pending?.found) {
+      return ctx.answerCbQuery("That request expired — start over from Consolidate.", { show_alert: true });
+    }
+    if (!pending.selected?.length) {
+      return ctx.answerCbQuery("Select at least one wallet to sweep from.", { show_alert: true });
+    }
+    return ctx.editMessageText(
+      "Sweep them into which wallet?\n\n" +
+        "Picking one of the selected wallets is fine — it keeps what it already holds.",
+      consolidateDestMenu(ctx.store.listWallets())
     );
   });
 
   bot.action(/^consol:dest:(.+)$/, async (ctx) => {
     const pending = ctx.session.consolidate;
-    if (!pending?.contract) {
+    if (!pending?.found || !pending.selected?.length) {
       return ctx.answerCbQuery("That request expired — start over from Consolidate.", { show_alert: true });
     }
     const destination = ctx.match[1];
     pending.destination = destination;
-    await ctx.answerCbQuery("Reading holdings…");
-    await ctx.editMessageText("Reading what each wallet holds — this walks the chain, so give it a moment.");
+    await ctx.answerCbQuery();
 
     const settings = ctx.store.getSettings();
     const { urls } = resolveRpcsForChain(settings.chainKey);
-    const owners = ctx.store.listWallets().map((w) => w.address);
+    const plan = buildPlan(
+      {
+        contract: pending.contract,
+        tokens: pending.found.flatMap((h) => h.tokenIds.map((id) => ({ owner: h.owner, tokenId: BigInt(id) }))),
+        skipped: [],
+      },
+      pending.selected,
+      destination
+    );
 
-    // Raced rather than sent to one endpoint: enumeration is many sequential
-    // calls, and a single hiccup partway through would mark a wallet
-    // non-enumerable and quietly leave its tokens behind. The redundant reads
-    // are worth not losing a wallet to a blip.
-    let plan;
-    try {
-      plan = await raceRead(readableRpcs(urls), (url) =>
-        planConsolidation(url, pending.contract, owners, destination)
-      );
-    } catch (err: any) {
-      ctx.session.consolidate = undefined;
-      return ctx.editMessageText(`Couldn't read that collection: ${err?.shortMessage ?? err?.message ?? err}`);
-    }
+    const labelFor = (addr: string) =>
+      ctx.store.listWallets().find((w) => w.address.toLowerCase() === addr.toLowerCase())?.label ?? maskAddress(addr);
 
     if (plan.tokens.length === 0) {
       ctx.session.consolidate = undefined;
-      const why = plan.skipped.length > 0 ? `\n\n${plan.skipped.map((sk) => `• ${maskAddress(sk.address)} — ${sk.reason}`).join("\n")}` : "";
-      return ctx.editMessageText(`Nothing to move — no other wallet holds this collection.${why}`);
+      return ctx.editMessageText(
+        `Nothing to move — ${labelFor(destination)} was the only wallet selected, and it already holds them.`,
+        mainMenu(ctx.from?.id === ownerId)
+      );
     }
-
-    pending.tokens = plan.tokens.map((t) => ({ owner: t.owner, tokenId: t.tokenId.toString() }));
 
     const ceiling = await resolveFeeCeiling(settings, urls);
     const worstCase = estimateConsolidationCost(plan.tokens.length, ceiling);
     const chain = resolveChain(settings.chainKey)!;
-    const labelFor = (addr: string) =>
-      ctx.store.listWallets().find((w) => w.address.toLowerCase() === addr.toLowerCase())?.label ?? maskAddress(addr);
-
     const bySender = new Map<string, number>();
     for (const t of plan.tokens) bySender.set(t.owner, (bySender.get(t.owner) ?? 0) + 1);
 
     const lines = [
-      `Move *${plan.tokens.length}* token(s) into *${labelFor(destination)}*?`,
+      `Move *${plan.tokens.length}* NFT(s) into *${labelFor(destination)}*?`,
       "",
       ...[...bySender].map(([owner, count]) => `• ${labelFor(owner)} → ${count}`),
       "",
       `Worst-case gas across all of them: ${formatEther(worstCase)} ${chain.nativeSymbol}, paid by each sending wallet.`,
     ];
-    // Wallets that were looked at and passed over: worth showing, since a
-    // non-enumerable collection is the difference between "you own none" and
-    // "this can't read them".
-    const notable = plan.skipped.filter((sk) => sk.reason !== "holds none");
-    if (notable.length > 0) {
-      lines.push("", "Skipped:", ...notable.map((sk) => `• ${maskAddress(sk.address)} — ${sk.reason}`));
-    }
 
     return ctx.editMessageText(lines.join("\n"), {
       parse_mode: "Markdown",
@@ -733,9 +782,21 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
 
   bot.action("consol:confirm", async (ctx) => {
     const pending = ctx.session.consolidate;
-    if (!pending?.destination || !pending.tokens?.length) {
+    if (!pending?.found || !pending.selected?.length || !pending.destination) {
       return ctx.answerCbQuery("That request expired — start over from Consolidate.", { show_alert: true });
     }
+    const destination = pending.destination;
+    // Built from the same scan the preview was built from, so what runs is
+    // what was confirmed — no second read of the chain in between.
+    const plan = buildPlan(
+      {
+        contract: pending.contract,
+        tokens: pending.found.flatMap((h) => h.tokenIds.map((id) => ({ owner: h.owner, tokenId: BigInt(id) }))),
+        skipped: [],
+      },
+      pending.selected,
+      destination
+    );
     ctx.session.consolidate = undefined;
     ctx.session.step = undefined;
     await ctx.answerCbQuery("Moving…");
@@ -749,18 +810,13 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
     try {
       const results = await consolidate({
         rpcUrl: urls[0],
-        plan: {
-          contract: pending.contract,
-          destination: pending.destination,
-          tokens: pending.tokens.map((t) => ({ owner: t.owner, tokenId: BigInt(t.tokenId) })),
-          skipped: [],
-        },
+        plan,
         keyFor: (owner) => store.getDecryptedKey(owner),
         maxFeePerGas: await resolveFeeCeiling(settings, urls),
         maxPriorityFee: gweiToWei(settings.priorityGwei),
         logger,
       });
-      await ctx.reply(summariseConsolidation(results, pending.destination), mainMenu(ctx.from?.id === ownerId));
+      await ctx.reply(summariseConsolidation(results, destination), mainMenu(ctx.from?.id === ownerId));
     } catch (err: any) {
       logger.errorBold(`Consolidation failed: ${err?.message ?? err}`);
     }
@@ -3882,11 +3938,69 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
       } catch (err: any) {
         return ctx.reply(`Couldn't read that as a collection: ${err?.message ?? err}`);
       }
-      ctx.session.consolidate = { contract };
-      return ctx.reply(
-        "Gather them into which wallet?",
-        consolidateDestMenu(ctx.store.listWallets())
-      );
+
+      const wallets = ctx.store.listWallets();
+      const note = await ctx.reply(`Checking ${wallets.length} wallet(s) for this collection…`);
+      const say = (text: string, extra?: any) =>
+        ctx.telegram.editMessageText(note.chat.id, note.message_id, undefined, text, extra).catch(() => {});
+
+      const { urls } = resolveRpcsForChain(settings.chainKey);
+      // Raced rather than sent to one endpoint: enumeration is many sequential
+      // calls, and a single hiccup partway through would mark a wallet
+      // non-enumerable and quietly leave its tokens out of the list. The
+      // redundant reads are worth not losing a wallet to a blip.
+      let scan;
+      try {
+        scan = await raceRead(readableRpcs(urls), (url) =>
+          scanHoldings(url, contract, wallets.map((w) => w.address))
+        );
+      } catch (err: any) {
+        return say(`Couldn't read that collection: ${err?.shortMessage ?? err?.message ?? err}`);
+      }
+
+      const found = holders(scan);
+      if (found.length === 0) {
+        // Distinguish "you own none" from "these couldn't be read" — the
+        // second is a different problem with a different fix.
+        const unreadable = scan.skipped.filter((sk) => sk.reason !== "holds none");
+        return say(
+          unreadable.length > 0
+            ? `None of your wallets hold this collection.\n\n${unreadable
+                .map((sk) => `• ${maskAddress(sk.address)} — ${sk.reason}`)
+                .join("\n")}`
+            : "None of your wallets hold this collection."
+        );
+      }
+
+      const labelFor = (addr: string) =>
+        wallets.find((w) => w.address.toLowerCase() === addr.toLowerCase())?.label ?? maskAddress(addr);
+      ctx.session.consolidate = {
+        contract,
+        found: found.map((h) => ({
+          owner: h.address,
+          label: labelFor(h.address),
+          tokenIds: h.tokenIds.map((id) => id.toString()),
+        })),
+        // Pre-selected: sweeping everything is the common case, so the default
+        // is one tap to Done and deselecting is the exception.
+        selected: found.map((h) => h.address.toLowerCase()),
+      };
+
+      const unreadable = scan.skipped.filter((sk) => sk.reason !== "holds none");
+      const total = found.reduce((s, h) => s + h.tokenIds.length, 0);
+      let text =
+        `📦 Found *${total}* NFT(s) across *${found.length}* wallet(s).\n\n` +
+        "Tap to choose which wallets to sweep, then Done.";
+      if (unreadable.length > 0) {
+        text += `\n\nCouldn't read:\n${unreadable.map((sk) => `• ${maskAddress(sk.address)} — ${sk.reason}`).join("\n")}`;
+      }
+      return say(text, {
+        parse_mode: "Markdown",
+        ...consolidateSourcesMenu(
+          found.map((h) => ({ address: h.address, label: labelFor(h.address), count: h.tokenIds.length })),
+          new Set(found.map((h) => h.address.toLowerCase()))
+        ),
+      });
     }
 
     if (step === "awaiting_fund_amount") {

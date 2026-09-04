@@ -1,8 +1,11 @@
 import { describe, it, expect } from "vitest";
 import {
+  buildPlan,
   estimateConsolidationCost,
   groupByOwner,
+  holders,
   summarise,
+  ScanResult,
   TRANSFER_GAS_LIMIT,
   TransferResult,
 } from "./nft-consolidate";
@@ -10,7 +13,15 @@ import {
 const GWEI = 1_000_000_000n;
 const A = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const B = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const C = "0xcccccccccccccccccccccccccccccccccccccccc";
 const DEST = "0xdddddddddddddddddddddddddddddddddddddddd";
+const CONTRACT = "0x1111111111111111111111111111111111111111";
+
+const scan = (tokens: { owner: string; tokenId: bigint }[]): ScanResult => ({
+  contract: CONTRACT,
+  tokens,
+  skipped: [],
+});
 
 describe("estimateConsolidationCost", () => {
   it("scales with the number of tokens, not the number of wallets", () => {
@@ -49,6 +60,72 @@ describe("groupByOwner", () => {
 
   it("handles an empty plan", () => {
     expect(groupByOwner([]).size).toBe(0);
+  });
+});
+
+describe("holders", () => {
+  it("lists only wallets that hold something, with their tokens", () => {
+    const found = holders(scan([{ owner: A, tokenId: 1n }, { owner: B, tokenId: 2n }]));
+    expect(found).toHaveLength(2);
+    expect(found.map((h) => h.address).sort()).toEqual([A, B]);
+  });
+
+  it("puts the biggest holder first, so the obvious destination is on top", () => {
+    const found = holders(
+      scan([
+        { owner: A, tokenId: 1n },
+        { owner: B, tokenId: 2n },
+        { owner: B, tokenId: 3n },
+        { owner: B, tokenId: 4n },
+        { owner: C, tokenId: 5n },
+        { owner: C, tokenId: 6n },
+      ])
+    );
+    expect(found.map((h) => h.address)).toEqual([B, C, A]);
+    expect(found[0].tokenIds).toEqual([2n, 3n, 4n]);
+  });
+
+  it("is empty when nothing was found", () => {
+    expect(holders(scan([]))).toEqual([]);
+  });
+});
+
+describe("buildPlan", () => {
+  const full = scan([
+    { owner: A, tokenId: 1n },
+    { owner: B, tokenId: 2n },
+    { owner: C, tokenId: 3n },
+  ]);
+
+  it("keeps only the wallets that were selected", () => {
+    const plan = buildPlan(full, [A, C], DEST);
+    expect(plan.tokens.map((t) => t.owner)).toEqual([A, C]);
+  });
+
+  it("leaves the destination's own tokens alone even when it was selected", () => {
+    // Sweeping the rest into the wallet that already holds the most is the
+    // common case; it must not pay gas to send to itself.
+    const plan = buildPlan(full, [A, B, C], B);
+    expect(plan.tokens.map((t) => t.owner)).toEqual([A, C]);
+  });
+
+  it("matches addresses regardless of case", () => {
+    const plan = buildPlan(full, [A.toUpperCase()], DEST);
+    expect(plan.tokens).toHaveLength(1);
+  });
+
+  it("plans nothing when the only selected wallet is the destination", () => {
+    expect(buildPlan(full, [B], B).tokens).toEqual([]);
+  });
+
+  it("carries the contract and destination through to the plan", () => {
+    const plan = buildPlan(full, [A], DEST);
+    expect(plan.contract).toBe(CONTRACT);
+    expect(plan.destination).toBe(DEST);
+  });
+
+  it("ignores a selection that holds nothing", () => {
+    expect(buildPlan(full, [DEST], DEST).tokens).toEqual([]);
   });
 });
 

@@ -46,6 +46,26 @@ export interface ConsolidationPlan {
   skipped: SkippedWallet[];
 }
 
+/** What a scan across a set of wallets turned up, before anything is chosen. */
+export interface ScanResult {
+  contract: string;
+  tokens: HeldToken[];
+  skipped: SkippedWallet[];
+}
+
+/** One wallet's holdings, for picking sources from. */
+export interface Holder {
+  address: string;
+  tokenIds: bigint[];
+}
+
+/** Wallets that hold something, most-held first, then by first-seen order. */
+export function holders(scan: ScanResult): Holder[] {
+  return [...groupByOwner(scan.tokens)]
+    .map(([address, tokenIds]) => ({ address, tokenIds }))
+    .sort((a, b) => b.tokenIds.length - a.tokenIds.length);
+}
+
 /**
  * Worst case, assuming every transfer burns the full fee ceiling.
  *
@@ -70,27 +90,22 @@ export function groupByOwner(tokens: HeldToken[]): Map<string, bigint[]> {
 /**
  * Read what each wallet holds in this collection.
  *
+ * Done before anything is chosen, so the wallets that actually hold the
+ * collection can be offered as the list to sweep from — picking sources blind
+ * out of a full wallet list means guessing which ones minted.
+ *
  * Enumeration uses tokenOfOwnerByIndex, the ERC-721 Enumerable extension.
  * Most SeaDrop collections implement it; one that does not cannot be walked
  * from the chain alone, so that wallet is reported as skipped along with its
- * balance rather than silently contributing nothing to the plan.
+ * balance rather than silently contributing nothing.
  */
-export async function planConsolidation(
-  rpcUrl: string,
-  contract: string,
-  owners: string[],
-  destination: string
-): Promise<ConsolidationPlan> {
+export async function scanHoldings(rpcUrl: string, contract: string, owners: string[]): Promise<ScanResult> {
   const provider = createProvider(rpcUrl);
   const nft = new Contract(contract, ERC721, provider);
   const tokens: HeldToken[] = [];
   const skipped: SkippedWallet[] = [];
 
   for (const owner of owners) {
-    // The destination keeps what it already holds; a self-transfer would burn
-    // gas to change nothing.
-    if (owner.toLowerCase() === destination.toLowerCase()) continue;
-
     let balance: bigint;
     try {
       balance = await nft.balanceOf(owner);
@@ -128,7 +143,27 @@ export async function planConsolidation(
     for (const tokenId of found) tokens.push({ owner, tokenId });
   }
 
-  return { contract, destination, tokens, skipped };
+  return { contract, tokens, skipped };
+}
+
+/**
+ * Narrow a scan to the wallets that were chosen, aimed at a destination.
+ *
+ * Pure, so the preview the user confirms and the moves that actually run are
+ * built by the same code from the same scan — the chain is not re-read
+ * between showing the plan and acting on it.
+ */
+export function buildPlan(scan: ScanResult, selected: string[], destination: string): ConsolidationPlan {
+  const wanted = new Set(selected.map((a) => a.toLowerCase()));
+  const dest = destination.toLowerCase();
+  return {
+    contract: scan.contract,
+    destination,
+    // The destination keeps what it already holds even if it was selected:
+    // a self-transfer would burn gas to change nothing.
+    tokens: scan.tokens.filter((t) => wanted.has(t.owner.toLowerCase()) && t.owner.toLowerCase() !== dest),
+    skipped: scan.skipped,
+  };
 }
 
 export interface TransferResult {
