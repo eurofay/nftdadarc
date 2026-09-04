@@ -5,8 +5,8 @@
 // afterwards: listing, accepting an offer, or simply seeing what you own all
 // get easier once a collection sits in one place.
 //
-// Purely on-chain — balanceOf / tokenOfOwnerByIndex to find them,
-// safeTransferFrom to move them — so this works for collections no
+// Purely on-chain — balanceOf and either enumeration or an ownerOf walk to
+// find them, safeTransferFrom to move them — so this works for collections no
 // marketplace has indexed, which on this chain is most of the recent ones.
 // Nothing here touches the OpenSea API.
 
@@ -18,6 +18,8 @@ import { Logger, defaultLogger } from "./logger";
 const ERC721 = new Interface([
   "function balanceOf(address owner) view returns (uint256)",
   "function tokenOfOwnerByIndex(address owner, uint256 index) view returns (uint256)",
+  "function totalSupply() view returns (uint256)",
+  "function ownerOf(uint256 tokenId) view returns (address)",
   "function safeTransferFrom(address from, address to, uint256 tokenId)",
 ]);
 
@@ -94,10 +96,18 @@ export function groupByOwner(tokens: HeldToken[]): Map<string, bigint[]> {
  * collection can be offered as the list to sweep from — picking sources blind
  * out of a full wallet list means guessing which ones minted.
  *
- * Enumeration uses tokenOfOwnerByIndex, the ERC-721 Enumerable extension.
- * Most SeaDrop collections implement it; one that does not cannot be walked
- * from the chain alone, so that wallet is reported as skipped along with its
- * balance rather than silently contributing nothing.
+ * Two ways to find the token ids, because the fast one is not always there:
+ *
+ *   1. tokenOfOwnerByIndex, the ERC-721 Enumerable extension. One call per
+ *      token owned, and it asks only about the wallets we care about.
+ *
+ *   2. Failing that, walk ownerOf over the id range. Measured on a live
+ *      SeaDrop collection: supportsInterface(0x780e9d63) is false, both index
+ *      functions revert, but totalSupply() answers and ownerOf(1) resolves
+ *      while ownerOf(0) reverts — the ERC721A shape this bot mints most of
+ *      the time. The walk costs one call per token in the collection rather
+ *      than per token held, but it covers every wallet in a single pass, and
+ *      a few hundred eth_calls is a second or two.
  */
 export async function scanHoldings(rpcUrl: string, contract: string, owners: string[]): Promise<ScanResult> {
   const provider = createProvider(rpcUrl);
@@ -105,21 +115,23 @@ export async function scanHoldings(rpcUrl: string, contract: string, owners: str
   const tokens: HeldToken[] = [];
   const skipped: SkippedWallet[] = [];
 
+  // Balances first: they say who is worth asking about, and later they say
+  // whether the walk found everything it should have.
+  const expected = new Map<string, bigint>();
   for (const owner of owners) {
-    let balance: bigint;
     try {
-      balance = await nft.balanceOf(owner);
+      const balance: bigint = await nft.balanceOf(owner);
+      if (balance === 0n) skipped.push({ address: owner, reason: "holds none" });
+      else expected.set(owner, balance);
     } catch (err: any) {
       const detail = err?.shortMessage ?? err?.message ?? String(err);
       skipped.push({ address: owner, reason: `could not read balance — ${detail}` });
-      continue;
     }
+  }
+  if (expected.size === 0) return { contract, tokens, skipped };
 
-    if (balance === 0n) {
-      skipped.push({ address: owner, reason: "holds none" });
-      continue;
-    }
-
+  const needsWalk: string[] = [];
+  for (const [owner, balance] of expected) {
     const found: bigint[] = [];
     let enumerable = true;
     for (let i = 0n; i < balance; i++) {
@@ -130,20 +142,152 @@ export async function scanHoldings(rpcUrl: string, contract: string, owners: str
         break;
       }
     }
-
     // Partial enumeration is worse than none: it would move some tokens and
-    // leave the rest behind without saying so. Report the whole wallet.
-    if (!enumerable) {
-      skipped.push({
-        address: owner,
-        reason: `holds ${balance}, but the collection is not enumerable — move these by token id`,
-      });
-      continue;
-    }
-    for (const tokenId of found) tokens.push({ owner, tokenId });
+    // leave the rest behind without saying so.
+    if (enumerable) for (const tokenId of found) tokens.push({ owner, tokenId });
+    else needsWalk.push(owner);
+  }
+
+  if (needsWalk.length > 0) {
+    const walked = await walkOwners(
+      nft,
+      new Map(needsWalk.map((o) => [o, expected.get(o)!]))
+    );
+    tokens.push(...walked.tokens);
+    skipped.push(...walked.skipped);
   }
 
   return { contract, tokens, skipped };
+}
+
+// How many ownerOf calls are in flight at once.
+//
+// ethers batches concurrent calls into one JSON-RPC request, so this is
+// really the batch size, and the endpoint has a strong opinion about it.
+// Benchmarked over 240 ownerOf calls against the public Robinhood RPC:
+//
+//   concurrency  25   4.2s   241/241 found
+//   concurrency  60   130s   181/241 found
+//   concurrency 100   105s    41/241 found
+//
+// Past ~25 the endpoint starts dropping requests inside the batch, and a
+// dropped ownerOf is indistinguishable from a burned token id — so raising
+// this does not merely slow the walk down, it silently loses tokens. The
+// balance cross-check at the end catches the shortfall and reports it, but
+// the fix is to stay at a batch size the endpoint actually serves.
+const WALK_CONCURRENCY = 25;
+
+// Ids checked beyond totalSupply before giving up. Burns leave gaps, so the
+// highest live id can sit above the supply — but not arbitrarily far, and an
+// unbounded walk on a hostile contract would never end.
+const WALK_SLACK = 2_000;
+
+/**
+ * Find token ids by asking who owns each one, for collections that cannot be
+ * enumerated.
+ *
+ * Walks upward from id 0 and stops as soon as every wallet's balance is
+ * accounted for, so the usual case ends early rather than reading the whole
+ * collection. Reverts are expected and ignored: id 0 does not exist on an
+ * ERC721A that starts at 1, and burned ids revert everywhere.
+ */
+async function walkOwners(
+  nft: Contract,
+  expected: Map<string, bigint>
+): Promise<{ tokens: HeldToken[]; skipped: SkippedWallet[] }> {
+  const tokens: HeldToken[] = [];
+  const skipped: SkippedWallet[] = [];
+
+  let supply: bigint;
+  try {
+    supply = await nft.totalSupply();
+  } catch (err: any) {
+    // No enumeration and no supply: there is no way to discover ids from the
+    // chain alone. Say exactly that rather than reporting zero holdings.
+    const detail = err?.shortMessage ?? err?.message ?? String(err);
+    for (const [owner, balance] of expected) {
+      skipped.push({
+        address: owner,
+        reason: `holds ${balance}, but the collection has neither enumeration nor totalSupply (${detail}) — move these by token id`,
+      });
+    }
+    return { tokens, skipped };
+  }
+
+  // Index by lowercase address once, so the hot loop is a map lookup rather
+  // than a case-insensitive scan of the wallet list per token.
+  const wanted = new Map([...expected.keys()].map((o) => [o.toLowerCase(), o]));
+  const foundFor = new Map<string, bigint[]>([...expected.keys()].map((o) => [o, []]));
+  const outstanding = new Map(expected);
+
+  const lastId = supply + BigInt(WALK_SLACK);
+  for (let start = 0n; start <= lastId; start += BigInt(WALK_CONCURRENCY)) {
+    const batch: bigint[] = [];
+    for (let i = 0n; i < BigInt(WALK_CONCURRENCY) && start + i <= lastId; i++) batch.push(start + i);
+
+    const results = await Promise.all(
+      batch.map(async (tokenId) => {
+        try {
+          return { tokenId, owner: (await nft.ownerOf(tokenId)) as string };
+        } catch {
+          // A gap, a burn, or an id below the collection's start.
+          return null;
+        }
+      })
+    );
+
+    for (const r of results) {
+      if (!r) continue;
+      const owner = wanted.get(r.owner.toLowerCase());
+      if (!owner) continue;
+      foundFor.get(owner)!.push(r.tokenId);
+      const left = (outstanding.get(owner) ?? 0n) - 1n;
+      if (left <= 0n) outstanding.delete(owner);
+      else outstanding.set(owner, left);
+    }
+
+    // Everything accounted for — no reason to read the rest of the collection.
+    if (outstanding.size === 0) break;
+  }
+
+  const reconciled = reconcileWalk(expected, foundFor);
+  return { tokens: reconciled.tokens, skipped: reconciled.skipped };
+}
+
+/**
+ * Compare what the walk found against what balanceOf promised.
+ *
+ * The walk cannot tell a burned id from a dropped RPC call — both just fail —
+ * so a short result is possible and must never pass silently. Moving four of
+ * a wallet's six tokens while reporting success is the worst outcome here:
+ * it looks finished, and the two left behind are only discovered later.
+ */
+export function reconcileWalk(
+  expected: Map<string, bigint>,
+  found: Map<string, bigint[]>
+): { tokens: HeldToken[]; skipped: SkippedWallet[] } {
+  const tokens: HeldToken[] = [];
+  const skipped: SkippedWallet[] = [];
+
+  for (const [owner, balance] of expected) {
+    const ids = found.get(owner) ?? [];
+    if (ids.length === 0) {
+      skipped.push({
+        address: owner,
+        reason: `holds ${balance}, but none of its token ids could be found — move these by token id`,
+      });
+      continue;
+    }
+    for (const tokenId of ids) tokens.push({ owner, tokenId });
+    if (BigInt(ids.length) < balance) {
+      skipped.push({
+        address: owner,
+        reason: `holds ${balance} but only ${ids.length} could be located — the rest need moving by token id`,
+      });
+    }
+  }
+
+  return { tokens, skipped };
 }
 
 /**

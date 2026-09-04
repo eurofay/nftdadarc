@@ -4,6 +4,7 @@ import {
   estimateConsolidationCost,
   groupByOwner,
   holders,
+  reconcileWalk,
   summarise,
   ScanResult,
   TRANSFER_GAS_LIMIT,
@@ -126,6 +127,56 @@ describe("buildPlan", () => {
 
   it("ignores a selection that holds nothing", () => {
     expect(buildPlan(full, [DEST], DEST).tokens).toEqual([]);
+  });
+});
+
+describe("reconcileWalk", () => {
+  it("accepts a wallet whose tokens were all located", () => {
+    const out = reconcileWalk(new Map([[A, 2n]]), new Map([[A, [4n, 9n]]]));
+    expect(out.tokens).toEqual([
+      { owner: A, tokenId: 4n },
+      { owner: A, tokenId: 9n },
+    ]);
+    expect(out.skipped).toEqual([]);
+  });
+
+  it("still moves what it found when a wallet comes up short", () => {
+    // Partial is worth having; pretending it was complete is not.
+    const out = reconcileWalk(new Map([[A, 6n]]), new Map([[A, [1n, 2n, 3n, 4n]]]));
+    expect(out.tokens).toHaveLength(4);
+    expect(out.skipped[0].reason).toContain("holds 6 but only 4");
+  });
+
+  it("never reports a short wallet as done", () => {
+    const out = reconcileWalk(new Map([[A, 3n]]), new Map([[A, [1n]]]));
+    expect(out.skipped).toHaveLength(1);
+  });
+
+  it("reports a wallet whose ids could not be found at all", () => {
+    const out = reconcileWalk(new Map([[A, 3n]]), new Map([[A, []]]));
+    expect(out.tokens).toEqual([]);
+    expect(out.skipped[0].reason).toContain("none of its token ids could be found");
+  });
+
+  it("treats a missing entry the same as an empty one", () => {
+    const out = reconcileWalk(new Map([[A, 3n]]), new Map());
+    expect(out.skipped[0].reason).toContain("none of its token ids could be found");
+  });
+
+  it("judges each wallet on its own", () => {
+    const out = reconcileWalk(
+      new Map([
+        [A, 2n],
+        [B, 2n],
+      ]),
+      new Map([
+        [A, [1n, 2n]],
+        [B, [3n]],
+      ])
+    );
+    expect(out.tokens).toHaveLength(3);
+    expect(out.skipped).toHaveLength(1);
+    expect(out.skipped[0].address).toBe(B);
   });
 });
 

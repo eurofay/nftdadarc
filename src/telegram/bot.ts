@@ -90,7 +90,7 @@ import {
 import { fetchOnChainHoldings } from "../nft-holdings";
 import { MintCardData } from "../mint-card";
 import { gasLimitForQuantity, upfrontReservation } from "../gas";
-import { raceRead, raceReadOrNull, readableRpcs } from "../fast-read";
+import { raceRead, raceReadOrNull, readableRpcs, tryInOrder } from "../fast-read";
 import { readStages, describeStages, checkEligibility, describeEligibility } from "../seadrop-stages";
 import { openSeaAuthFailure } from "../opensea-market";
 import { stageWindow, assessWallet } from "../mint-readiness";
@@ -3960,13 +3960,13 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
         ctx.telegram.editMessageText(note.chat.id, note.message_id, undefined, text, extra).catch(() => {});
 
       const { urls } = resolveRpcsForChain(settings.chainKey);
-      // Raced rather than sent to one endpoint: enumeration is many sequential
-      // calls, and a single hiccup partway through would mark a wallet
-      // non-enumerable and quietly leave its tokens out of the list. The
-      // redundant reads are worth not losing a wallet to a blip.
+      // Tried in order rather than raced. A scan can be hundreds of eth_calls
+      // on a collection with no enumeration, and racing would multiply that
+      // by the number of endpoints to get a result only one of them needed to
+      // produce. Failover is kept; the triple load is not.
       let scan;
       try {
-        scan = await raceRead(readableRpcs(urls), (url) =>
+        scan = await tryInOrder(urls, (url) =>
           scanHoldings(url, contract, wallets.map((w) => w.address))
         );
       } catch (err: any) {

@@ -97,3 +97,35 @@ export async function raceReadOrNull<T>(
     return null;
   }
 }
+
+/**
+ * First endpoint that succeeds, tried in order rather than all at once.
+ *
+ * raceRead sends the same read everywhere and takes the quickest answer,
+ * which is right for a single cheap call on a hot path. It is wrong for work
+ * that costs hundreds of calls — an ownerOf walk across a whole collection —
+ * where racing multiplies the load on every endpoint by the number of
+ * endpoints, for a result only one of them needed to produce.
+ *
+ * So this asks one at a time and moves on only when an endpoint fails,
+ * keeping the failover that racing was there for without the cost.
+ */
+export async function tryInOrder<T>(
+  rpcUrls: string[],
+  read: (url: string) => Promise<T>,
+  logger: Logger = defaultLogger
+): Promise<T> {
+  const readable = readableRpcs(rpcUrls);
+  if (readable.length === 0) throw new Error("No RPC endpoints to read from.");
+
+  let firstError: unknown;
+  for (const url of readable) {
+    try {
+      return await read(url);
+    } catch (err) {
+      if (firstError === undefined) firstError = err;
+      logger.info(`  ${new URL(url).host} couldn't serve that read, trying the next endpoint…`);
+    }
+  }
+  throw firstError ?? new Error("No endpoint returned a usable result.");
+}
