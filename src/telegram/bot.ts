@@ -79,7 +79,7 @@ import { batchTransfer, estimateBatchCost } from "../fund-transfer";
 import { fetchOnChainHoldings } from "../nft-holdings";
 import { MintCardData } from "../mint-card";
 import { gasLimitForQuantity, upfrontReservation } from "../gas";
-import { raceRead, raceReadOrNull } from "../fast-read";
+import { raceRead, raceReadOrNull, readableRpcs } from "../fast-read";
 import { readStages, describeStages, checkEligibility, describeEligibility } from "../seadrop-stages";
 import { stageWindow, assessWallet } from "../mint-readiness";
 import { resolveMaxFee, marketFee } from "../gas-fit";
@@ -1420,7 +1420,7 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
     await ctx.answerCbQuery("Checking…");
     const { urls } = resolveRpcsForChain(ctx.store.getSettings().chainKey);
     try {
-      const balance = await raceRead(urls, (url) => createProvider(url).getBalance(address));
+      const balance = await raceRead(readableRpcs(urls), (url) => createProvider(url).getBalance(address));
       return showWallet(ctx, address, balance);
     } catch (err: any) {
       return ctx.answerCbQuery(`Couldn't read the balance: ${describeRpcError(err)}`, { show_alert: true });
@@ -1902,7 +1902,7 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
     const priority = gweiToWei(settings.priorityGwei);
     if (configured > 0n) return configured;
     try {
-      const head = await raceRead(urls, (url) => createProvider(url).getBlock("latest"));
+      const head = await raceRead(readableRpcs(urls), (url) => createProvider(url).getBlock("latest"));
       return resolveMaxFee(configured, head?.baseFeePerGas ?? 0n, priority).maxFeePerGas;
     } catch {
       // Couldn't read the chain — a sane ceiling beats signing with zero.
@@ -3414,7 +3414,7 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
       const ready = await Promise.all(
         wallets.map(async (w) => {
           const [balance, elig] = await Promise.all([
-            raceRead(urls, (url) => createProvider(url).getBalance(w.address)).catch(() => null),
+            raceRead(readableRpcs(urls), (url) => createProvider(url).getBalance(w.address)).catch(() => null),
             raceRead(urls, (url) =>
               checkEligibility(url, contract, w.address, plan.drop.maxTotalMintableByWallet)
             ).catch(() => null),

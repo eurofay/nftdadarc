@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { raceRead, raceReadOrNull } from "./fast-read";
+import { raceRead, raceReadOrNull, readableRpcs } from "./fast-read";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -67,5 +67,41 @@ describe("raceReadOrNull", () => {
       }, logger)
     ).toBeNull();
     expect(logger.info).toHaveBeenCalled();
+  });
+});
+
+describe("readableRpcs", () => {
+  it("drops the sequencer, which rejects every read", () => {
+    // Constructing a provider against it fails ethers' one-time network
+    // detection, and the cached provider then retries every second forever.
+    const urls = [
+      "https://rpc.mainnet.chain.robinhood.com",
+      "https://robinhood-mainnet.g.alchemy.com/v2/key",
+      "https://sequencer.mainnet.chain.robinhood.com",
+    ];
+    expect(readableRpcs(urls)).toEqual([urls[0], urls[1]]);
+  });
+
+  it("keeps ordering, so the fastest read endpoint stays first", () => {
+    const urls = ["https://a.example", "https://sequencer.x", "https://b.example"];
+    expect(readableRpcs(urls)).toEqual(["https://a.example", "https://b.example"]);
+  });
+
+  it("returns everything untouched when none is send-only", () => {
+    const urls = ["https://a.example", "https://b.example"];
+    expect(readableRpcs(urls)).toEqual(urls);
+  });
+
+  it("falls back to the full list rather than returning nothing", () => {
+    // A caller with no endpoints at all fails far more confusingly than one
+    // that tries an unlikely endpoint and gets a clean error.
+    const only = ["https://sequencer.mainnet.chain.robinhood.com"];
+    expect(readableRpcs(only)).toEqual(only);
+  });
+
+  it("matches case-insensitively", () => {
+    expect(readableRpcs(["https://SEQUENCER.example", "https://a.example"])).toEqual([
+      "https://a.example",
+    ]);
   });
 });

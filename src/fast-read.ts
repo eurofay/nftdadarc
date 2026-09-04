@@ -72,3 +72,22 @@ export async function raceReadOrNull<T>(
     return null;
   }
 }
+
+/**
+ * Endpoints that can actually answer a read.
+ *
+ * A sequencer accepts eth_sendRawTransaction and rejects everything else —
+ * including eth_chainId, which ethers calls once when constructing a provider.
+ * That detection fails, and the provider then retries every second for the
+ * life of the process, filling the log with "failed to detect network" while
+ * the read it was for has long since been served by another endpoint.
+ *
+ * So reads are pointed only at endpoints that serve reads. Sending still goes
+ * to every endpoint, which is where the sequencer earns its place.
+ */
+export function readableRpcs(urls: string[]): string[] {
+  const readable = urls.filter((url) => !/sequencer/i.test(url));
+  // Never hand back an empty list: a caller with nothing to read from fails
+  // in a far more confusing way than one that tries an unlikely endpoint.
+  return readable.length > 0 ? readable : urls;
+}
