@@ -1100,10 +1100,14 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
     const settings = store.getSettings();
     const key = process.env.OPENSEA_API_KEY;
     const seen = new Map<string, { slug: string; name: string }>();
+    const unresolved = store.listMints();
 
     for (const w of store.listWallets()) {
       try {
-        const nfts = await fetchAccountNfts(settings.chainKey, w.address, key, 3);
+        // 12 pages, not 3. A wallet here can hold hundreds of NFTs, and at
+        // 50 per page the old cap saw the first 150 — everything past that
+        // was simply not watched, which is how a sale goes unnoticed.
+        const nfts = await fetchAccountNfts(settings.chainKey, w.address, key, 12);
         for (const c of groupByCollection(nfts)) {
           if (!seen.has(c.slug)) seen.set(c.slug, { slug: c.slug, name: c.slug });
         }
@@ -1111,8 +1115,30 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
         /* one unreadable wallet shouldn't blank the whole watchlist */
       }
     }
+
+    // Everything ever minted, including collections OpenSea's account index
+    // misses — measured at 100 NFTs where the chain held 1,923.
+    const needSlug: typeof unresolved = [];
     for (const m of store.listMints()) {
-      if (m.slug && !seen.has(m.slug)) seen.set(m.slug, { slug: m.slug, name: m.name || m.slug });
+      if (m.slug) {
+        if (!seen.has(m.slug)) seen.set(m.slug, { slug: m.slug, name: m.name || m.slug });
+      } else {
+        needSlug.push(m);
+      }
+    }
+
+    // A mint whose slug was never resolved used to be dropped silently, so a
+    // collection OpenSea hadn't indexed at mint time was never watched again.
+    // Resolve it now instead.
+    for (const m of needSlug.slice(0, 20)) {
+      try {
+        const info = await openseaContractInfo(settings.chainKey, m.nftContract, key);
+        if (info?.slug && !seen.has(info.slug)) {
+          seen.set(info.slug, { slug: info.slug, name: info.name || info.slug });
+        }
+      } catch {
+        /* still unindexed; try again next refresh */
+      }
     }
     return [...seen.values()];
   }

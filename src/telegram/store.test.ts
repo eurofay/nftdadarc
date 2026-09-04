@@ -272,6 +272,9 @@ describe("TelegramStore settings", () => {
     // that it copies without being asked each time — so it starts on.
     expect(s.autoEnabled).toBe(false);
     expect(s.copyMintEnabled).toBe(true);
+    // A copy signal is only worth acting on immediately; a stage seen hours
+    // ago has usually moved on, and re-minting it is arriving late.
+    expect(s.copyBackfillHours).toBe(0);
   });
 
   it("remembers a deliberate turn-off across a restart", () => {

@@ -174,7 +174,11 @@ const DEFAULT_SETTINGS: BotSettings = {
   // asked each time. Turning it off is a deliberate act and is remembered.
   copyMintEnabled: true,
   copyMintMaxPriceEth: 0,
-  copyBackfillHours: 12,
+  // Off by default. A copy signal is only worth acting on immediately —
+  // minting a collection hours after the watched wallet did means arriving
+  // late to whatever edge that wallet had, and the stage may have closed.
+  // The mechanism remains for covering downtime if it is ever wanted.
+  copyBackfillHours: 0,
   activityEnabled: true,
   activitySweepSales: 3,
   activityFloorMovePct: 15,

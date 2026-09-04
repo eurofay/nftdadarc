@@ -17,8 +17,11 @@
 
 import { Wallet, formatEther } from "ethers";
 import { buildLocalMintPlan } from "./seadrop-public";
-import { raceReadOrNull } from "./fast-read";
+import { raceRead, raceReadOrNull } from "./fast-read";
 import { RepeatFilter } from "./copy-mint-message";
+import { checkEligibility } from "./seadrop-stages";
+import { gasLimitForQuantity } from "./gas";
+import { resolveMaxFee } from "./gas-fit";
 import { DEFAULT_CHUNK_BLOCKS, MintSighting, scanSeaDropMints } from "./seadrop-events";
 import { localPublicSnipe, SnipeOutcome } from "./local-mint";
 import { backoffMs, createProvider, describeRpcError } from "./rpc-provider";
@@ -371,6 +374,38 @@ export async function runCopyMintWatcher(opts: CopyMintOpts): Promise<void> {
           : drop.drop.maxTotalMintableByWallet;
         // Reuse the drop already fetched: only the encoded quantity differs,
         // and re-reading it was two more round trips on the critical path.
+        // Fire only with wallets the chain will actually accept.
+        //
+        // Without this the watcher fires blind: a wallet already at the
+        // drop's per-wallet cap, or a collection that sold out between the
+        // sighting and now, both revert — and a revert still burns the gas it
+        // used. The sighting says someone ELSE could mint, which is not the
+        // same as us being able to.
+        const eligible: string[] = [];
+        for (const key of walletKeys) {
+          const address = new Wallet(key).address;
+          try {
+            const e = await raceRead(rpcUrls, (url) =>
+              checkEligibility(url, sighting.nftContract, address, drop.drop.maxTotalMintableByWallet)
+            );
+            if (e.canMint > 0) eligible.push(key);
+            else log.info(`     ↷ ${address.slice(0, 8)}… — ${e.reason ?? "cannot mint"}`);
+          } catch {
+            // Couldn't check: assume eligible rather than miss the drop. A
+            // revert costs gas; not firing costs the mint.
+            eligible.push(key);
+          }
+        }
+        if (eligible.length === 0) {
+          const reason = "no wallet is eligible — already minted, or sold out";
+          const seen = repeats.consider(reason);
+          if (seen.send) {
+            log.error(`     ✗ Skipped — ${reason}.${seen.count > 1 ? ` (${seen.count}× recently)` : ""}`);
+          }
+          await report({ sourceWallet: sighting.from, sourceTxHash: sighting.txHash, nftContract: sighting.nftContract, quantity: 0, outcome: "skipped", reason, txHashes: [] });
+          continue;
+        }
+
         const plan =
           quantity === 1
             ? drop
@@ -392,9 +427,14 @@ export async function runCopyMintWatcher(opts: CopyMintOpts): Promise<void> {
         // once, an unfunded wallet would otherwise produce one "insufficient
         // funds" failure per collection. Checked once per copy, not per
         // collection, so the cost is one balance read.
-        const required = BigInt(gasLimit) * maxFeePerGas + plan.value;
+        // Mirror what the signer will actually reserve: an auto ceiling reads
+        // as zero here, and the sizing is per-quantity, not a flat number.
+        const effectiveLimit = gasLimit > 0 ? gasLimit : gasLimitForQuantity(quantity);
+        const head = await provider.getBlock("latest").catch(() => null);
+        const ceiling = resolveMaxFee(maxFeePerGas, head?.baseFeePerGas ?? 0n, maxPriorityFee).maxFeePerGas;
+        const required = BigInt(effectiveLimit) * ceiling + plan.value;
         const affordable: string[] = [];
-        for (const key of walletKeys) {
+        for (const key of eligible) {
           const address = new Wallet(key).address;
           let balance = 0n;
           try {
@@ -412,7 +452,7 @@ export async function runCopyMintWatcher(opts: CopyMintOpts): Promise<void> {
             );
         }
         if (affordable.length === 0) {
-          const reason = `no wallet can cover ${formatEther(required)} ETH (gas ${gasLimit} x ${formatEther(maxFeePerGas)} + mint price)`;
+          const reason = `no wallet can cover ${formatEther(required)} ETH (gas ${effectiveLimit} x ${formatEther(ceiling)} + mint price)`;
           log.error(`     ✗ Skipped — ${reason}.`);
           await report({ sourceWallet: sighting.from, sourceTxHash: sighting.txHash, nftContract: sighting.nftContract, quantity, outcome: "skipped", reason, txHashes: [] });
           continue;
