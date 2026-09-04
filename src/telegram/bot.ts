@@ -104,7 +104,8 @@ import {
   MintParams,
 } from "../seadrop-allowlist";
 import { findAllowListUri, fetchAllowList, parseAllowList, deriveProof } from "../allowlist-fetch";
-import { renderMintCardPng } from "../mint-card-render";
+import { renderMintCardPng, renderPnlCardPng } from "../mint-card-render";
+import { computePnl, renderPnl, PnlReport } from "../pnl";
 import { acceptOfferViaSdk, acceptOfferWithFallback, createListing, parseListingPrice } from "../opensea-sell";
 import { createLogger, withPrefix, LogSink } from "../logger";
 import { istTimeToDate, toIST } from "../time-format";
@@ -125,6 +126,7 @@ interface SessionData {
     | "awaiting_copy_target"
     | "awaiting_fund_amount"
     | "awaiting_consolidate_contract"
+    | "awaiting_pnl_contract"
     | "awaiting_sched_link"
     | "awaiting_sched_quantity"
     | "awaiting_sched_custom_time"
@@ -639,6 +641,24 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
     ctx.session.fundSource = undefined;
     ctx.session.fundTargets = undefined;
     return ctx.editMessageText("Send FROM which wallet?", fundSourceMenu(wallets));
+  });
+
+  // ── P&L ──────────────────────────────────────────────────────────────
+  // One collection, every wallet, one number. Minting across nine wallets
+  // means nine separate answers to "did that work out", and adding them up
+  // by hand is how a losing position goes unnoticed.
+  bot.action("menu:pnl", (ctx) => {
+    if (ctx.store.listWallets().length === 0) {
+      return ctx.answerCbQuery("Add a wallet first.", { show_alert: true });
+    }
+    ctx.session.step = "awaiting_pnl_contract";
+    return ctx.editMessageText(
+      "📊 *P&L for a collection*\n\n" +
+        "Send the contract address or OpenSea link.\n\n" +
+        "I'll count what every wallet holds on-chain, price it against the floor and the " +
+        "best standing offer, and show what it cost against what it's worth.",
+      { parse_mode: "Markdown" }
+    );
   });
 
   // ── Consolidate ──────────────────────────────────────────────────────
@@ -3942,6 +3962,116 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
           "You'll be asked to approve the transfer contract if it isn't approved yet.",
         sellActionConfirmMenu("list", address, slug, makeTokenizer(ctx.session))
       );
+    }
+
+    if (step === "awaiting_pnl_contract") {
+      ctx.session.step = undefined;
+      const settings = ctx.store.getSettings();
+      let contract: string;
+      try {
+        contract = await resolveMintTarget(ctx.message.text.trim(), settings.chainKey);
+      } catch (err: any) {
+        return ctx.reply(`Couldn't read that as a collection: ${err?.message ?? err}`);
+      }
+
+      const wallets = ctx.store.listWallets();
+      if (wallets.length === 0) return ctx.reply("Add a wallet first.");
+      const note = await ctx.reply(`Counting what ${wallets.length} wallet(s) hold…`);
+      const say = (text: string, extra?: any) =>
+        ctx.telegram.editMessageText(note.chat.id, note.message_id, undefined, text, extra).catch(() => {});
+
+      const { urls } = resolveRpcsForChain(settings.chainKey);
+      const chain = resolveChain(settings.chainKey)!;
+
+      // Holdings first and on their own: this is the only figure here that
+      // comes off the chain, and every value below it is someone else's
+      // opinion layered on top.
+      let scan;
+      try {
+        scan = await tryInOrder(urls, (url) =>
+          scanHoldings(url, contract, wallets.map((w) => w.address))
+        );
+      } catch (err: any) {
+        return say(`Couldn't read that collection: ${err?.shortMessage ?? err?.message ?? err}`);
+      }
+
+      const found = holders(scan);
+      const quantity = found.reduce((sum, h) => sum + h.tokenIds.length, 0);
+      if (quantity === 0) {
+        const unreadable = scan.skipped.filter((sk) => sk.reason !== "holds none");
+        return say(
+          unreadable.length > 0
+            ? `None of your wallets hold this collection.\n\n${unreadable
+                .map((sk) => `• ${maskAddress(sk.address)} — ${sk.reason}`)
+                .join("\n")}`
+            : "None of your wallets hold this collection, so there's no P&L to show."
+        );
+      }
+
+      await say(`Found ${quantity} across ${found.length} wallet(s). Pricing them…`);
+
+      // Everything below is best-effort. A missing floor or a collection
+      // OpenSea has never indexed degrades the report; it never kills it,
+      // because the holdings above are already worth showing on their own.
+      const lookup = await lookupContract(settings.chainKey, contract, process.env.OPENSEA_API_KEY);
+      const slug = isLookupFailure(lookup) ? null : lookup.slug;
+      const apiKey = process.env.OPENSEA_API_KEY;
+
+      const [stages, info, stats, offer] = await Promise.all([
+        raceReadOrNull(urls, (url) => readStages(url, contract)).catch(() => null),
+        slug ? fetchCollection(slug, apiKey).catch(() => null) : Promise.resolve(null),
+        slug ? fetchStats(slug, apiKey).catch(() => null) : Promise.resolve(null),
+        slug ? fetchBestCollectionOffer(slug, apiKey).catch(() => null) : Promise.resolve(null),
+      ]);
+
+      const publicStage = (stages ?? []).find((s) => s.kind === "public");
+      const mintPriceEth =
+        publicStage?.priceWei !== undefined ? Number(formatEther(publicStage.priceWei)) : null;
+
+      // Gas from the same model the mint path sizes its limit with, at the
+      // fee ceiling this bot would sign at. Every wallet paid its own, so it
+      // scales with wallets and tokens rather than tokens alone.
+      let gasEth: number | null = null;
+      try {
+        const ceiling = await resolveFeeCeiling(settings, urls);
+        const perWallet = found.map((h) => BigInt(gasLimitForQuantity(h.tokenIds.length)) * ceiling);
+        gasEth = Number(formatEther(perWallet.reduce((a, b) => a + b, 0n)));
+      } catch {
+        /* a modelled figure we can't model is better left out than guessed */
+      }
+
+      const labelFor = (addr: string) =>
+        wallets.find((w) => w.address.toLowerCase() === addr.toLowerCase())?.label ?? maskAddress(addr);
+
+      const report: PnlReport = {
+        name: info?.name || (isLookupFailure(lookup) ? maskAddress(contract) : lookup.name),
+        contract,
+        symbol: chain.nativeSymbol,
+        quantity,
+        wallets: found.length,
+        mintPriceEth,
+        gasEth,
+        floorEth: stats?.floorPrice ?? null,
+        bestOfferEth: offer?.priceEth ?? null,
+        priceSource: mintPriceEth === null ? "unknown" : "stage",
+        breakdown: found.map((h) => ({
+          address: h.address,
+          label: labelFor(h.address),
+          count: h.tokenIds.length,
+        })),
+      };
+      const pnl = computePnl(report);
+
+      // The card is decoration around a report that already stands on its
+      // own, so a rasteriser failure must not cost the numbers.
+      try {
+        const png = await renderPnlCardPng({ report, pnl, artHref: info?.imageUrl ?? null });
+        await ctx.replyWithPhoto({ source: png });
+      } catch (err: any) {
+        console.error(`P&L card failed for ${contract}: ${err?.message ?? err}`);
+      }
+
+      return say(renderPnl(report, pnl), { parse_mode: "Markdown" });
     }
 
     if (step === "awaiting_consolidate_contract") {

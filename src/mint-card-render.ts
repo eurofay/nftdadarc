@@ -5,6 +5,7 @@
 import path from "path";
 import { Resvg } from "@resvg/resvg-js";
 import { renderMintCard, MintCardData } from "./mint-card";
+import { renderPnlCard, PnlCardData } from "./pnl-card";
 
 // Bundled rather than relying on system fonts: a server with no DM Sans
 // installed silently falls back to a serif and the card stops looking like
@@ -68,6 +69,10 @@ export async function renderMintCardPng(
   // SMIL can't rasterise; asking for it only wastes work.
   const svg = renderMintCard({ ...data, artHref, animated: false });
 
+  return rasterise(svg, opts);
+}
+
+function rasterise(svg: string, opts: RenderOptions): Buffer {
   const resvg = new Resvg(svg, {
     fitTo: { mode: "width", value: opts.width ?? 1256 },
     background: "#121A19",
@@ -81,4 +86,17 @@ export async function renderMintCardPng(
   });
 
   return Buffer.from(resvg.render().asPng());
+}
+
+/**
+ * Same rasteriser, same fonts, for the P&L card.
+ *
+ * Shares rasterise() with the mint card so both come out of one renderer
+ * configuration -- a second Resvg setup would drift, and the two cards
+ * arriving in the same chat with different fallback fonts would look like
+ * a bug rather than a family.
+ */
+export async function renderPnlCardPng(data: PnlCardData, opts: RenderOptions = {}): Promise<Buffer> {
+  const artHref = data.artHref ? await inlineImage(data.artHref) : null;
+  return rasterise(renderPnlCard({ ...data, artHref }), opts);
 }
