@@ -10,7 +10,7 @@ import { message } from "telegraf/filters";
 import { isAddress, formatEther, parseEther, Wallet } from "ethers";
 import { generateMnemonic, deriveWallets, isValidMnemonic } from "../hd-wallet";
 import { createProvider, describeRpcError } from "../rpc-provider";
-import { TelegramStore, WalletRecord, ScheduledMint } from "./store";
+import { TelegramStore, WalletRecord, ScheduledMint, BotSettings } from "./store";
 import { UserStores } from "./user-stores";
 import { ask, BotSnapshot } from "./agent";
 import { AccessControl } from "./access-control";
@@ -82,6 +82,7 @@ import { gasLimitForQuantity, upfrontReservation } from "../gas";
 import { raceRead, raceReadOrNull } from "../fast-read";
 import { readStages, describeStages, checkEligibility, describeEligibility } from "../seadrop-stages";
 import { stageWindow, assessWallet } from "../mint-readiness";
+import { resolveMaxFee, marketFee } from "../gas-fit";
 import { OpenSeaMintClient, OpenSeaMintError } from "../opensea-mint";
 import {
   fetchAllowListRoot,
@@ -1396,7 +1397,10 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
     if (balance !== undefined) {
       // What stops an underfunded wallet is the upfront reservation, not the
       // mint price — see gas.ts.
-      const needed = upfrontReservation(gasLimitForQuantity(1), gweiToWei(settings.maxFeeGwei));
+      const needed = upfrontReservation(
+        gasLimitForQuantity(1),
+        await resolveFeeCeiling(settings, resolveRpcsForChain(settings.chainKey).urls)
+      );
       lines.push(
         balance >= needed
           ? `✅ Covers ~${balance / needed} mint(s) in flight`
@@ -1819,7 +1823,7 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
         sourceKey: ctx.store.getDecryptedKey(fundSource),
         targets: fundTargets,
         amountWei: BigInt(fundAmountWei),
-        maxFeePerGas: gweiToWei(settings.maxFeeGwei),
+        maxFeePerGas: await resolveFeeCeiling(settings, urls),
         maxPriorityFee: gweiToWei(settings.priorityGwei),
         logger,
       });
@@ -1884,6 +1888,27 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
 
   // ── Admin panel (owner only) ──────────────────────────────────────────
   const requireOwner = (ctx: BotContext): boolean => ctx.from?.id === ownerId;
+
+  /**
+   * The fee ceiling to sign with, outside the mint engine.
+   *
+   * A max fee of 0 means "follow the chain" (see gas-fit.ts), which the mint
+   * path resolves for itself. Anything that signs its own transactions — the
+   * batch transfer below — has to do the same, or it signs with a ceiling of
+   * zero and the node never includes it.
+   */
+  async function resolveFeeCeiling(settings: BotSettings, urls: string[]): Promise<bigint> {
+    const configured = gweiToWei(settings.maxFeeGwei);
+    const priority = gweiToWei(settings.priorityGwei);
+    if (configured > 0n) return configured;
+    try {
+      const head = await raceRead(urls, (url) => createProvider(url).getBlock("latest"));
+      return resolveMaxFee(configured, head?.baseFeePerGas ?? 0n, priority).maxFeePerGas;
+    } catch {
+      // Couldn't read the chain — a sane ceiling beats signing with zero.
+      return marketFee(1_000_000_000n, priority);
+    }
+  }
 
   /** Live state handed to the assistant. Read-only, and gathered per ask. */
   async function buildSnapshot(ctx: BotContext): Promise<BotSnapshot> {
@@ -2742,7 +2767,7 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
           chain.nativeSymbol,
           wallets,
           settings.gasLimit,
-          gweiToWei(settings.maxFeeGwei),
+          await resolveFeeCeiling(settings, urls),
           plan.value
         );
         return ctx.reply(
@@ -3088,7 +3113,7 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
         chain.nativeSymbol,
         wallets,
         settings.gasLimit,
-        gweiToWei(settings.maxFeeGwei),
+        await resolveFeeCeiling(settings, urls),
         plan.value
       );
       await ctx.reply(
@@ -3679,7 +3704,14 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
 
       const settings = ctx.store.getSettings();
       const chain = resolveChain(settings.chainKey)!;
-      const worstCase = estimateBatchCost(targets.length, amountWei, gweiToWei(settings.maxFeeGwei));
+      // Same ceiling the transfer will actually sign with. Passing the raw
+      // setting would quote gas as free whenever it is set to auto.
+      const { urls: fundUrls } = resolveRpcsForChain(settings.chainKey);
+      const worstCase = estimateBatchCost(
+        targets.length,
+        amountWei,
+        await resolveFeeCeiling(settings, fundUrls)
+      );
       const sourceLabel = ctx.store.listWallets().find((w) => w.address.toLowerCase() === source.toLowerCase())?.label ?? source;
       return ctx.reply(
         `Send ${formatEther(amountWei)} ${chain.nativeSymbol} from ${sourceLabel} to ${targets.length} wallet(s)?\n` +
