@@ -80,6 +80,7 @@ import { runCopyMintWatcher } from "../copy-mint";
 import { runActivityWatcher } from "../activity-watcher";
 import { batchTransfer, estimateBatchCost } from "../fund-transfer";
 import {
+  ScanResult,
   scanHoldings,
   holders,
   buildPlan,
@@ -183,6 +184,11 @@ interface RunningWatcher {
   stopSignal: { stopped: boolean };
   promise: Promise<void>;
 }
+
+// Telegram rate-limits edits to a message. A walk finishes a batch roughly
+// twice a second, and editing that often would trip the limit long before the
+// scan did. Slow enough to stay well inside it, quick enough to look alive.
+const PROGRESS_EDIT_MS = 4_000;
 
 function gweiToWei(gwei: number): bigint {
   return BigInt(Math.round(gwei * 1e9));
@@ -2183,6 +2189,51 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
     }
   }
 
+  /**
+   * Scan every wallet for a collection, reporting progress as it goes.
+   *
+   * Deliberately NOT awaited by the caller's handler. Telegraf wraps every
+   * handler in a 90-second timeout, and a collection with no enumeration
+   * costs one call per token in the whole drop — a 7,361-token drop took past
+   * two minutes and surfaced as "Promise timed out after 90000 milliseconds"
+   * while the scan was still running perfectly well behind it.
+   *
+   * Progress edits are throttled: Telegram rate-limits message edits, and a
+   * batch completing every half second would trip that long before the scan
+   * finished.
+   */
+  async function scanWithProgress(
+    ctx: BotContext,
+    contract: string,
+    noteChatId: number,
+    noteMessageId: number
+  ): Promise<ScanResult | null> {
+    const settings = ctx.store.getSettings();
+    const { urls } = resolveRpcsForChain(settings.chainKey);
+    const wallets = ctx.store.listWallets();
+    const say = (text: string, extra?: any) =>
+      ctx.telegram.editMessageText(noteChatId, noteMessageId, undefined, text, extra).catch(() => {});
+
+    let lastEdit = 0;
+    try {
+      return await scanHoldings(urls, contract, wallets.map((w) => w.address), {
+        onProgress: (checked, total) => {
+          const now = Date.now();
+          if (now - lastEdit < PROGRESS_EDIT_MS || total <= 0) return;
+          lastEdit = now;
+          const pct = Math.min(100, Math.round((checked / total) * 100));
+          void say(
+            `Checking ${wallets.length} wallet(s) against ${total.toLocaleString()} tokens…\n` +
+              `${pct}% — this collection can't be enumerated, so every token has to be asked about.`
+          );
+        },
+      });
+    } catch (err: any) {
+      await say(`Couldn't read that collection: ${err?.shortMessage ?? err?.message ?? err}`);
+      return null;
+    }
+  }
+
   /** Live state handed to the assistant. Read-only, and gathered per ask. */
   async function buildSnapshot(ctx: BotContext): Promise<BotSnapshot> {
     const store = ctx.store;
@@ -3977,101 +4028,105 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
       const wallets = ctx.store.listWallets();
       if (wallets.length === 0) return ctx.reply("Add a wallet first.");
       const note = await ctx.reply(`Counting what ${wallets.length} wallet(s) hold…`);
-      const say = (text: string, extra?: any) =>
-        ctx.telegram.editMessageText(note.chat.id, note.message_id, undefined, text, extra).catch(() => {});
 
-      const { urls } = resolveRpcsForChain(settings.chainKey);
-      const chain = resolveChain(settings.chainKey)!;
+      // Detached: see scanWithProgress. Awaiting this would hand Telegraf a
+      // promise it kills at 90 seconds, and a large collection takes longer.
+      void (async () => {
+        const say = (text: string, extra?: any) =>
+          ctx.telegram.editMessageText(note.chat.id, note.message_id, undefined, text, extra).catch(() => {});
+        try {
+          const { urls } = resolveRpcsForChain(settings.chainKey);
+          const chain = resolveChain(settings.chainKey)!;
 
-      // Holdings first and on their own: this is the only figure here that
-      // comes off the chain, and every value below it is someone else's
-      // opinion layered on top.
-      let scan;
-      try {
-        scan = await tryInOrder(urls, (url) =>
-          scanHoldings(url, contract, wallets.map((w) => w.address))
-        );
-      } catch (err: any) {
-        return say(`Couldn't read that collection: ${err?.shortMessage ?? err?.message ?? err}`);
-      }
+          // Holdings first and on their own: this is the only figure here
+          // that comes off the chain, and every value below it is someone
+          // else's opinion layered on top.
+          const scan = await scanWithProgress(ctx, contract, note.chat.id, note.message_id);
+          if (!scan) return;
 
-      const found = holders(scan);
-      const quantity = found.reduce((sum, h) => sum + h.tokenIds.length, 0);
-      if (quantity === 0) {
-        const unreadable = scan.skipped.filter((sk) => sk.reason !== "holds none");
-        return say(
-          unreadable.length > 0
-            ? `None of your wallets hold this collection.\n\n${unreadable
-                .map((sk) => `• ${maskAddress(sk.address)} — ${sk.reason}`)
-                .join("\n")}`
-            : "None of your wallets hold this collection, so there's no P&L to show."
-        );
-      }
+          const found = holders(scan);
+          const quantity = found.reduce((sum, h) => sum + h.tokenIds.length, 0);
+          if (quantity === 0) {
+            const unreadable = scan.skipped.filter((sk) => sk.reason !== "holds none");
+            return say(
+              unreadable.length > 0
+                ? `None of your wallets hold this collection.\n\n${unreadable
+                    .map((sk) => `• ${maskAddress(sk.address)} — ${sk.reason}`)
+                    .join("\n")}`
+                : "None of your wallets hold this collection, so there's no P&L to show."
+            );
+          }
 
-      await say(`Found ${quantity} across ${found.length} wallet(s). Pricing them…`);
+          await say(`Found ${quantity} across ${found.length} wallet(s). Pricing them…`);
 
-      // Everything below is best-effort. A missing floor or a collection
-      // OpenSea has never indexed degrades the report; it never kills it,
-      // because the holdings above are already worth showing on their own.
-      const lookup = await lookupContract(settings.chainKey, contract, process.env.OPENSEA_API_KEY);
-      const slug = isLookupFailure(lookup) ? null : lookup.slug;
-      const apiKey = process.env.OPENSEA_API_KEY;
+          // Everything below is best-effort. A missing floor or a collection
+          // OpenSea has never indexed degrades the report; it never kills it,
+          // because the holdings above are already worth showing on their own.
+          const lookup = await lookupContract(settings.chainKey, contract, process.env.OPENSEA_API_KEY);
+          const slug = isLookupFailure(lookup) ? null : lookup.slug;
+          const apiKey = process.env.OPENSEA_API_KEY;
 
-      const [stages, info, stats, offer] = await Promise.all([
-        raceReadOrNull(urls, (url) => readStages(url, contract)).catch(() => null),
-        slug ? fetchCollection(slug, apiKey).catch(() => null) : Promise.resolve(null),
-        slug ? fetchStats(slug, apiKey).catch(() => null) : Promise.resolve(null),
-        slug ? fetchBestCollectionOffer(slug, apiKey).catch(() => null) : Promise.resolve(null),
-      ]);
+          const [stages, info, stats, offer] = await Promise.all([
+            raceReadOrNull(urls, (url) => readStages(url, contract)).catch(() => null),
+            slug ? fetchCollection(slug, apiKey).catch(() => null) : Promise.resolve(null),
+            slug ? fetchStats(slug, apiKey).catch(() => null) : Promise.resolve(null),
+            slug ? fetchBestCollectionOffer(slug, apiKey).catch(() => null) : Promise.resolve(null),
+          ]);
 
-      const publicStage = (stages ?? []).find((s) => s.kind === "public");
-      const mintPriceEth =
-        publicStage?.priceWei !== undefined ? Number(formatEther(publicStage.priceWei)) : null;
+          const publicStage = (stages ?? []).find((s) => s.kind === "public");
+          const mintPriceEth =
+            publicStage?.priceWei !== undefined ? Number(formatEther(publicStage.priceWei)) : null;
 
-      // Gas from the same model the mint path sizes its limit with, at the
-      // fee ceiling this bot would sign at. Every wallet paid its own, so it
-      // scales with wallets and tokens rather than tokens alone.
-      let gasEth: number | null = null;
-      try {
-        const ceiling = await resolveFeeCeiling(settings, urls);
-        const perWallet = found.map((h) => BigInt(gasLimitForQuantity(h.tokenIds.length)) * ceiling);
-        gasEth = Number(formatEther(perWallet.reduce((a, b) => a + b, 0n)));
-      } catch {
-        /* a modelled figure we can't model is better left out than guessed */
-      }
+          // Gas from the same model the mint path sizes its limit with, at
+          // the fee ceiling this bot would sign at. Every wallet paid its own,
+          // so it scales with wallets and tokens rather than tokens alone.
+          let gasEth: number | null = null;
+          try {
+            const ceiling = await resolveFeeCeiling(settings, urls);
+            const perWallet = found.map((h) => BigInt(gasLimitForQuantity(h.tokenIds.length)) * ceiling);
+            gasEth = Number(formatEther(perWallet.reduce((a, b) => a + b, 0n)));
+          } catch {
+            /* a modelled figure we can't model is better left out than guessed */
+          }
 
-      const labelFor = (addr: string) =>
-        wallets.find((w) => w.address.toLowerCase() === addr.toLowerCase())?.label ?? maskAddress(addr);
+          const labelFor = (addr: string) =>
+            wallets.find((w) => w.address.toLowerCase() === addr.toLowerCase())?.label ?? maskAddress(addr);
 
-      const report: PnlReport = {
-        name: info?.name || (isLookupFailure(lookup) ? maskAddress(contract) : lookup.name),
-        contract,
-        symbol: chain.nativeSymbol,
-        quantity,
-        wallets: found.length,
-        mintPriceEth,
-        gasEth,
-        floorEth: stats?.floorPrice ?? null,
-        bestOfferEth: offer?.priceEth ?? null,
-        priceSource: mintPriceEth === null ? "unknown" : "stage",
-        breakdown: found.map((h) => ({
-          address: h.address,
-          label: labelFor(h.address),
-          count: h.tokenIds.length,
-        })),
-      };
-      const pnl = computePnl(report);
+          const report: PnlReport = {
+            name: info?.name || (isLookupFailure(lookup) ? maskAddress(contract) : lookup.name),
+            contract,
+            symbol: chain.nativeSymbol,
+            quantity,
+            wallets: found.length,
+            mintPriceEth,
+            gasEth,
+            floorEth: stats?.floorPrice ?? null,
+            bestOfferEth: offer?.priceEth ?? null,
+            priceSource: mintPriceEth === null ? "unknown" : "stage",
+            breakdown: found.map((h) => ({
+              address: h.address,
+              label: labelFor(h.address),
+              count: h.tokenIds.length,
+            })),
+          };
+          const pnl = computePnl(report);
 
-      // The card is decoration around a report that already stands on its
-      // own, so a rasteriser failure must not cost the numbers.
-      try {
-        const png = await renderPnlCardPng({ report, pnl, artHref: info?.imageUrl ?? null });
-        await ctx.replyWithPhoto({ source: png });
-      } catch (err: any) {
-        console.error(`P&L card failed for ${contract}: ${err?.message ?? err}`);
-      }
+          // The card is decoration around a report that already stands on its
+          // own, so a rasteriser failure must not cost the numbers.
+          try {
+            const png = await renderPnlCardPng({ report, pnl, artHref: info?.imageUrl ?? null });
+            await ctx.replyWithPhoto({ source: png });
+          } catch (err: any) {
+            console.error(`P&L card failed for ${contract}: ${err?.message ?? err}`);
+          }
 
-      return say(renderPnl(report, pnl), { parse_mode: "Markdown" });
+          await say(renderPnl(report, pnl), { parse_mode: "Markdown" });
+        } catch (err: any) {
+          console.error(`P&L failed for ${contract}: ${err?.message ?? err}`);
+          await say(`P&L failed: ${err?.shortMessage ?? err?.message ?? err}`);
+        }
+      })();
+      return;
     }
 
     if (step === "awaiting_consolidate_contract") {
@@ -4086,66 +4141,67 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
 
       const wallets = ctx.store.listWallets();
       const note = await ctx.reply(`Checking ${wallets.length} wallet(s) for this collection…`);
-      const say = (text: string, extra?: any) =>
-        ctx.telegram.editMessageText(note.chat.id, note.message_id, undefined, text, extra).catch(() => {});
 
-      const { urls } = resolveRpcsForChain(settings.chainKey);
-      // Tried in order rather than raced. A scan can be hundreds of eth_calls
-      // on a collection with no enumeration, and racing would multiply that
-      // by the number of endpoints to get a result only one of them needed to
-      // produce. Failover is kept; the triple load is not.
-      let scan;
-      try {
-        scan = await tryInOrder(urls, (url) =>
-          scanHoldings(url, contract, wallets.map((w) => w.address))
-        );
-      } catch (err: any) {
-        return say(`Couldn't read that collection: ${err?.shortMessage ?? err?.message ?? err}`);
-      }
+      // Detached for the same reason as P&L above: this can outrun Telegraf's
+      // 90-second handler timeout on a collection that has to be walked.
+      void (async () => {
+        const say = (text: string, extra?: any) =>
+          ctx.telegram.editMessageText(note.chat.id, note.message_id, undefined, text, extra).catch(() => {});
+        try {
+          const scan = await scanWithProgress(ctx, contract, note.chat.id, note.message_id);
+          if (!scan) return;
 
-      const found = holders(scan);
-      if (found.length === 0) {
-        // Distinguish "you own none" from "these couldn't be read" — the
-        // second is a different problem with a different fix.
-        const unreadable = scan.skipped.filter((sk) => sk.reason !== "holds none");
-        return say(
-          unreadable.length > 0
-            ? `None of your wallets hold this collection.\n\n${unreadable
-                .map((sk) => `• ${maskAddress(sk.address)} — ${sk.reason}`)
-                .join("\n")}`
-            : "None of your wallets hold this collection."
-        );
-      }
+          const found = holders(scan);
+          if (found.length === 0) {
+            // Distinguish "you own none" from "these couldn't be read" — the
+            // second is a different problem with a different fix.
+            const unreadable = scan.skipped.filter((sk) => sk.reason !== "holds none");
+            return say(
+              unreadable.length > 0
+                ? `None of your wallets hold this collection.\n\n${unreadable
+                    .map((sk) => `• ${maskAddress(sk.address)} — ${sk.reason}`)
+                    .join("\n")}`
+                : "None of your wallets hold this collection."
+            );
+          }
 
-      const labelFor = (addr: string) =>
-        wallets.find((w) => w.address.toLowerCase() === addr.toLowerCase())?.label ?? maskAddress(addr);
-      ctx.session.consolidate = {
-        contract,
-        found: found.map((h) => ({
-          owner: h.address,
-          label: labelFor(h.address),
-          tokenIds: h.tokenIds.map((id) => id.toString()),
-        })),
-        // Pre-selected: sweeping everything is the common case, so the default
-        // is one tap to Done and deselecting is the exception.
-        selected: found.map((h) => h.address.toLowerCase()),
-      };
+          const labelFor = (addr: string) =>
+            wallets.find((w) => w.address.toLowerCase() === addr.toLowerCase())?.label ?? maskAddress(addr);
+          ctx.session.consolidate = {
+            contract,
+            found: found.map((h) => ({
+              owner: h.address,
+              label: labelFor(h.address),
+              tokenIds: h.tokenIds.map((id) => id.toString()),
+            })),
+            // Pre-selected: sweeping everything is the common case, so the
+            // default is one tap to Done and deselecting is the exception.
+            selected: found.map((h) => h.address.toLowerCase()),
+          };
 
-      const unreadable = scan.skipped.filter((sk) => sk.reason !== "holds none");
-      const total = found.reduce((s, h) => s + h.tokenIds.length, 0);
-      let text =
-        `📦 Found *${total}* NFT(s) across *${found.length}* wallet(s).\n\n` +
-        "Tap to choose which wallets to sweep, then Done.";
-      if (unreadable.length > 0) {
-        text += `\n\nCouldn't read:\n${unreadable.map((sk) => `• ${maskAddress(sk.address)} — ${sk.reason}`).join("\n")}`;
-      }
-      return say(text, {
-        parse_mode: "Markdown",
-        ...consolidateSourcesMenu(
-          found.map((h) => ({ address: h.address, label: labelFor(h.address), count: h.tokenIds.length })),
-          new Set(found.map((h) => h.address.toLowerCase()))
-        ),
-      });
+          const unreadable = scan.skipped.filter((sk) => sk.reason !== "holds none");
+          const total = found.reduce((s, h) => s + h.tokenIds.length, 0);
+          let text =
+            `📦 Found *${total}* NFT(s) across *${found.length}* wallet(s).\n\n` +
+            "Tap to choose which wallets to sweep, then Done.";
+          if (unreadable.length > 0) {
+            text += `\n\nCouldn't read:\n${unreadable
+              .map((sk) => `• ${maskAddress(sk.address)} — ${sk.reason}`)
+              .join("\n")}`;
+          }
+          await say(text, {
+            parse_mode: "Markdown",
+            ...consolidateSourcesMenu(
+              found.map((h) => ({ address: h.address, label: labelFor(h.address), count: h.tokenIds.length })),
+              new Set(found.map((h) => h.address.toLowerCase()))
+            ),
+          });
+        } catch (err: any) {
+          console.error(`Consolidate scan failed for ${contract}: ${err?.message ?? err}`);
+          await say(`Scan failed: ${err?.shortMessage ?? err?.message ?? err}`);
+        }
+      })();
+      return;
     }
 
     if (step === "awaiting_fund_amount") {

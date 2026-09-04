@@ -12,6 +12,7 @@
 
 import { Contract, Interface, Wallet, formatEther } from "ethers";
 import { createProvider } from "./rpc-provider";
+import { readableRpcs } from "./fast-read";
 import { waitForReceipt } from "./rpc-blast";
 import { Logger, defaultLogger } from "./logger";
 
@@ -89,6 +90,55 @@ export function groupByOwner(tokens: HeldToken[]): Map<string, bigint[]> {
   return byOwner;
 }
 
+// How long an endpoint gets to prove it can answer before the walk starts.
+// Short on purpose: this is one cheap call to a node that either works or
+// does not, and the walk behind it makes thousands.
+const HEALTH_CHECK_MS = 5_000;
+
+/**
+ * The endpoints that can actually answer, checked once up front.
+ *
+ * The walk deals work out across every endpoint, so a dead one is not merely
+ * useless — it is actively expensive. Every call routed to it has to reach
+ * its own timeout before failing over, and with thousands of calls that turns
+ * a 90-second walk into one that never finishes. Measured: adding a single
+ * unreachable host to a two-endpoint walk took it past nine minutes.
+ *
+ * So each endpoint answers one cheap call first, and only the ones that do
+ * take part. If none answer, the first is returned anyway so the caller fails
+ * with a real RPC error rather than an empty-list one.
+ */
+async function healthyContracts(urls: string[], contract: string): Promise<Contract[]> {
+  const checks = await Promise.all(
+    urls.map(async (url) => {
+      try {
+        // getBlockNumber, deliberately: this has to test the ENDPOINT, not
+        // the contract. The first version probed balanceOf(address(0)), which
+        // ERC-721 reverts on by specification -- so every healthy endpoint
+        // failed its own health check, the list came back empty, and the
+        // fallback then picked whichever url was listed first. Which, in the
+        // one case this exists to handle, was the dead one.
+        await Promise.race([
+          createProvider(url, HEALTH_CHECK_MS).getBlockNumber(),
+          new Promise((_, reject) => setTimeout(() => reject(new Error("health check timed out")), HEALTH_CHECK_MS)),
+        ]);
+        return new Contract(contract, ERC721, createProvider(url));
+      } catch {
+        return null;
+      }
+    })
+  );
+  const healthy = checks.filter((c): c is Contract => c !== null);
+  // Nothing answered: hand back the first anyway, so the caller fails with a
+  // real RPC error rather than an empty-list one that says nothing.
+  return healthy.length > 0 ? healthy : [new Contract(contract, ERC721, createProvider(urls[0]))];
+}
+
+export interface ScanOptions {
+  /** Called as the walk advances, so a slow scan can show it is alive. */
+  onProgress?: (checked: number, total: number) => void;
+}
+
 /**
  * Read what each wallet holds in this collection.
  *
@@ -101,68 +151,95 @@ export function groupByOwner(tokens: HeldToken[]): Map<string, bigint[]> {
  *   1. tokenOfOwnerByIndex, the ERC-721 Enumerable extension. One call per
  *      token owned, and it asks only about the wallets we care about.
  *
- *   2. Failing that, walk ownerOf over the id range. Measured on a live
- *      SeaDrop collection: supportsInterface(0x780e9d63) is false, both index
- *      functions revert, but totalSupply() answers and ownerOf(1) resolves
- *      while ownerOf(0) reverts — the ERC721A shape this bot mints most of
- *      the time. The walk costs one call per token in the collection rather
- *      than per token held, but it covers every wallet in a single pass, and
- *      a few hundred eth_calls is a second or two.
+ *   2. Failing that, walk ownerOf over the id range. Measured on two live
+ *      SeaDrop collections: supportsInterface(0x780e9d63) false, both index
+ *      functions reverting, totalSupply answering, ownerOf(1) resolving and
+ *      ownerOf(0) reverting — the ERC721A shape this bot mints most of the
+ *      time. The walk costs one call per token in the collection rather than
+ *      per token held, which on a 7,361-token drop is minutes, not seconds.
+ *
+ * Everything that can be asked at once is: balances go out together rather
+ * than one wallet at a time, and enumerability is probed once for the
+ * collection instead of once per wallet. On fourteen wallets that alone was
+ * twenty-eight sequential round trips before the real work started.
  */
-export async function scanHoldings(rpcUrl: string, contract: string, owners: string[]): Promise<ScanResult> {
-  const provider = createProvider(rpcUrl);
-  const nft = new Contract(contract, ERC721, provider);
+export async function scanHoldings(
+  rpcUrls: string | string[],
+  contract: string,
+  owners: string[],
+  opts: ScanOptions = {}
+): Promise<ScanResult> {
+  const urls = readableRpcs(Array.isArray(rpcUrls) ? rpcUrls : [rpcUrls]);
+  const contracts = await healthyContracts(urls, contract);
+  const nft = contracts[0];
+
   const tokens: HeldToken[] = [];
   const skipped: SkippedWallet[] = [];
 
-  // Balances first: they say who is worth asking about, and later they say
-  // whether the walk found everything it should have.
+  // Balances first, all at once: they say who is worth asking about, and
+  // later they say whether the walk found everything it should have.
+  const balances = await Promise.all(
+    owners.map(
+      async (owner): Promise<{ owner: string; balance: bigint | null; error: string | null }> => {
+        try {
+          return { owner, balance: (await nft.balanceOf(owner)) as bigint, error: null };
+        } catch (err: any) {
+          return { owner, balance: null, error: err?.shortMessage ?? err?.message ?? String(err) };
+        }
+      }
+    )
+  );
+
   const expected = new Map<string, bigint>();
-  for (const owner of owners) {
-    try {
-      const balance: bigint = await nft.balanceOf(owner);
-      if (balance === 0n) skipped.push({ address: owner, reason: "holds none" });
-      else expected.set(owner, balance);
-    } catch (err: any) {
-      const detail = err?.shortMessage ?? err?.message ?? String(err);
-      skipped.push({ address: owner, reason: `could not read balance — ${detail}` });
-    }
+  for (const b of balances) {
+    if (b.balance === null) skipped.push({ address: b.owner, reason: `could not read balance — ${b.error}` });
+    else if (b.balance === 0n) skipped.push({ address: b.owner, reason: "holds none" });
+    else expected.set(b.owner, b.balance);
   }
   if (expected.size === 0) return { contract, tokens, skipped };
 
-  const needsWalk: string[] = [];
-  for (const [owner, balance] of expected) {
-    const found: bigint[] = [];
-    let enumerable = true;
-    for (let i = 0n; i < balance; i++) {
-      try {
-        found.push(await nft.tokenOfOwnerByIndex(owner, i));
-      } catch {
-        enumerable = false;
-        break;
+  // Enumerability is a property of the contract, not of a wallet, so it is
+  // asked once. Probing per wallet meant a non-enumerable collection paid one
+  // failed call for every wallet before falling back.
+  const probe = [...expected.keys()][0];
+  let enumerable = true;
+  try {
+    await nft.tokenOfOwnerByIndex(probe, 0);
+  } catch {
+    enumerable = false;
+  }
+
+  if (enumerable) {
+    for (const [owner, balance] of expected) {
+      const found: bigint[] = [];
+      let ok = true;
+      for (let i = 0n; i < balance; i++) {
+        try {
+          found.push(await nft.tokenOfOwnerByIndex(owner, i));
+        } catch {
+          ok = false;
+          break;
+        }
       }
+      // Partial enumeration is worse than none: it would move some tokens and
+      // leave the rest behind without saying so.
+      if (ok) for (const tokenId of found) tokens.push({ owner, tokenId });
+      else
+        skipped.push({
+          address: owner,
+          reason: `holds ${balance}, but enumeration stopped short — move these by token id`,
+        });
     }
-    // Partial enumeration is worse than none: it would move some tokens and
-    // leave the rest behind without saying so.
-    if (enumerable) for (const tokenId of found) tokens.push({ owner, tokenId });
-    else needsWalk.push(owner);
+    return { contract, tokens, skipped };
   }
 
-  if (needsWalk.length > 0) {
-    const walked = await walkOwners(
-      nft,
-      new Map(needsWalk.map((o) => [o, expected.get(o)!]))
-    );
-    tokens.push(...walked.tokens);
-    skipped.push(...walked.skipped);
-  }
-
-  return { contract, tokens, skipped };
+  const walked = await walkOwners(contracts, expected, opts);
+  return { contract, tokens: [...tokens, ...walked.tokens], skipped: [...skipped, ...walked.skipped] };
 }
 
-// How many ownerOf calls are in flight at once.
+// How many ownerOf calls are in flight against ONE endpoint at a time.
 //
-// ethers batches concurrent calls into one JSON-RPC request, so this is
+// ethers batches concurrent calls into a single JSON-RPC request, so this is
 // really the batch size, and the endpoint has a strong opinion about it.
 // Benchmarked over 240 ownerOf calls against the public Robinhood RPC:
 //
@@ -170,11 +247,10 @@ export async function scanHoldings(rpcUrl: string, contract: string, owners: str
 //   concurrency  60   130s   181/241 found
 //   concurrency 100   105s    41/241 found
 //
-// Past ~25 the endpoint starts dropping requests inside the batch, and a
-// dropped ownerOf is indistinguishable from a burned token id — so raising
-// this does not merely slow the walk down, it silently loses tokens. The
-// balance cross-check at the end catches the shortfall and reports it, but
-// the fix is to stay at a batch size the endpoint actually serves.
+// Past ~25 it starts dropping requests inside the batch, and a dropped
+// ownerOf is indistinguishable from a burned token id — so raising this does
+// not merely slow the walk down, it silently loses tokens. Extra throughput
+// comes from using more endpoints, not from a bigger batch.
 const WALK_CONCURRENCY = 25;
 
 // Ids checked beyond totalSupply before giving up. Burns leave gaps, so the
@@ -190,17 +266,24 @@ const WALK_SLACK = 2_000;
  * accounted for, so the usual case ends early rather than reading the whole
  * collection. Reverts are expected and ignored: id 0 does not exist on an
  * ERC721A that starts at 1, and burned ids revert everywhere.
+ *
+ * Batches are dealt out across every readable endpoint at once. One endpoint
+ * caps out at 25 concurrent calls, so two endpoints halve a 7,361-token walk
+ * rather than each being asked to swallow more than it can serve. A call that
+ * fails on one endpoint is retried on another before it counts as a gap —
+ * without that, a rate-limited endpoint would quietly turn owned tokens into
+ * missing ones.
  */
 async function walkOwners(
-  nft: Contract,
-  expected: Map<string, bigint>
+  contracts: Contract[],
+  expected: Map<string, bigint>,
+  opts: ScanOptions = {}
 ): Promise<{ tokens: HeldToken[]; skipped: SkippedWallet[] }> {
-  const tokens: HeldToken[] = [];
   const skipped: SkippedWallet[] = [];
 
   let supply: bigint;
   try {
-    supply = await nft.totalSupply();
+    supply = await contracts[0].totalSupply();
   } catch (err: any) {
     // No enumeration and no supply: there is no way to discover ids from the
     // chain alone. Say exactly that rather than reporting zero holdings.
@@ -211,7 +294,7 @@ async function walkOwners(
         reason: `holds ${balance}, but the collection has neither enumeration nor totalSupply (${detail}) — move these by token id`,
       });
     }
-    return { tokens, skipped };
+    return { tokens: [], skipped };
   }
 
   // Index by lowercase address once, so the hot loop is a map lookup rather
@@ -221,37 +304,52 @@ async function walkOwners(
   const outstanding = new Map(expected);
 
   const lastId = supply + BigInt(WALK_SLACK);
-  for (let start = 0n; start <= lastId; start += BigInt(WALK_CONCURRENCY)) {
-    const batch: bigint[] = [];
-    for (let i = 0n; i < BigInt(WALK_CONCURRENCY) && start + i <= lastId; i++) batch.push(start + i);
+  const total = Number(supply);
+  const stride = BigInt(WALK_CONCURRENCY * contracts.length);
 
-    const results = await Promise.all(
-      batch.map(async (tokenId) => {
-        try {
-          return { tokenId, owner: (await nft.ownerOf(tokenId)) as string };
-        } catch {
-          // A gap, a burn, or an id below the collection's start.
-          return null;
-        }
-      })
-    );
+  const ownerOf = async (tokenId: bigint, preferred: number): Promise<string | null> => {
+    for (let attempt = 0; attempt < contracts.length; attempt++) {
+      const nft = contracts[(preferred + attempt) % contracts.length];
+      try {
+        return (await nft.ownerOf(tokenId)) as string;
+      } catch (err: any) {
+        // A revert is the contract's answer: this id does not exist. Only a
+        // transport failure is worth asking a different endpoint about.
+        const message = String(err?.shortMessage ?? err?.message ?? err);
+        if (/revert|nonexistent|invalid token/i.test(message)) return null;
+      }
+    }
+    return null;
+  };
 
-    for (const r of results) {
-      if (!r) continue;
-      const owner = wanted.get(r.owner.toLowerCase());
+  for (let start = 0n; start <= lastId; start += stride) {
+    const calls: Promise<{ tokenId: bigint; owner: string | null }>[] = [];
+    for (let i = 0n; i < stride && start + i <= lastId; i++) {
+      const tokenId = start + i;
+      // Deal consecutive ids round-robin, so every endpoint carries an equal
+      // share of each batch instead of one being saturated first.
+      const endpoint = Number(i % BigInt(contracts.length));
+      calls.push(ownerOf(tokenId, endpoint).then((owner) => ({ tokenId, owner })));
+    }
+
+    for (const { tokenId, owner: holder } of await Promise.all(calls)) {
+      if (!holder) continue;
+      const owner = wanted.get(holder.toLowerCase());
       if (!owner) continue;
-      foundFor.get(owner)!.push(r.tokenId);
+      foundFor.get(owner)!.push(tokenId);
       const left = (outstanding.get(owner) ?? 0n) - 1n;
       if (left <= 0n) outstanding.delete(owner);
       else outstanding.set(owner, left);
     }
+
+    opts.onProgress?.(Math.min(Number(start + stride), total), total);
 
     // Everything accounted for — no reason to read the rest of the collection.
     if (outstanding.size === 0) break;
   }
 
   const reconciled = reconcileWalk(expected, foundFor);
-  return { tokens: reconciled.tokens, skipped: reconciled.skipped };
+  return { tokens: reconciled.tokens, skipped: [...skipped, ...reconciled.skipped] };
 }
 
 /**

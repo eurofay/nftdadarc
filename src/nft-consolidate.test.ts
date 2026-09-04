@@ -239,3 +239,23 @@ describe("summarise", () => {
     expect(summarise([ok(1n)], DEST)).toContain(DEST.slice(0, 8));
   });
 });
+
+describe("scanHoldings endpoint health", () => {
+  // Regression: the health check used to probe balanceOf(address(0)), which
+  // ERC-721 reverts on by specification. Every healthy endpoint therefore
+  // failed its own check, the healthy list came back empty, and the fallback
+  // picked whichever url was listed first -- the dead one, in the exact case
+  // the check exists to handle. The probe must not be able to revert for
+  // reasons that belong to the contract rather than the endpoint.
+  it("probes the endpoint, not the contract", async () => {
+    const fs = await import("node:fs");
+    const source = fs.readFileSync(new URL("./nft-consolidate.ts", import.meta.url), "utf8");
+    const from = source.indexOf("async function healthyContracts");
+    const to = source.indexOf("export interface ScanOptions", from);
+    expect(from).toBeGreaterThan(-1);
+    expect(to).toBeGreaterThan(from);
+    const body = source.slice(from, to);
+    expect(body).toContain("getBlockNumber");
+    expect(body).not.toContain("nft.balanceOf");
+  });
+});
