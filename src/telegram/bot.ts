@@ -39,6 +39,8 @@ import {
   fundSourceMenu,
   fundTargetsMenu,
   fundConfirmMenu,
+  consolidateDestMenu,
+  consolidateConfirmMenu,
   schedWalletsMenu,
   schedTimingMenu,
   schedConfirmMenu,
@@ -76,11 +78,18 @@ import { runAutoMintWatcher } from "../auto-mint";
 import { runCopyMintWatcher } from "../copy-mint";
 import { runActivityWatcher } from "../activity-watcher";
 import { batchTransfer, estimateBatchCost } from "../fund-transfer";
+import {
+  planConsolidation,
+  consolidate,
+  estimateConsolidationCost,
+  summarise as summariseConsolidation,
+} from "../nft-consolidate";
 import { fetchOnChainHoldings } from "../nft-holdings";
 import { MintCardData } from "../mint-card";
 import { gasLimitForQuantity, upfrontReservation } from "../gas";
 import { raceRead, raceReadOrNull, readableRpcs } from "../fast-read";
 import { readStages, describeStages, checkEligibility, describeEligibility } from "../seadrop-stages";
+import { openSeaAuthFailure } from "../opensea-market";
 import { stageWindow, assessWallet } from "../mint-readiness";
 import { resolveMaxFee, marketFee } from "../gas-fit";
 import { OpenSeaMintClient, OpenSeaMintError } from "../opensea-mint";
@@ -112,6 +121,7 @@ interface SessionData {
     | "awaiting_agent_question"
     | "awaiting_copy_target"
     | "awaiting_fund_amount"
+    | "awaiting_consolidate_contract"
     | "awaiting_sched_link"
     | "awaiting_sched_quantity"
     | "awaiting_sched_custom_time"
@@ -120,6 +130,12 @@ interface SessionData {
   fundSource?: string;
   fundTargets?: string[]; // lowercased addresses
   fundAmountWei?: string; // bigint as string — kept out of the type so session stays plain-JSON-shaped
+  consolidate?: {
+    contract: string;
+    destination?: string;
+    /** Planned moves, held between the preview and the confirm tap. */
+    tokens?: { owner: string; tokenId: string }[];
+  };
   schedContract?: string;
   schedWallets?: string[]; // lowercased addresses
   schedQuantity?: number;
@@ -619,6 +635,135 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
     ctx.session.fundSource = undefined;
     ctx.session.fundTargets = undefined;
     return ctx.editMessageText("Send FROM which wallet?", fundSourceMenu(wallets));
+  });
+
+  // ── Consolidate ──────────────────────────────────────────────────────
+  // Minting from many wallets is the point; owning from many wallets is not.
+  // This reads holdings straight off the chain and moves them into one
+  // wallet, so it works on collections no marketplace has indexed yet.
+  bot.action("menu:consolidate", (ctx) => {
+    const wallets = ctx.store.listWallets();
+    if (wallets.length < 2) {
+      return ctx.answerCbQuery("Add at least two wallets first — one to gather from, one to gather into.", {
+        show_alert: true,
+      });
+    }
+    ctx.session.consolidate = undefined;
+    ctx.session.step = "awaiting_consolidate_contract";
+    return ctx.editMessageText(
+      "📦 *Consolidate a collection*\n\n" +
+        "Send the contract address or OpenSea link of the collection you want gathered up.\n\n" +
+        "Every one of your wallets holding it will send its tokens to whichever wallet you pick next. " +
+        "Gas comes out of each sending wallet.",
+      { parse_mode: "Markdown" }
+    );
+  });
+
+  bot.action(/^consol:dest:(.+)$/, async (ctx) => {
+    const pending = ctx.session.consolidate;
+    if (!pending?.contract) {
+      return ctx.answerCbQuery("That request expired — start over from Consolidate.", { show_alert: true });
+    }
+    const destination = ctx.match[1];
+    pending.destination = destination;
+    await ctx.answerCbQuery("Reading holdings…");
+    await ctx.editMessageText("Reading what each wallet holds — this walks the chain, so give it a moment.");
+
+    const settings = ctx.store.getSettings();
+    const { urls } = resolveRpcsForChain(settings.chainKey);
+    const owners = ctx.store.listWallets().map((w) => w.address);
+
+    // Raced rather than sent to one endpoint: enumeration is many sequential
+    // calls, and a single hiccup partway through would mark a wallet
+    // non-enumerable and quietly leave its tokens behind. The redundant reads
+    // are worth not losing a wallet to a blip.
+    let plan;
+    try {
+      plan = await raceRead(readableRpcs(urls), (url) =>
+        planConsolidation(url, pending.contract, owners, destination)
+      );
+    } catch (err: any) {
+      ctx.session.consolidate = undefined;
+      return ctx.editMessageText(`Couldn't read that collection: ${err?.shortMessage ?? err?.message ?? err}`);
+    }
+
+    if (plan.tokens.length === 0) {
+      ctx.session.consolidate = undefined;
+      const why = plan.skipped.length > 0 ? `\n\n${plan.skipped.map((sk) => `• ${maskAddress(sk.address)} — ${sk.reason}`).join("\n")}` : "";
+      return ctx.editMessageText(`Nothing to move — no other wallet holds this collection.${why}`);
+    }
+
+    pending.tokens = plan.tokens.map((t) => ({ owner: t.owner, tokenId: t.tokenId.toString() }));
+
+    const ceiling = await resolveFeeCeiling(settings, urls);
+    const worstCase = estimateConsolidationCost(plan.tokens.length, ceiling);
+    const chain = resolveChain(settings.chainKey)!;
+    const labelFor = (addr: string) =>
+      ctx.store.listWallets().find((w) => w.address.toLowerCase() === addr.toLowerCase())?.label ?? maskAddress(addr);
+
+    const bySender = new Map<string, number>();
+    for (const t of plan.tokens) bySender.set(t.owner, (bySender.get(t.owner) ?? 0) + 1);
+
+    const lines = [
+      `Move *${plan.tokens.length}* token(s) into *${labelFor(destination)}*?`,
+      "",
+      ...[...bySender].map(([owner, count]) => `• ${labelFor(owner)} → ${count}`),
+      "",
+      `Worst-case gas across all of them: ${formatEther(worstCase)} ${chain.nativeSymbol}, paid by each sending wallet.`,
+    ];
+    // Wallets that were looked at and passed over: worth showing, since a
+    // non-enumerable collection is the difference between "you own none" and
+    // "this can't read them".
+    const notable = plan.skipped.filter((sk) => sk.reason !== "holds none");
+    if (notable.length > 0) {
+      lines.push("", "Skipped:", ...notable.map((sk) => `• ${maskAddress(sk.address)} — ${sk.reason}`));
+    }
+
+    return ctx.editMessageText(lines.join("\n"), {
+      parse_mode: "Markdown",
+      ...consolidateConfirmMenu(),
+    });
+  });
+
+  bot.action("consol:cancel", (ctx) => {
+    ctx.session.consolidate = undefined;
+    ctx.session.step = undefined;
+    return ctx.editMessageText("Cancelled. Nothing was moved.", mainMenu(ctx.from?.id === ownerId));
+  });
+
+  bot.action("consol:confirm", async (ctx) => {
+    const pending = ctx.session.consolidate;
+    if (!pending?.destination || !pending.tokens?.length) {
+      return ctx.answerCbQuery("That request expired — start over from Consolidate.", { show_alert: true });
+    }
+    ctx.session.consolidate = undefined;
+    ctx.session.step = undefined;
+    await ctx.answerCbQuery("Moving…");
+    await ctx.editMessageText("Moving — status below.");
+
+    const settings = ctx.store.getSettings();
+    const { urls } = resolveRpcsForChain(settings.chainKey);
+    const logger = createLogger(createTelegramSink(bot, ctx.chat!.id));
+    const store = ctx.store;
+
+    try {
+      const results = await consolidate({
+        rpcUrl: urls[0],
+        plan: {
+          contract: pending.contract,
+          destination: pending.destination,
+          tokens: pending.tokens.map((t) => ({ owner: t.owner, tokenId: BigInt(t.tokenId) })),
+          skipped: [],
+        },
+        keyFor: (owner) => store.getDecryptedKey(owner),
+        maxFeePerGas: await resolveFeeCeiling(settings, urls),
+        maxPriorityFee: gweiToWei(settings.priorityGwei),
+        logger,
+      });
+      await ctx.reply(summariseConsolidation(results, pending.destination), mainMenu(ctx.from?.id === ownerId));
+    } catch (err: any) {
+      logger.errorBold(`Consolidation failed: ${err?.message ?? err}`);
+    }
   });
 
   // ── Portfolio, sectioned per wallet ──────────────────────────────────
@@ -1180,10 +1325,8 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
   bot.action("menu:activity", (ctx) => {
     const tracked = ctx.store.listMints().filter((m) => m.slug).length;
     return ctx.editMessageText(
-      `🔔 Activity alerts: ${runningActivity.has(ctx.from!.id) ? "🟢 running" : "🔴 stopped"}
-` +
-        `Watching ${tracked} portfolio collection(s) for sweeps, floor moves and offers.
-` +
+      `🔔 Activity alerts: ${runningActivity.has(ctx.from!.id) ? "🟢 running" : "🔴 stopped"}\n` +
+        `Watching ${tracked} portfolio collection(s) for sweeps, floor moves and offers.\n` +
         "Alerts arrive here automatically; nothing is ever bought or sold.",
       activityMenu(runningActivity.has(ctx.from!.id), ctx.store.getSettings())
     );
@@ -1246,15 +1389,25 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
         balances = "\n  (balance lookup failed)";
       }
     }
+
+    // A rejected API key looks identical to "no data" everywhere else, so say
+    // it plainly in the one place someone checks when things seem dead.
+    const authFailure = openSeaAuthFailure();
+    const openSeaNote = authFailure
+      ? `\n\n⚠️ ${authFailure.detail}.\n` +
+        "Floor prices, offers, activity alerts and portfolio art all come from " +
+        "OpenSea, so they stay blank until the key is replaced. Minting is " +
+        "unaffected — it reads only the chain."
+      : "";
+
     await ctx.editMessageText(
       `Chain: ${settings.chainKey}\n` +
         `Wallets: ${wallets.length}${balances}\n` +
         `Auto mint: ${runningAutoFor(ctx.from!.id).size > 0 ? `running on ${[...runningAutoFor(ctx.from!.id).keys()].join(", ")}` : "stopped"}\n` +
-        `Copy mint: ${runningCopy.has(ctx.from!.id) ? "running" : "stopped"} (watching ${ctx.store.listCopyTargets().length})
-` +
-        `Portfolio: ${ctx.store.listMints().length} collection(s)
-` +
-        `Activity alerts: ${runningActivity.has(ctx.from!.id) ? "running" : "stopped"}`,
+        `Copy mint: ${runningCopy.has(ctx.from!.id) ? "running" : "stopped"} (watching ${ctx.store.listCopyTargets().length})\n` +
+        `Portfolio: ${ctx.store.listMints().length} collection(s)\n` +
+        `Activity alerts: ${runningActivity.has(ctx.from!.id) ? "running" : "stopped"}` +
+        openSeaNote,
       menuFor(ctx)
     );
   });
@@ -3717,6 +3870,22 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
           "Listing costs no gas and moves nothing now — it publishes a signed offer to sell. " +
           "You'll be asked to approve the transfer contract if it isn't approved yet.",
         sellActionConfirmMenu("list", address, slug, makeTokenizer(ctx.session))
+      );
+    }
+
+    if (step === "awaiting_consolidate_contract") {
+      ctx.session.step = undefined;
+      const settings = ctx.store.getSettings();
+      let contract: string;
+      try {
+        contract = await resolveMintTarget(ctx.message.text.trim(), settings.chainKey);
+      } catch (err: any) {
+        return ctx.reply(`Couldn't read that as a collection: ${err?.message ?? err}`);
+      }
+      ctx.session.consolidate = { contract };
+      return ctx.reply(
+        "Gather them into which wallet?",
+        consolidateDestMenu(ctx.store.listWallets())
       );
     }
 

@@ -45,12 +45,37 @@ export interface CollectionOffer {
   orderHash: string;
 }
 
+// A rejected key and a collection with no data both used to return null, so
+// an expired key looked exactly like "nothing to report" — no floor, no
+// offers, no alerts, and nothing anywhere saying why. The last auth failure is
+// remembered so callers can tell the difference and say so.
+let lastAuthFailure: { at: number; detail: string } | null = null;
+
+/** The most recent time OpenSea rejected our key, if it has. */
+export function openSeaAuthFailure(): { at: number; detail: string } | null {
+  return lastAuthFailure;
+}
+
+export function clearOpenSeaAuthFailure(): void {
+  lastAuthFailure = null;
+}
+
 async function get(path: string, apiKey?: string): Promise<any | null> {
   const headers: Record<string, string> = { accept: "application/json" };
   if (apiKey) headers["x-api-key"] = apiKey;
   try {
     const res = await fetch(`${BASE}/${path}`, { headers });
+    if (res.status === 401 || res.status === 403) {
+      lastAuthFailure = {
+        at: Date.now(),
+        detail: apiKey ? `OpenSea rejected the API key (HTTP ${res.status})` : "No OPENSEA_API_KEY is set",
+      };
+      return null;
+    }
     if (!res.ok) return null;
+    // A call that works clears a stale failure, so a replaced key stops being
+    // reported as broken without needing a restart.
+    lastAuthFailure = null;
     return await res.json();
   } catch {
     return null;

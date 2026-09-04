@@ -15,7 +15,7 @@ export function mainMenu(isAdmin = false) {
     [Markup.button.callback("🎯 Auto Mint", "menu:auto"), Markup.button.callback("👀 Copy Mint", "menu:copy")],
     [Markup.button.callback("💸 Fund Wallets", "menu:fund"), Markup.button.callback("⏰ Scheduled Mint", "menu:sched")],
     [Markup.button.callback("🖼 Portfolio", "menu:portfolio"), Markup.button.callback("🔔 Activity Alerts", "menu:activity")],
-    [Markup.button.callback("⚡ Quick Mint", "menu:quick")],
+    [Markup.button.callback("⚡ Quick Mint", "menu:quick"), Markup.button.callback("📦 Consolidate", "menu:consolidate")],
     [Markup.button.callback("📊 Status", "menu:status")],
   ];
   if (isAdmin) {
@@ -401,6 +401,23 @@ export function autoChainsMenu(selected: Set<string>) {
 }
 
 // Pick the ONE wallet to send from.
+// Consolidation picks a destination and sweeps every OTHER wallet into it, so
+// unlike the funding flow there is nothing to exclude here — whichever wallet
+// is tapped becomes the one thing the collection ends up in.
+export function consolidateDestMenu(wallets: WalletRecord[]) {
+  const rows = wallets.map((w) => [
+    Markup.button.callback(`${w.label} (${maskAddress(w.address)})`, `consol:dest:${w.address}`),
+  ]);
+  rows.push([Markup.button.callback("❌ Cancel", "consol:cancel")]);
+  return Markup.inlineKeyboard(rows);
+}
+
+export function consolidateConfirmMenu() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback("✅ Move them", "consol:confirm"), Markup.button.callback("❌ Cancel", "consol:cancel")],
+  ]);
+}
+
 export function fundSourceMenu(wallets: WalletRecord[]) {
   const rows = wallets.map((w) => [
     Markup.button.callback(`${w.label} (${maskAddress(w.address)})`, `fund:source:${w.address}`),
