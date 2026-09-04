@@ -18,6 +18,7 @@
 import { Wallet, formatEther } from "ethers";
 import { buildLocalMintPlan } from "./seadrop-public";
 import { raceReadOrNull } from "./fast-read";
+import { RepeatFilter } from "./copy-mint-message";
 import { DEFAULT_CHUNK_BLOCKS, MintSighting, scanSeaDropMints } from "./seadrop-events";
 import { localPublicSnipe, SnipeOutcome } from "./local-mint";
 import { backoffMs, createProvider, describeRpcError } from "./rpc-provider";
@@ -110,7 +111,9 @@ export interface CopyMintOpts {
   // Every attempt, including the ones that never fired. "Why didn't it copy
   // that one" is only answerable if skips are recorded too.
   onAttempt?: (attempt: CopyAttemptReport) => void | Promise<void>;
-  alreadyMinted?: (nftContract: string) => boolean; // see auto-mint.ts — avoids re-minting across restarts
+  alreadyMinted?: (nftContract: string) => boolean;
+  /** Resolves a contract to a readable name, so logs aren't a wall of hex. */
+  describeCollection?: (nftContract: string) => Promise<string | null>; // see auto-mint.ts — avoids re-minting across restarts
   logger?: Logger;
   stopSignal?: { stopped: boolean };
 }
@@ -139,6 +142,12 @@ export async function runCopyMintWatcher(opts: CopyMintOpts): Promise<void> {
   // repeat one line every tick. Cleared on recovery.
   let scanErrorReported: string | null = null;
   const maxCatchup = catchupBlocksFor(chain.key);
+
+  // Nineteen watched wallets produce the same failure many times an hour —
+  // underfunded wallets, most often. The first report is information; the
+  // fourth is noise burying anything new. Repeats are counted and resurfaced
+  // periodically rather than printed every time.
+  const repeats = new RepeatFilter();
 
   const signal = opts.stopSignal ?? { stopped: false };
   process.once("SIGINT", () => {
@@ -319,8 +328,12 @@ export async function runCopyMintWatcher(opts: CopyMintOpts): Promise<void> {
           continue;
         }
 
+        const name =
+          (await opts.describeCollection?.(sighting.nftContract).catch(() => null)) ??
+          sighting.nftContract;
         log.warnBold(
-          `\n  👀 ${sighting.from} minted ${sighting.nftContract} (block ${sighting.blockNumber}) — copying`
+          `
+  👀 ${name} — minted by ${sighting.from.slice(0, 8)}… (block ${sighting.blockNumber}), copying`
         );
 
         // Raced across every endpoint rather than pinned to rpcUrls[0]. That
@@ -334,7 +347,10 @@ export async function runCopyMintWatcher(opts: CopyMintOpts): Promise<void> {
         );
         if (!drop) {
           const reason = "no public drop resolvable for this contract";
-          log.error(`     ✗ Skipped — ${reason}.`);
+          const seen = repeats.consider(reason);
+          if (seen.send) {
+            log.error(`     ✗ Skipped — ${reason}.${seen.count > 1 ? ` (${seen.count}× recently)` : ""}`);
+          }
           await report({ sourceWallet: sighting.from, sourceTxHash: sighting.txHash, nftContract: sighting.nftContract, quantity: 0, outcome: "skipped", reason, txHashes: [] });
           continue;
         }

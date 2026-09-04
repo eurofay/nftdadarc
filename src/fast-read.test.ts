@@ -105,3 +105,29 @@ describe("readableRpcs", () => {
     ]);
   });
 });
+
+describe("raceRead never touches a send-only endpoint", () => {
+  it("skips the sequencer even when the caller passes it", async () => {
+    // The regression this exists for: a read sent to the sequencer leaves a
+    // provider retrying network detection every second, forever.
+    const tried: string[] = [];
+    const got = await raceRead(
+      ["https://sequencer.mainnet.chain.robinhood.com", "https://rpc.example"],
+      async (url) => {
+        tried.push(url);
+        return url;
+      }
+    );
+    expect(tried).toEqual(["https://rpc.example"]);
+    expect(got).toBe("https://rpc.example");
+  });
+
+  it("still uses it when it is the only endpoint, rather than failing", async () => {
+    const tried: string[] = [];
+    await raceRead(["https://sequencer.x"], async (url) => {
+      tried.push(url);
+      return url;
+    });
+    expect(tried).toEqual(["https://sequencer.x"]);
+  });
+});

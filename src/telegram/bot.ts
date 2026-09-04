@@ -1491,6 +1491,13 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
       maxPriceEth: settings.copyMintMaxPriceEth,
       quantityPerWallet: settings.copyMintMaxQuantity,
       logChunkBlocks: logChunkBlocksFor(settings.chainKey),
+      describeCollection: async (nftContract) => {
+        // Best-effort: a missing name costs a readable log line, never a mint.
+        const known = store.listMints().find((m) => m.nftContract.toLowerCase() === nftContract.toLowerCase());
+        if (known?.slug) return known.slug;
+        const info = await openseaContractInfo(settings.chainKey, nftContract, process.env.OPENSEA_API_KEY);
+        return info?.name ?? null;
+      },
       backfillBlocks: blocksForSeconds(settings.chainKey, settings.copyBackfillHours * 3600),
       onMinted: (o) => recordOutcome(store, settings.chainKey, o, { bot, chatId, source: "Copy Mint" }),
       onAttempt: (a) => {
