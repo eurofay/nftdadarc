@@ -1,10 +1,12 @@
-import { describe, it, expect, vi, afterEach } from "vitest";
+import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 import {
   fetchCollection,
   fetchStats,
   fetchActivity,
   fetchBestCollectionOffer,
   openseaCollectionUrl,
+  openSeaAuthFailure,
+  clearOpenSeaAuthFailure,
 } from "./opensea-market";
 
 function mockFetch(status: number, body: any) {
@@ -140,5 +142,53 @@ describe("fetchBestCollectionOffer", () => {
   it("returns null when there are no offers", async () => {
     mockFetch(200, { offers: [] });
     expect(await fetchBestCollectionOffer("x", "k")).toBeNull();
+  });
+});
+
+describe("openSeaAuthFailure", () => {
+  beforeEach(() => clearOpenSeaAuthFailure());
+
+  it("records nothing while calls succeed", async () => {
+    mockFetch(200, { total: { volume: 0 } });
+    await fetchStats("glitchy404", "key");
+    expect(openSeaAuthFailure()).toBe(null);
+  });
+
+  it("records a refusal, so an unavailable endpoint is not read as no data", async () => {
+    mockFetch(401, { errors: ["Invalid API key"] });
+    await fetchBestCollectionOffer("glitchy404", "key");
+    expect(openSeaAuthFailure()?.detail).toContain("refused this endpoint");
+  });
+
+  it("names the endpoint family that was refused", async () => {
+    mockFetch(401, {});
+    await fetchBestCollectionOffer("glitchy404", "key");
+    expect(openSeaAuthFailure()?.areas).toEqual(["offers"]);
+  });
+
+  it("does not let a public endpoint succeeding erase a real refusal", async () => {
+    // Most of this API answers without a key. A global flag meant the next
+    // floor-price read wiped the 401 seconds after it happened.
+    mockFetch(401, {});
+    await fetchBestCollectionOffer("glitchy404", "key");
+    vi.restoreAllMocks();
+    mockFetch(200, { total: { volume: 0 } });
+    await fetchStats("glitchy404", "key");
+    expect(openSeaAuthFailure()?.areas).toEqual(["offers"]);
+  });
+
+  it("clears once the same endpoint works again, so a fix needs no restart", async () => {
+    mockFetch(401, {});
+    await fetchBestCollectionOffer("glitchy404", "bad");
+    vi.restoreAllMocks();
+    mockFetch(200, []);
+    await fetchBestCollectionOffer("glitchy404", "good");
+    expect(openSeaAuthFailure()).toBe(null);
+  });
+
+  it("says so plainly when no key is configured at all", async () => {
+    mockFetch(401, {});
+    await fetchBestCollectionOffer("glitchy404");
+    expect(openSeaAuthFailure()?.detail).toContain("no OPENSEA_API_KEY is set");
   });
 });

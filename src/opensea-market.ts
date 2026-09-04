@@ -45,19 +45,44 @@ export interface CollectionOffer {
   orderHash: string;
 }
 
-// A rejected key and a collection with no data both used to return null, so
-// an expired key looked exactly like "nothing to report" — no floor, no
-// offers, no alerts, and nothing anywhere saying why. The last auth failure is
-// remembered so callers can tell the difference and say so.
-let lastAuthFailure: { at: number; detail: string } | null = null;
+// A refusal and a collection with no data both used to return null, so an
+// endpoint that never answers looked exactly like "nothing to report" — no
+// offers, no alerts, and nothing anywhere saying why.
+//
+// Tracked per endpoint family, and worded carefully, because a 401 from this
+// API means less than it appears to. Measured live with one valid key:
+//
+//   offers/collection/boredapeyachtclub   200
+//   offers/collection/<robinhood collection>  401
+//   events/collection/boredapeyachtclub   401
+//   collections/<slug>/stats              200, and 200 with no key at all
+//
+// Same key throughout. So a 401 means "this key cannot have this endpoint for
+// this collection" — an unindexed chain, or an endpoint outside the key's
+// plan — and almost never "this key is invalid". Reporting it as a bad key
+// sends someone off to regenerate a working credential.
+//
+// Per-family rather than global because most of this API answers without a
+// key: a single flag meant the next successful floor-price read wiped the
+// record of a real refusal seconds after it happened, so the warning almost
+// never survived long enough to be seen.
+const authFailures = new Map<string, { at: number; detail: string }>();
 
-/** The most recent time OpenSea rejected our key, if it has. */
-export function openSeaAuthFailure(): { at: number; detail: string } | null {
-  return lastAuthFailure;
+/** Endpoint family — "offers/collection/x" and "offers/collection/y" share one. */
+function family(path: string): string {
+  return path.split("/")[0];
+}
+
+/** The endpoint families OpenSea refused, if any. */
+export function openSeaAuthFailure(): { at: number; detail: string; areas: string[] } | null {
+  if (authFailures.size === 0) return null;
+  const areas = [...authFailures.keys()].sort();
+  const latest = [...authFailures.values()].sort((a, b) => b.at - a.at)[0];
+  return { ...latest, areas };
 }
 
 export function clearOpenSeaAuthFailure(): void {
-  lastAuthFailure = null;
+  authFailures.clear();
 }
 
 async function get(path: string, apiKey?: string): Promise<any | null> {
@@ -66,16 +91,19 @@ async function get(path: string, apiKey?: string): Promise<any | null> {
   try {
     const res = await fetch(`${BASE}/${path}`, { headers });
     if (res.status === 401 || res.status === 403) {
-      lastAuthFailure = {
+      authFailures.set(family(path), {
         at: Date.now(),
-        detail: apiKey ? `OpenSea rejected the API key (HTTP ${res.status})` : "No OPENSEA_API_KEY is set",
-      };
+        detail: apiKey
+          ? `OpenSea refused this endpoint (HTTP ${res.status}) — the key works elsewhere, so it is the endpoint or the chain, not the key`
+          : `OpenSea refused this endpoint (HTTP ${res.status}) and no OPENSEA_API_KEY is set`,
+      });
       return null;
     }
     if (!res.ok) return null;
-    // A call that works clears a stale failure, so a replaced key stops being
+    // Only this family is cleared, so a working public endpoint never covers
+    // up a refused authenticated one, and a fixed endpoint stops being
     // reported as broken without needing a restart.
-    lastAuthFailure = null;
+    authFailures.delete(family(path));
     return await res.json();
   } catch {
     return null;

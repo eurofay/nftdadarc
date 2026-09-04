@@ -62,7 +62,7 @@ import {
 import { resolveChain, logChunkBlocksFor, blocksForSeconds } from "../chains";
 import { resolveRpcsForChain } from "../rpc-resolver";
 import { parseNftLink } from "../nft-link";
-import { resolveSlug, openseaContractInfo } from "../slug-resolver";
+import { resolveSlug, openseaContractInfo, lookupContract, isLookupFailure } from "../slug-resolver";
 import {
   fetchCollection,
   fetchStats,
@@ -1449,11 +1449,22 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
     // A rejected API key looks identical to "no data" everywhere else, so say
     // it plainly in the one place someone checks when things seem dead.
     const authFailure = openSeaAuthFailure();
+    // Names what is actually refused, and does not blame the key. Measured
+    // with one valid key: offers works on an Ethereum collection and 401s on
+    // a Robinhood one, events 401s everywhere, stats answers with no key at
+    // all. So a 401 is about the endpoint and the chain, not the credential —
+    // saying "replace your key" sends someone to fix something that works.
+    const AREA_NAMES: Record<string, string> = {
+      offers: "collection offers",
+      events: "activity alerts and sale feeds",
+      listings: "listings",
+      orders: "listings and offers",
+    };
     const openSeaNote = authFailure
-      ? `\n\n⚠️ ${authFailure.detail}.\n` +
-        "Floor prices, offers, activity alerts and portfolio art all come from " +
-        "OpenSea, so they stay blank until the key is replaced. Minting is " +
-        "unaffected — it reads only the chain."
+      ? `\n\n⚠️ ${authFailure.areas.map((a) => AREA_NAMES[a] ?? a).join(", ")} unavailable.\n` +
+        `${authFailure.detail}.\n` +
+        "Floor prices, collection art and contract lookups still work — those need no key. " +
+        "Minting is unaffected either way; it reads only the chain."
       : "";
 
     await ctx.editMessageText(
@@ -3553,15 +3564,19 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
         return say(`Couldn't read that as a collection: ${err?.message ?? err}`);
       }
 
-      const info = await openseaContractInfo(settings.chainKey, contract, process.env.OPENSEA_API_KEY).catch(
-        () => null
-      );
-      if (!info?.slug) {
+      // The eligibility query is keyed by slug, so a contract address has to
+      // be turned into one first. A collection link carries the slug in its
+      // URL and skips this entirely, which is the reliable route when
+      // OpenSea is throttling the lookup — so say that rather than implying
+      // the collection does not exist.
+      const lookup = await lookupContract(settings.chainKey, contract, process.env.OPENSEA_API_KEY);
+      if (isLookupFailure(lookup)) {
         return say(
-          "OpenSea doesn't have a collection slug for that contract, and the eligibility " +
-            "query is keyed by slug. Send the OpenSea collection link instead."
+          `Couldn't turn that contract into an OpenSea collection.\n\n${lookup.detail}.\n\n` +
+            "Send the OpenSea collection link instead — the slug is in the URL, so it needs no lookup."
         );
       }
+      const info = lookup;
 
       const wallets = ctx.store.listWallets();
       if (wallets.length === 0) return say("Add a wallet first.");
