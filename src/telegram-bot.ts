@@ -42,9 +42,10 @@ async function main(): Promise<void> {
   // Global for the whole bot, not per user: one password, one revoke.
   const access = new AccessControl(path.join(dataDir, "access.json"));
 
-  // Optional: a second bot that carries only the activity alerts, so the
-  // feed does not bury the menus in the main thread. Absent by default.
-  const alerts = startAlertsBot(process.env.TELEGRAM_ALERTS_BOT_TOKEN, ownerId);
+  // Optional: a second bot carrying the activity alerts and the wallet
+  // filter, so neither buries the menus in the main thread. Absent by
+  // default, in which case both stay on the main bot.
+  const alerts = startAlertsBot(process.env.TELEGRAM_ALERTS_BOT_TOKEN, ownerId, stores);
 
   const bot = createBot({ token, ownerId, stores, access, alerts });
 

@@ -511,14 +511,3 @@ export function schedConfirmMenu() {
     [Markup.button.callback("✅ Confirm", "sched:confirm"), Markup.button.callback("❌ Cancel", "sched:cancel")],
   ]);
 }
-
-export function filterConfirmMenu() {
-  return Markup.inlineKeyboard([
-    [Markup.button.callback("✅ Start", "filter:run"), Markup.button.callback("❌ Cancel", "filter:cancel")],
-  ]);
-}
-
-// A long run needs a way out that keeps what it has already found.
-export function filterRunningMenu() {
-  return Markup.inlineKeyboard([[Markup.button.callback("⏹ Stop and keep results", "filter:cancel")]]);
-}
