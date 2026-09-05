@@ -5,7 +5,7 @@
 // Access is restricted to one Telegram user id (TELEGRAM_OWNER_ID) in private
 // chat only; every other update is silently ignored.
 
-import { Telegraf, Markup, Context } from "telegraf";
+import { Telegraf, Markup, Context, Telegram } from "telegraf";
 import { message } from "telegraf/filters";
 import { isAddress, formatEther, parseEther, Wallet } from "ethers";
 import { generateMnemonic, deriveWallets, isValidMnemonic } from "../hd-wallet";
@@ -40,6 +40,8 @@ import {
   fundTargetsMenu,
   fundConfirmMenu,
   consolidateSourcesMenu,
+  filterConfirmMenu,
+  filterRunningMenu,
   consolidateDestMenu,
   consolidateConfirmMenu,
   schedWalletsMenu,
@@ -107,6 +109,19 @@ import {
 import { findAllowListUri, fetchAllowList, parseAllowList, deriveProof } from "../allowlist-fetch";
 import { renderMintCardPng, renderPnlCardPng } from "../mint-card-render";
 import { computePnl, renderPnl, PnlReport } from "../pnl";
+import Anthropic from "@anthropic-ai/sdk";
+import { AGENT_MODEL } from "./agent";
+import { parseWalletList, describeParse, toCsv } from "../wallet-csv";
+import {
+  Criteria,
+  parseCriteria,
+  parseCriteriaJson,
+  describeCriteria,
+  applyCriteria,
+  fieldsNeeded,
+  CRITERIA_SCHEMA,
+} from "../wallet-criteria";
+import { enrichWallets, measureRate, describeEta } from "../wallet-enrich";
 import { acceptOfferViaSdk, acceptOfferWithFallback, createListing, parseListingPrice } from "../opensea-sell";
 import { createLogger, withPrefix, LogSink } from "../logger";
 import { istTimeToDate, toIST } from "../time-format";
@@ -128,6 +143,8 @@ interface SessionData {
     | "awaiting_fund_amount"
     | "awaiting_consolidate_contract"
     | "awaiting_pnl_contract"
+    | "awaiting_filter_file"
+    | "awaiting_filter_criteria"
     | "awaiting_sched_link"
     | "awaiting_sched_quantity"
     | "awaiting_sched_custom_time"
@@ -136,6 +153,11 @@ interface SessionData {
   fundSource?: string;
   fundTargets?: string[]; // lowercased addresses
   fundAmountWei?: string; // bigint as string — kept out of the type so session stays plain-JSON-shaped
+  filter?: {
+    addresses: string[];
+    criteria?: Criteria;
+    jobId?: string;
+  };
   consolidate?: {
     contract: string;
     /** The scan, held across source picking, destination picking and confirm. */
@@ -354,7 +376,10 @@ async function sendCard(
 const BATCH_QUIET_MS = 1200; // a mint's lines land well inside this
 const BATCH_MAX_LINES = 60; // flush early rather than let a long run grow unbounded
 
-function createTelegramSink(bot: Telegraf<BotContext>, chatId: number): LogSink {
+// Takes any object carrying a Telegram client rather than the Telegraf
+// instance itself, so the optional alerts bot can drive the same sink without
+// a second copy of the batching logic.
+function createTelegramSink(bot: { telegram: Telegram }, chatId: number): LogSink {
   let buffer: string[] = [];
   let timer: NodeJS.Timeout | null = null;
   let queue: Promise<void> = Promise.resolve();
@@ -478,9 +503,16 @@ export interface BotDeps {
   ownerId: number;
   stores: UserStores;
   access: AccessControl;
+  /**
+   * Optional second bot that activity alerts are sent through instead.
+   *
+   * Same store, same watcher, different chat -- a feed of sale and floor
+   * alerts in the same thread as the menus buries the menus.
+   */
+  alerts?: { telegram: Telegram } | null;
 }
 
-export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf<BotContext> {
+export function createBot({ token, ownerId, stores, access, alerts }: BotDeps): Telegraf<BotContext> {
   const bot = new Telegraf<BotContext>(token);
 
   // Without this, a throw inside any handler propagates out through
@@ -647,6 +679,156 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
     ctx.session.fundSource = undefined;
     ctx.session.fundTargets = undefined;
     return ctx.editMessageText("Send FROM which wallet?", fundSourceMenu(wallets));
+  });
+
+  // Running filter jobs, so a long run can be called off from the chat.
+  const stoppedFilters = new Set<string>();
+  const stopFilterJob = (id: string) => stoppedFilters.add(id);
+  const isFilterStopped = (id: string) => stoppedFilters.has(id);
+  const clearFilterJob = (id: string) => stoppedFilters.delete(id);
+
+  /**
+   * Read the criteria, by pattern first and the assistant only if that fails.
+   *
+   * The parser is deterministic, free, and works with no API key. The model
+   * is better at unusual phrasing but costs a call and can be unavailable, so
+   * it is the fallback rather than the default -- and its answer is validated
+   * as JSON against a fixed schema, never executed as an instruction.
+   */
+  async function readCriteria(text: string): Promise<{ criteria: Criteria | null; via: string }> {
+    const direct = parseCriteria(text);
+    if (direct) return { criteria: direct, via: "parsed" };
+
+    const apiKey = process.env.ANTHROPIC_API_KEY;
+    if (!apiKey) return { criteria: null, via: "no-model" };
+
+    try {
+      const client = new Anthropic({ apiKey });
+      const response = await client.messages.create({
+        model: AGENT_MODEL,
+        max_tokens: 512,
+        system:
+          "Convert the user's wallet-filter request into JSON matching this schema, and reply with the JSON only:\n" +
+          CRITERIA_SCHEMA +
+          "\n\nFields: balance is native currency in ETH units; txCount is the number of transactions " +
+          "sent (the nonce); nftCount is NFTs held. If the request cannot be expressed in this schema, " +
+          'reply exactly {"conditions":[]}.',
+        messages: [{ role: "user", content: text }],
+      });
+      const raw = response.content
+        .map((b: any) => (b.type === "text" ? b.text : ""))
+        .join("")
+        .trim();
+      return { criteria: parseCriteriaJson(raw), via: "model" };
+    } catch {
+      return { criteria: null, via: "model-failed" };
+    }
+  }
+
+  // ── Wallet filter ────────────────────────────────────────────────────
+  // Upload a list, say what you want in plain English, get the matching
+  // wallets back as a CSV.
+  //
+  // The list arrives as a file rather than pasted text because a Telegram
+  // message caps at 4096 characters -- about ninety addresses. A file can be
+  // 20 MB, which is roughly 450,000 wallets, so the chat is never the limit.
+  // The RPC is: see wallet-enrich.ts for the measured numbers.
+  bot.action("menu:filter", (ctx) => {
+    ctx.session.filter = undefined;
+    ctx.session.step = undefined;
+    return ctx.editMessageText(
+      "🧮 *Wallet filter*\n\n" +
+        "Upload a CSV or TXT file of wallet addresses — attach it, don't paste it.\n\n" +
+        "Any layout works: header or not, address in any column, comma or tab separated. " +
+        "I'll tell you how many I found, then ask what you want to filter on.",
+      { parse_mode: "Markdown" }
+    );
+  });
+
+  bot.action("filter:cancel", (ctx) => {
+    const running = ctx.session.filter?.jobId;
+    if (running) stopFilterJob(running);
+    ctx.session.filter = undefined;
+    ctx.session.step = undefined;
+    return ctx.editMessageText("Filter cancelled.", mainMenu(ctx.from?.id === ownerId));
+  });
+
+  bot.action("filter:run", async (ctx) => {
+    const pending = ctx.session.filter;
+    if (!pending?.addresses?.length || !pending.criteria) {
+      return ctx.answerCbQuery("That request expired — upload the file again.", { show_alert: true });
+    }
+    await ctx.answerCbQuery("Started.");
+    const addresses = pending.addresses;
+    const criteria = pending.criteria;
+    const jobId = `${ctx.from!.id}:${Date.now()}`;
+    ctx.session.filter = { ...pending, jobId };
+
+    const note = await ctx.reply(`Reading ${addresses.length.toLocaleString()} wallet(s) from the chain…`);
+    const settings = ctx.store.getSettings();
+    const { urls } = resolveRpcsForChain(settings.chainKey);
+    const chain = resolveChain(settings.chainKey)!;
+
+    // Detached, like every other long job here: this can run for an hour and
+    // Telegraf kills a handler at ninety seconds.
+    void (async () => {
+      const say = (text: string, extra?: any) =>
+        ctx.telegram.editMessageText(note.chat.id, note.message_id, undefined, text, extra).catch(() => {});
+      let lastEdit = 0;
+      try {
+        const result = await enrichWallets({
+          rpcUrl: readableRpcs(urls)[0],
+          addresses,
+          fields: fieldsNeeded(criteria),
+          shouldStop: () => isFilterStopped(jobId),
+          onProgress: (p) => {
+            const now = Date.now();
+            if (now - lastEdit < PROGRESS_EDIT_MS) return;
+            lastEdit = now;
+            const pct = Math.round((p.done / p.total) * 100);
+            void say(
+              `🧮 Filtering ${addresses.length.toLocaleString()} wallet(s)\n\n` +
+                `${pct}% — ${p.done.toLocaleString()} of ${p.total.toLocaleString()} reads\n` +
+                `${p.rate.toFixed(0)}/sec, ${describeEta(p.etaSeconds)} left`,
+              filterRunningMenu()
+            );
+          },
+        });
+
+        clearFilterJob(jobId);
+        const matched = applyCriteria(result.stats, criteria);
+        const csv = toCsv(
+          matched.map((s) => ({
+            address: s.address,
+            ...(s.balance !== undefined ? { balance: s.balance } : {}),
+            ...(s.txCount !== undefined ? { transactions: s.txCount } : {}),
+          }))
+        );
+
+        const summary =
+          `🧮 *Filter complete*${result.stopped ? " (stopped early)" : ""}\n\n` +
+          `Filter: ${describeCriteria(criteria)}\n` +
+          `Matched: *${matched.length.toLocaleString()}* of ${addresses.length.toLocaleString()} ` +
+          `(${((matched.length / addresses.length) * 100).toFixed(1)}%)\n` +
+          `Took ${Math.round(result.elapsedMs / 1000)}s on ${chain.name}` +
+          (result.unreadable.length > 0
+            ? `\n\n⚠️ ${result.unreadable.length.toLocaleString()} wallet(s) couldn't be read and are excluded — ` +
+              "an unknown value is not a match."
+            : "");
+
+        await say(summary, { parse_mode: "Markdown" });
+        if (matched.length > 0) {
+          await ctx.replyWithDocument({
+            source: Buffer.from(csv, "utf8"),
+            filename: `filtered-${matched.length}-wallets.csv`,
+          });
+        }
+      } catch (err: any) {
+        clearFilterJob(jobId);
+        console.error(`Wallet filter failed: ${err?.message ?? err}`);
+        await say(`Filter failed: ${err?.shortMessage ?? err?.message ?? err}`);
+      }
+    })();
   });
 
   // ── P&L ──────────────────────────────────────────────────────────────
@@ -1380,7 +1562,10 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
 
     const settings = store.getSettings();
     const stopSignal = { stopped: false };
-    const logger = withPrefix("activity", createLogger(createTelegramSink(bot, chatId)));
+    // Alerts go to the second bot when one is configured, and to this one
+    // otherwise. The chat id is the same either way: a Telegram private chat
+    // is identified by the user, not by the bot.
+    const logger = withPrefix("activity", createLogger(createTelegramSink(alerts ?? bot, chatId)));
     const promise = runActivityWatcher({
       collections,
       apiKey: process.env.OPENSEA_API_KEY,
@@ -3472,6 +3657,53 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
   }
 
   bot.on(message("document"), async (ctx) => {
+    // A wallet list, for the filter. Checked before the restore branch so an
+    // upload during a filter flow is never mistaken for a backup.
+    if (ctx.session.step === "awaiting_filter_file") {
+      ctx.session.step = undefined;
+      const doc = ctx.message.document;
+
+      // Telegram's own ceiling for a bot download is 20 MB, which at ~43
+      // bytes per line is roughly 450,000 addresses -- far past anything
+      // anyone will filter. Refusing here beats a confusing failure inside
+      // getFileLink.
+      if ((doc.file_size ?? 0) > 20 * 1024 * 1024) {
+        return ctx.reply(
+          "That file is over Telegram's 20 MB limit for bot downloads. Split it and send the parts separately."
+        );
+      }
+
+      let text: string;
+      try {
+        const link = await ctx.telegram.getFileLink(doc.file_id);
+        const res = await fetch(link.toString());
+        text = await res.text();
+      } catch (err: any) {
+        return ctx.reply(`❌ Couldn't download that file: ${err?.message ?? err}`);
+      }
+
+      const parsed = parseWalletList(text);
+      if (parsed.addresses.length === 0) {
+        return ctx.reply(
+          "I couldn't find any wallet addresses in that file.\n\n" +
+            "It should have 0x… addresses in it somewhere — any column, any separator."
+        );
+      }
+
+      ctx.session.filter = { addresses: parsed.addresses };
+      ctx.session.step = "awaiting_filter_criteria";
+      return ctx.reply(
+        `📄 *${describeParse(parsed)}*\n\n` +
+          `Now tell me what to filter on, in your own words. For example:\n` +
+          "• wallets with more than 5 transactions\n" +
+          "• at least 0.01 eth\n" +
+          "• over 10 transactions and at least 0.05 eth\n\n" +
+          "I can filter on balance, transaction count, and NFTs held.",
+        { parse_mode: "Markdown" }
+      );
+    }
+
+
     if (ctx.session.step !== "awaiting_restore_file") return;
     if (!requireOwner(ctx)) return;
     ctx.session.step = undefined;
@@ -4012,6 +4244,60 @@ export function createBot({ token, ownerId, stores, access }: BotDeps): Telegraf
           "Listing costs no gas and moves nothing now — it publishes a signed offer to sell. " +
           "You'll be asked to approve the transfer contract if it isn't approved yet.",
         sellActionConfirmMenu("list", address, slug, makeTokenizer(ctx.session))
+      );
+    }
+
+    if (step === "awaiting_filter_criteria") {
+      ctx.session.step = undefined;
+      const pending = ctx.session.filter;
+      if (!pending?.addresses?.length) {
+        return ctx.reply("That list expired — upload the file again from Wallet filter.");
+      }
+
+      const thinking = await ctx.reply("Reading that…");
+      const say = (text: string, extra?: any) =>
+        ctx.telegram.editMessageText(thinking.chat.id, thinking.message_id, undefined, text, extra).catch(() => {});
+
+      const { criteria, via } = await readCriteria(ctx.message.text.trim());
+      if (!criteria) {
+        ctx.session.step = "awaiting_filter_criteria";
+        return say(
+          "I couldn't turn that into a filter." +
+            (via === "no-model" ? "" : " I tried the assistant too.") +
+            "\n\nI can filter on *balance*, *transactions* and *NFTs held*. Try something like:\n" +
+            "• more than 5 transactions\n" +
+            "• at least 0.01 eth\n" +
+            "• over 10 transactions and at least 0.05 eth",
+          { parse_mode: "Markdown" }
+        );
+      }
+
+      ctx.session.filter = { ...pending, criteria };
+
+      // Time a small sample and quote a real number. Throughput on these
+      // endpoints varies by an order of magnitude with load, and committing
+      // someone to an hour having implied twenty minutes is worse than making
+      // them wait a few seconds for the truth.
+      const settings = ctx.store.getSettings();
+      const { urls } = resolveRpcsForChain(settings.chainKey);
+      const fields = fieldsNeeded(criteria);
+      const reads = pending.addresses.length * fields.length;
+      const sample = await measureRate(readableRpcs(urls)[0], pending.addresses.slice(0, 20));
+      const eta = sample.ratePerSecond > 0 ? describeEta(reads / sample.ratePerSecond) : "unknown";
+
+      return say(
+        `🧮 *Ready to filter*\n\n` +
+          `Wallets: *${pending.addresses.length.toLocaleString()}*\n` +
+          `Filter: ${describeCriteria(criteria)}\n` +
+          `${via === "model" ? "_Read by the assistant — check it says what you meant._\n" : ""}` +
+          `\nThat needs *${reads.toLocaleString()}* chain reads at about ` +
+          `${sample.ratePerSecond.toFixed(0)}/sec, so roughly *${eta}*.\n` +
+          (reads > 20_000
+            ? "\nA run this long is worth doing on a private RPC — the public one is the slow part, " +
+              "not the bot. You can stop it at any point and keep what it found.\n"
+            : "") +
+          "\nStart?",
+        { parse_mode: "Markdown", ...filterConfirmMenu() }
       );
     }
 

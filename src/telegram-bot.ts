@@ -6,6 +6,7 @@ import dotenv from "dotenv";
 dotenv.config({ path: path.resolve(process.cwd(), ".env") });
 
 import { createBot } from "./telegram/bot";
+import { startAlertsBot } from "./telegram/alerts-bot";
 import { UserStores } from "./telegram/user-stores";
 import { AccessControl } from "./telegram/access-control";
 
@@ -41,10 +42,20 @@ async function main(): Promise<void> {
   // Global for the whole bot, not per user: one password, one revoke.
   const access = new AccessControl(path.join(dataDir, "access.json"));
 
-  const bot = createBot({ token, ownerId, stores, access });
+  // Optional: a second bot that carries only the activity alerts, so the
+  // feed does not bury the menus in the main thread. Absent by default.
+  const alerts = startAlertsBot(process.env.TELEGRAM_ALERTS_BOT_TOKEN, ownerId);
 
-  process.once("SIGINT", () => bot.stop("SIGINT"));
-  process.once("SIGTERM", () => bot.stop("SIGTERM"));
+  const bot = createBot({ token, ownerId, stores, access, alerts });
+
+  process.once("SIGINT", () => {
+    bot.stop("SIGINT");
+    alerts?.stop("SIGINT");
+  });
+  process.once("SIGTERM", () => {
+    bot.stop("SIGTERM");
+    alerts?.stop("SIGTERM");
+  });
 
   // launch()'s own promise only resolves after stop() is called — it never
   // resolves while long-polling is active — so "started successfully" has
