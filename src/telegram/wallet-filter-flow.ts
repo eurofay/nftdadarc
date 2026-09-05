@@ -67,14 +67,25 @@ export const FILTER_INTRO =
   "Any layout works: header or not, address in any column, comma or tab separated. " +
   "I'll tell you how many I found, then ask what you want to filter on.";
 
+export interface WalletFilterHandle {
+  /**
+   * Put a chat into the filter flow without it pressing the menu button.
+   *
+   * The host uses this for a deep link: arriving from the main bot with
+   * ?start=filter should land on "upload your file", not on a generic
+   * welcome that makes you go looking for the feature you just clicked.
+   */
+  beginFor(chatId: number): void;
+}
+
 /**
  * Mount the whole flow on a bot.
  *
- * Returns nothing: everything it needs is registered as middleware, and the
- * only entry point is the "menu:filter" action, which the host bot surfaces
+ * Everything it needs is registered as middleware; the entry points are the
+ * "menu:filter" action and the returned handle, which the host surfaces
  * however it likes.
  */
-export function registerWalletFilter(bot: Telegraf<any>, deps: WalletFilterDeps): void {
+export function registerWalletFilter(bot: Telegraf<any>, deps: WalletFilterDeps): WalletFilterHandle {
   const { ownerId, stores } = deps;
   const states = new Map<number, FilterState>();
   const stopped = new Set<string>();
@@ -283,6 +294,12 @@ export function registerWalletFilter(bot: Telegraf<any>, deps: WalletFilterDeps)
       }
     })();
   });
+
+  return {
+    beginFor(chatId: number) {
+      states.set(chatId, { step: "awaiting_file" });
+    },
+  };
 }
 
 /**

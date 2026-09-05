@@ -488,7 +488,7 @@ export interface BotDeps {
    * Same store, same watcher, different chat -- a feed of sale and floor
    * alerts in the same thread as the menus buries the menus.
    */
-  alerts?: { telegram: Telegram } | null;
+  alerts?: { telegram: Telegram; username?: string } | null;
 }
 
 export function createBot({ token, ownerId, stores, access, alerts }: BotDeps): Telegraf<BotContext> {
@@ -666,13 +666,25 @@ export function createBot({ token, ownerId, stores, access, alerts }: BotDeps): 
   // a feature that disappears unless you set an optional environment variable
   // is worse than one in a slightly noisy thread.
   if (alerts) {
-    bot.action("menu:filter", (ctx) =>
-      ctx.editMessageText(
-        "🧮 *Wallet filter*\n\nIt lives on your alerts bot now — open that chat and send /filter.\n\n" +
-          "A filter run is a long stream of progress and a CSV at the end, which would bury these menus.",
-        { parse_mode: "Markdown", ...mainMenu(ctx.from?.id === ownerId) }
-      )
-    );
+    bot.action("menu:filter", (ctx) => {
+      // A tappable link, not an instruction to go and find the other chat.
+      // ?start=filter lands on "upload your file" rather than a welcome.
+      const link = alerts.username
+        ? Markup.inlineKeyboard([
+            [Markup.button.url("🧮 Open Wallet Filter", `https://t.me/${alerts.username}?start=filter`)],
+            [Markup.button.callback("⬅ Back", "menu:main")],
+          ])
+        : mainMenu(ctx.from?.id === ownerId);
+      return ctx.editMessageText(
+        "🧮 *Wallet filter*\n\n" +
+          "It lives on your alerts bot — a filter run is a long stream of progress and a CSV at " +
+          "the end, which would bury these menus.\n\n" +
+          (alerts.username
+            ? "Tap below to open it there."
+            : "Open that bot and send /filter. (I couldn't read its username to link it directly.)"),
+        { parse_mode: "Markdown", ...link }
+      );
+    });
   } else {
     registerWalletFilter(bot, { ownerId, stores });
   }

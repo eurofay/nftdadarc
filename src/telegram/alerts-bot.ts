@@ -21,6 +21,14 @@ import { registerWalletFilter, FILTER_INTRO } from "./wallet-filter-flow";
 
 export interface AlertsBot {
   telegram: Telegram;
+  /**
+   * The bot's @username, once Telegram has told us.
+   *
+   * Filled in asynchronously after launch, which is why it is mutable rather
+   * than a constructor argument: the main bot needs it to build a t.me link,
+   * and it reads it at click time, long after startup.
+   */
+  username?: string;
   stop: (reason?: string) => void;
 }
 
@@ -44,11 +52,24 @@ export function startAlertsBot(
   if (!trimmed) return null;
 
   const bot = new Telegraf(trimmed);
+  const filter = registerWalletFilter(bot, { ownerId, stores });
 
-  registerWalletFilter(bot, { ownerId, stores });
+  const handle: AlertsBot = {
+    telegram: bot.telegram,
+    stop: (reason) => bot.stop(reason),
+  };
 
   bot.start((ctx) => {
     if (ctx.from?.id !== ownerId) return ctx.reply("This bot only serves its owner.");
+
+    // Arriving from the main bot's link carries ?start=filter. Landing on a
+    // generic welcome after clicking "Wallet Filter" would make you go
+    // looking for the thing you just clicked, so jump straight in.
+    if (ctx.startPayload === "filter") {
+      filter.beginFor(ctx.chat.id);
+      return ctx.reply(FILTER_INTRO, { parse_mode: "Markdown" });
+    }
+
     return ctx.reply(
       "🔔 *Alerts & tools*\n\n" +
         "Activity alerts arrive here, so they stop burying the menus in the main bot.\n\n" +
@@ -61,6 +82,7 @@ export function startAlertsBot(
 
   bot.command("filter", (ctx) => {
     if (ctx.from?.id !== ownerId) return;
+    filter.beginFor(ctx.chat.id);
     return ctx.reply(FILTER_INTRO, { parse_mode: "Markdown" });
   });
 
@@ -70,7 +92,18 @@ export function startAlertsBot(
   });
 
   bot
-    .launch(() => console.log(`Companion bot running — alerts and wallet filter, reporting to ${ownerId}.`))
+    .launch(() => {
+      console.log(`Companion bot running — alerts and wallet filter, reporting to ${ownerId}.`);
+      // Best-effort: the link on the main bot degrades to plain text without
+      // it, which is worth far less than the main bot failing to start.
+      bot.telegram
+        .getMe()
+        .then((me) => {
+          handle.username = me.username;
+          console.log(`Companion bot is @${me.username} — the main bot will link to it.`);
+        })
+        .catch((err: any) => console.error(`Couldn't read the companion bot's username: ${err?.message ?? err}`));
+    })
     .catch((err: any) => {
       // Logged, not thrown: see above.
       console.error(`Companion bot could not start: ${err?.description || err?.message || err}`);
@@ -79,5 +112,5 @@ export function startAlertsBot(
       }
     });
 
-  return { telegram: bot.telegram, stop: (reason) => bot.stop(reason) };
+  return handle;
 }

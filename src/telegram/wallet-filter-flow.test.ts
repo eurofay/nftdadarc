@@ -84,6 +84,45 @@ describe("registerWalletFilter", () => {
     });
   });
 
+  describe("beginFor", () => {
+    // The deep link from the main bot arrives as ?start=filter and must land
+    // on "upload your file". Without this the button would open a welcome
+    // screen and you would go looking for the thing you just clicked.
+    it("arms a chat so the next upload is taken as a wallet list", async () => {
+      const { bot, handlers } = stubBot();
+      const handle = registerWalletFilter(bot, deps);
+      handle.beginFor(99);
+
+      let reachedHost = false;
+      let replied = "";
+      await handlers[0](
+        ctx({
+          message: { document: { file_id: "x", file_size: 99 * 1024 * 1024 } },
+          reply: async (t: string) => {
+            replied = t;
+          },
+        }),
+        async () => {
+          reachedHost = true;
+        }
+      );
+      expect(reachedHost).toBe(false);
+      expect(replied).toContain("20 MB");
+    });
+
+    it("arms only the chat it was given", async () => {
+      const { bot, handlers } = stubBot();
+      const handle = registerWalletFilter(bot, deps);
+      handle.beginFor(1234);
+
+      let reachedHost = false;
+      await handlers[0](ctx({ message: { document: { file_id: "x" } } }), async () => {
+        reachedHost = true;
+      });
+      expect(reachedHost).toBe(true);
+    });
+  });
+
   it("keeps conversations separate per chat", async () => {
     // Two chats filtering at once must not share a wallet list.
     const { bot, actions } = stubBot();
