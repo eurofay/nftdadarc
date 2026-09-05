@@ -16,3 +16,6 @@ keys.txt
 data/
 
 # Bundled fonts are needed at runtime for card rendering — keep them tracked.
+
+# Leftovers from atomic writes (write to .tmp, then rename).
+*.ts.tmp
