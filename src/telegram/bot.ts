@@ -129,6 +129,7 @@ interface SessionData {
     | "awaiting_fund_amount"
     | "awaiting_consolidate_contract"
     | "awaiting_pnl_contract"
+    | "awaiting_find_contract"
     | "awaiting_sched_link"
     | "awaiting_sched_quantity"
     | "awaiting_sched_custom_time"
@@ -703,6 +704,26 @@ export function createBot({ token, ownerId, stores, access, alerts }: BotDeps): 
         "Send the contract address or OpenSea link.\n\n" +
         "I'll count what every wallet holds on-chain, price it against the floor and the " +
         "best standing offer, and show what it cost against what it's worth.",
+      { parse_mode: "Markdown" }
+    );
+  });
+
+  // ── Find an NFT ──────────────────────────────────────────────────────
+  // Paste a contract, get straight to the actions for it.
+  //
+  // Everything the answer needs already exists: scanHoldings reads the chain,
+  // and the sell/list handlers below are keyed by (wallet, slug). So this is
+  // mostly a lookup that hands off, rather than a second copy of either.
+  bot.action("menu:find", (ctx) => {
+    if (ctx.store.listWallets().length === 0) {
+      return ctx.answerCbQuery("Add a wallet first.", { show_alert: true });
+    }
+    ctx.session.step = "awaiting_find_contract";
+    return ctx.editMessageText(
+      "🔎 *Find an NFT you hold*\n\n" +
+        "Paste the contract address or OpenSea link.\n\n" +
+        "I'll find which of your wallets hold it, then show the floor, any standing offer, " +
+        "and what you can do about it.",
       { parse_mode: "Markdown" }
     );
   });
@@ -4056,6 +4077,104 @@ export function createBot({ token, ownerId, stores, access, alerts }: BotDeps): 
           "You'll be asked to approve the transfer contract if it isn't approved yet.",
         sellActionConfirmMenu("list", address, slug, makeTokenizer(ctx.session))
       );
+    }
+
+    if (step === "awaiting_find_contract") {
+      ctx.session.step = undefined;
+      const settings = ctx.store.getSettings();
+      let contract: string;
+      try {
+        contract = await resolveMintTarget(ctx.message.text.trim(), settings.chainKey);
+      } catch (err: any) {
+        return ctx.reply(`Couldn't read that as a collection: ${err?.message ?? err}`);
+      }
+
+      const wallets = ctx.store.listWallets();
+      const note = await ctx.reply(`Looking through ${wallets.length} wallet(s)…`);
+
+      // Detached for the same reason as Consolidate and P&L: a collection
+      // with no enumeration is walked token by token, which outruns
+      // Telegraf's ninety-second handler timeout.
+      void (async () => {
+        const say = (text: string, extra?: any) =>
+          ctx.telegram.editMessageText(note.chat.id, note.message_id, undefined, text, extra).catch(() => {});
+        try {
+          const scan = await scanWithProgress(ctx, contract, note.chat.id, note.message_id);
+          if (!scan) return;
+
+          const found = holders(scan);
+          const total = found.reduce((sum, h) => sum + h.tokenIds.length, 0);
+          if (total === 0) {
+            const unreadable = scan.skipped.filter((sk) => sk.reason !== "holds none");
+            return say(
+              unreadable.length > 0
+                ? `None of your wallets hold this collection.\n\n${unreadable
+                    .map((sk) => `• ${maskAddress(sk.address)} — ${sk.reason}`)
+                    .join("\n")}`
+                : "None of your wallets hold this collection."
+            );
+          }
+
+          // On-chain facts first, market data second. The holdings are always
+          // right; everything below them depends on OpenSea answering, which
+          // on this chain it currently often does not.
+          const labelFor = (addr: string) =>
+            wallets.find((w) => w.address.toLowerCase() === addr.toLowerCase())?.label ?? maskAddress(addr);
+          const lookup = await lookupContract(settings.chainKey, contract, process.env.OPENSEA_API_KEY);
+          const slug = isLookupFailure(lookup) ? null : lookup.slug;
+          const key = process.env.OPENSEA_API_KEY;
+          const [info, stats, offer] = await Promise.all([
+            slug ? fetchCollection(slug, key).catch(() => null) : Promise.resolve(null),
+            slug ? fetchStats(slug, key).catch(() => null) : Promise.resolve(null),
+            slug ? fetchBestCollectionOffer(slug, key).catch(() => null) : Promise.resolve(null),
+          ]);
+
+          const name = info?.name || (isLookupFailure(lookup) ? maskAddress(contract) : lookup.name);
+          const lines = [
+            `🔎 *${name}*`,
+            "",
+            `Held: *${total}* across *${found.length}* wallet(s)`,
+            ...found.map((h) => `  ${labelFor(h.address)} — ${h.tokenIds.length}`),
+            "",
+            stats?.floorPrice != null
+              ? `Floor: *${stats.floorPrice} ${stats.floorSymbol}*`
+              : "Floor: — (nothing listed)",
+            offer ? `Best offer: *${offer.priceEth} ETH*` : "Best offer: — (no standing bid)",
+          ];
+
+          // Say why the market half is blank rather than leaving it looking
+          // like the collection simply has no activity. They are different
+          // problems and only one of them is yours to fix.
+          if (!slug) {
+            lines.push(
+              "",
+              `_OpenSea has no collection for this contract right now (${
+                isLookupFailure(lookup) ? lookup.detail : "unknown"
+              }), so there is no floor, no offers and nothing to list against._`
+            );
+          } else if (!stats && !offer) {
+            lines.push("", "_OpenSea returned no market data for this collection right now._");
+          }
+
+          // The sell and list actions are keyed by (wallet, slug) and already
+          // exist, so this hands straight off to them rather than repeating
+          // them. Only the biggest holder is offered: acting on the wallet
+          // holding one of twelve is almost never what was meant.
+          const kb =
+            slug !== null
+              ? sellCollectionMenu(found[0].address, slug, offer !== null, makeTokenizer(ctx.session))
+              : undefined;
+          if (kb) {
+            lines.push("", `_Actions below apply to *${labelFor(found[0].address)}*, which holds the most._`);
+          }
+
+          return say(lines.join("\n"), { parse_mode: "Markdown", ...(kb ?? {}) });
+        } catch (err: any) {
+          console.error(`Find NFT failed for ${contract}: ${err?.message ?? err}`);
+          await say(`Lookup failed: ${err?.shortMessage ?? err?.message ?? err}`);
+        }
+      })();
+      return;
     }
 
     if (step === "awaiting_pnl_contract") {

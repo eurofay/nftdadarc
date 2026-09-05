@@ -16,7 +16,7 @@ export function mainMenu(isAdmin = false) {
     [Markup.button.callback("💸 Fund Wallets", "menu:fund"), Markup.button.callback("⏰ Scheduled Mint", "menu:sched")],
     [Markup.button.callback("🖼 Portfolio", "menu:portfolio"), Markup.button.callback("🔔 Activity Alerts", "menu:activity")],
     [Markup.button.callback("⚡ Quick Mint", "menu:quick"), Markup.button.callback("📦 Consolidate", "menu:consolidate")],
-    [Markup.button.callback("📊 P&L", "menu:pnl")],
+    [Markup.button.callback("📊 P&L", "menu:pnl"), Markup.button.callback("🔎 Find NFT", "menu:find")],
     [Markup.button.callback("🧮 Wallet Filter", "menu:filter")],
     [Markup.button.callback("📊 Status", "menu:status")],
   ];
