@@ -317,8 +317,12 @@ export function seedDetailMenu(seedId: string) {
 }
 
 export function copyMenu(enabled: boolean, targets: CopyTarget[]) {
+  // The name renames and the bin removes. Tapping the row used to delete
+  // outright, which put the destructive action on the whole row and left no
+  // way to fix a label at all.
   const rows = targets.map((t) => [
-    Markup.button.callback(`🗑 ${t.label} (${maskAddress(t.address)})`, `copy:remove:${t.address}`),
+    Markup.button.callback(`✏️ ${t.label} (${maskAddress(t.address)})`, `copy:rename:${t.address}`),
+    Markup.button.callback("🗑", `copy:remove:${t.address}`),
   ]);
   rows.push([Markup.button.callback(enabled ? "⏸ Turn off" : "▶️ Turn on", "copy:toggle")]);
   rows.push([Markup.button.callback("➕ Watch a wallet", "copy:add")]);

@@ -344,6 +344,22 @@ export class TelegramStore {
     return target;
   }
 
+  /**
+   * Rename a watched wallet. Returns the new record, or null if not watched.
+   *
+   * Same reasoning as renameWallet: the label is presentation only, and the
+   * watcher matches sightings by address, so renaming cannot stop a wallet
+   * being copied or silently start copying a different one.
+   */
+  renameCopyTarget(address: string, label: string): CopyTarget | null {
+    const target = this.data.copyTargets.find((t) => t.address.toLowerCase() === address.toLowerCase());
+    if (!target) return null;
+    const trimmed = label.trim();
+    target.label = trimmed === "" ? target.address.slice(0, 8) : trimmed.slice(0, MAX_LABEL);
+    this.save();
+    return target;
+  }
+
   removeCopyTarget(address: string): boolean {
     const before = this.data.copyTargets.length;
     this.data.copyTargets = this.data.copyTargets.filter((t) => t.address.toLowerCase() !== address.toLowerCase());

@@ -131,6 +131,7 @@ interface SessionData {
     | "awaiting_pnl_contract"
     | "awaiting_find_contract"
     | "awaiting_wallet_label"
+    | "awaiting_copy_label"
     | "awaiting_sched_link"
     | "awaiting_sched_quantity"
     | "awaiting_sched_custom_time"
@@ -155,6 +156,7 @@ interface SessionData {
   cbTokens?: Record<string, string>;
   cbSeq?: number;
   renameWallet?: string;
+  renameCopyTarget?: string;
   sellWallet?: string;
   sellSlug?: string;
   sellPriceEth?: number;
@@ -1803,6 +1805,20 @@ Send the new name.`,
         "0xabc... whale\n\n" +
         "Or paste many at once — one per line, or separated by spaces or commas. " +
         "Addresses already on the list are skipped."
+    );
+  });
+
+  bot.action(/^copy:rename:(.+)$/, (ctx) => {
+    const address = ctx.match[1];
+    const target = ctx.store.listCopyTargets().find((t) => t.address.toLowerCase() === address.toLowerCase());
+    if (!target) return ctx.answerCbQuery("That wallet is no longer watched.", { show_alert: true });
+    ctx.session.step = "awaiting_copy_label";
+    ctx.session.renameCopyTarget = address;
+    return ctx.editMessageText(
+      "Rename *" + target.label + "*\n\n" +
+        maskAddress(target.address) +
+        "\n\nSend the new name.",
+      { parse_mode: "Markdown" }
     );
   });
 
@@ -4094,6 +4110,21 @@ Send the new name.`,
           "Listing costs no gas and moves nothing now — it publishes a signed offer to sell. " +
           "You'll be asked to approve the transfer contract if it isn't approved yet.",
         sellActionConfirmMenu("list", address, slug, makeTokenizer(ctx.session))
+      );
+    }
+
+    if (step === "awaiting_copy_label") {
+      ctx.session.step = undefined;
+      const address = ctx.session.renameCopyTarget;
+      ctx.session.renameCopyTarget = undefined;
+      if (!address) return ctx.reply("That request expired — open Copy Mint again.");
+
+      const renamed = ctx.store.renameCopyTarget(address, ctx.message.text);
+      if (!renamed) return ctx.reply("That wallet is no longer watched.");
+      // Matching is by address, so the watcher keeps copying it either way.
+      return ctx.reply(
+        "✅ Renamed to *" + renamed.label + "*.",
+        { parse_mode: "Markdown", ...copyMenu(runningCopy.has(ctx.from!.id), ctx.store.listCopyTargets()) }
       );
     }
 

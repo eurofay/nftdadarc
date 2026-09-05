@@ -231,6 +231,56 @@ describe("TelegramStore copy-mint watchlist", () => {
   });
 });
 
+describe("TelegramStore renameCopyTarget", () => {
+  const WATCHED = new Wallet(TEST_KEY_2).address;
+
+  it("changes the label", () => {
+    const store = freshStore();
+    store.addCopyTarget("whale", WATCHED);
+    expect(store.renameCopyTarget(WATCHED, "the good one")?.label).toBe("the good one");
+    expect(store.listCopyTargets()[0].label).toBe("the good one");
+  });
+
+  it("keeps the address, so the watcher copies the same wallet", () => {
+    // Matching is by address; a rename must not redirect the watcher.
+    const store = freshStore();
+    store.addCopyTarget("whale", WATCHED);
+    store.renameCopyTarget(WATCHED, "renamed");
+    expect(store.listCopyTargets()[0].address).toBe(WATCHED);
+    expect(store.listCopyTargets()).toHaveLength(1);
+  });
+
+  it("matches the address regardless of case", () => {
+    const store = freshStore();
+    store.addCopyTarget("whale", WATCHED);
+    expect(store.renameCopyTarget(WATCHED.toLowerCase(), "lower")?.label).toBe("lower");
+  });
+
+  it("returns null for a wallet that is not watched", () => {
+    const store = freshStore();
+    expect(store.renameCopyTarget(WATCHED, "ghost")).toBe(null);
+  });
+
+  it("falls back to the address stub on an empty name", () => {
+    const store = freshStore();
+    store.addCopyTarget("whale", WATCHED);
+    expect(store.renameCopyTarget(WATCHED, "  ")?.label).toBe(WATCHED.slice(0, 8));
+  });
+
+  it("caps a very long name", () => {
+    const store = freshStore();
+    store.addCopyTarget("whale", WATCHED);
+    expect(store.renameCopyTarget(WATCHED, "y".repeat(500))!.label.length).toBeLessThanOrEqual(40);
+  });
+
+  it("persists across a reload", () => {
+    const store = freshStore();
+    store.addCopyTarget("whale", WATCHED);
+    store.renameCopyTarget(WATCHED, "kept");
+    expect(new TelegramStore(tmpFile, "test-pass").listCopyTargets()[0].label).toBe("kept");
+  });
+});
+
 describe("TelegramStore minted holdings", () => {
   const NFT = "0x1111111111111111111111111111111111111111";
   const W1 = "0xaaaAaAaaAaAaAaaAaAAAAAAAAaaaAaAaAaaAaaAa";
