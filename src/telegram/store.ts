@@ -8,6 +8,10 @@ import { randomBytes } from "crypto";
 import { Wallet } from "ethers";
 import { encrypt, decrypt } from "./crypto";
 
+// Telegram inline buttons are ~64 bytes of callback data and a finite width;
+// a pasted paragraph as a label makes every keyboard it appears in unusable.
+const MAX_LABEL = 40;
+
 export interface WalletRecord {
   label: string;
   address: string;
@@ -262,6 +266,25 @@ export class TelegramStore {
       derivationIndex: origin?.derivationIndex,
     };
     this.data.wallets.push(record);
+    this.save();
+    return record;
+  }
+
+  /**
+   * Rename a wallet. Returns the new record, or null when there is no such
+   * wallet.
+   *
+   * The label is presentation only -- every other part of the bot addresses a
+   * wallet by its address -- so renaming cannot orphan a copy-mint target, a
+   * scheduled mint, or anything else holding a reference.
+   */
+  renameWallet(address: string, label: string): WalletRecord | null {
+    const record = this.data.wallets.find((w) => w.address.toLowerCase() === address.toLowerCase());
+    if (!record) return null;
+    const trimmed = label.trim();
+    // An empty name would leave a blank button that cannot be identified in a
+    // list, so it falls back to the same default a new wallet gets.
+    record.label = trimmed === "" ? record.address.slice(0, 8) : trimmed.slice(0, MAX_LABEL);
     this.save();
     return record;
   }

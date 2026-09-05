@@ -144,6 +144,71 @@ describe("TelegramStore wallets", () => {
   });
 });
 
+describe("TelegramStore renameWallet", () => {
+  it("changes the label", () => {
+    const store = freshStore();
+    const added = store.addWallet("main", TEST_KEY_1);
+    const renamed = store.renameWallet(added.address, "cold storage");
+    expect(renamed?.label).toBe("cold storage");
+    expect(store.listWallets()[0].label).toBe("cold storage");
+  });
+
+  it("keeps the key and address untouched", () => {
+    // A rename must never be able to lose access to a funded wallet.
+    const store = freshStore();
+    const added = store.addWallet("main", TEST_KEY_1);
+    store.renameWallet(added.address, "renamed");
+    expect(store.listWallets()[0].address).toBe(added.address);
+    expect(store.getDecryptedKey(added.address)).toBe(TEST_KEY_1);
+  });
+
+  it("matches the address regardless of case", () => {
+    const store = freshStore();
+    const added = store.addWallet("main", TEST_KEY_1);
+    expect(store.renameWallet(added.address.toLowerCase(), "lower")?.label).toBe("lower");
+  });
+
+  it("returns null for a wallet that is not there", () => {
+    const store = freshStore();
+    expect(store.renameWallet(new Wallet(TEST_KEY_2).address, "ghost")).toBe(null);
+  });
+
+  it("falls back to the address stub rather than leaving a blank button", () => {
+    const store = freshStore();
+    const added = store.addWallet("main", TEST_KEY_1);
+    expect(store.renameWallet(added.address, "   ")?.label).toBe(added.address.slice(0, 8));
+  });
+
+  it("trims surrounding whitespace", () => {
+    const store = freshStore();
+    const added = store.addWallet("main", TEST_KEY_1);
+    expect(store.renameWallet(added.address, "  spaced  ")?.label).toBe("spaced");
+  });
+
+  it("caps a very long name, which would otherwise break every keyboard", () => {
+    const store = freshStore();
+    const added = store.addWallet("main", TEST_KEY_1);
+    const renamed = store.renameWallet(added.address, "x".repeat(500));
+    expect(renamed!.label.length).toBeLessThanOrEqual(40);
+  });
+
+  it("persists across a reload", () => {
+    const store = freshStore();
+    const added = store.addWallet("main", TEST_KEY_1);
+    store.renameWallet(added.address, "kept");
+    const reopened = new TelegramStore(tmpFile, "test-pass");
+    expect(reopened.listWallets()[0].label).toBe("kept");
+  });
+
+  it("leaves other wallets alone", () => {
+    const store = freshStore();
+    const a = store.addWallet("first", TEST_KEY_1);
+    store.addWallet("second", TEST_KEY_2);
+    store.renameWallet(a.address, "changed");
+    expect(store.listWallets().map((w) => w.label).sort()).toEqual(["changed", "second"]);
+  });
+});
+
 describe("TelegramStore copy-mint watchlist", () => {
   it("adds and lists a copy-mint target", () => {
     const store = freshStore();

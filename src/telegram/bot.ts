@@ -130,6 +130,7 @@ interface SessionData {
     | "awaiting_consolidate_contract"
     | "awaiting_pnl_contract"
     | "awaiting_find_contract"
+    | "awaiting_wallet_label"
     | "awaiting_sched_link"
     | "awaiting_sched_quantity"
     | "awaiting_sched_custom_time"
@@ -153,6 +154,7 @@ interface SessionData {
   schedTargetStartMs?: number | "now"; // chosen fire time, pending confirmation
   cbTokens?: Record<string, string>;
   cbSeq?: number;
+  renameWallet?: string;
   sellWallet?: string;
   sellSlug?: string;
   sellPriceEth?: number;
@@ -1750,6 +1752,22 @@ export function createBot({ token, ownerId, stores, access, alerts }: BotDeps): 
   }
 
   bot.action(/^wallet:manage:(.+)$/, (ctx) => showWallet(ctx, ctx.match[1]));
+
+  bot.action(/^wallet:rename:(.+)$/, (ctx) => {
+    const address = ctx.match[1];
+    const wallet = ctx.store.listWallets().find((w) => w.address.toLowerCase() === address.toLowerCase());
+    if (!wallet) return ctx.answerCbQuery("That wallet is gone.", { show_alert: true });
+    ctx.session.step = "awaiting_wallet_label";
+    ctx.session.renameWallet = address;
+    return ctx.editMessageText(
+      `✏️ Rename *${wallet.label}*
+
+${maskAddress(wallet.address)}
+
+Send the new name.`,
+      { parse_mode: "Markdown" }
+    );
+  });
 
   bot.action(/^wallet:bal:(.+)$/, async (ctx) => {
     const address = ctx.match[1];
@@ -4077,6 +4095,20 @@ export function createBot({ token, ownerId, stores, access, alerts }: BotDeps): 
           "You'll be asked to approve the transfer contract if it isn't approved yet.",
         sellActionConfirmMenu("list", address, slug, makeTokenizer(ctx.session))
       );
+    }
+
+    if (step === "awaiting_wallet_label") {
+      ctx.session.step = undefined;
+      const address = ctx.session.renameWallet;
+      ctx.session.renameWallet = undefined;
+      if (!address) return ctx.reply("That request expired — open the wallet again.");
+
+      const renamed = ctx.store.renameWallet(address, ctx.message.text);
+      if (!renamed) return ctx.reply("That wallet is gone.");
+      // The label is presentation only, so nothing else needs updating: every
+      // other reference to a wallet is by address.
+      await ctx.reply(`✅ Renamed to *${renamed.label}*.`, { parse_mode: "Markdown" });
+      return showWallet(ctx, renamed.address);
     }
 
     if (step === "awaiting_find_contract") {
