@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="360" viewBox="0 0 1200 360">
+  <defs>
+    <linearGradient id="fire" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%"   stop-color="#FBB040"/>
+      <stop offset="55%"  stop-color="#F5871F"/>
+      <stop offset="100%" stop-color="#C4342A"/>
+    </linearGradient>
+    <linearGradient id="fireOver" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%"   stop-color="#FFD06A"/>
+      <stop offset="100%" stop-color="#FBB040"/>
+    </linearGradient>
+    <linearGradient id="creamOver" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%"   stop-color="#FFFFFF"/>
+      <stop offset="100%" stop-color="#F6EFE4"/>
+    </linearGradient>
+    <linearGradient id="creamGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%"   stop-color="#F6EFE4"/>
+      <stop offset="100%" stop-color="#CDBBA6"/>
+    </linearGradient>
+    <linearGradient id="darkGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%"   stop-color="#1B2725"/>
+      <stop offset="100%" stop-color="#121A19"/>
+    </linearGradient>
+    <linearGradient id="night" x1="0.1" y1="0" x2="1" y2="1">
+      <stop offset="0%"   stop-color="#1B2725"/>
+      <stop offset="60%"  stop-color="#121A19"/>
+      <stop offset="100%" stop-color="#0B100F"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="50%" cy="45%" r="55%">
+      <stop offset="0%"   stop-color="#F5871F" stop-opacity="0.30"/>
+      <stop offset="100%" stop-color="#F5871F" stop-opacity="0"/>
+    </radialGradient></defs>
+  <rect width="1200" height="360" fill="url(#night)"/>
+  <circle cx="250" cy="180" r="150" fill="url(#glow)"/>
+  
+    <path d="M 250,180 C 120,74 120,286 250,180 C 380,74 380,286 250,180" fill="none" stroke="url(#fire)" stroke-width="28"
+          stroke-linecap="round" stroke-linejoin="round"/>
+    <line x1="223.4" y1="153.4" x2="276.6" y2="206.6"
+          stroke="#121A19" stroke-width="43.4" stroke-linecap="butt"/>
+    <line x1="228.16" y1="158.16" x2="271.84" y2="201.84"
+          stroke="url(#fireOver)" stroke-width="28" stroke-linecap="round"/>
+  <text x="440" y="196" font-family="DM Sans" font-size="132" font-weight="700"
+        fill="#F6EFE4" letter-spacing="-4">l00p</text>
+  <text x="448" y="252" font-family="DM Mono" font-size="26" letter-spacing="13"
+        fill="#F5871F">MINT BOT</text>
+</svg>

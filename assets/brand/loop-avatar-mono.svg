@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="fire" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%"   stop-color="#FBB040"/>
+      <stop offset="55%"  stop-color="#F5871F"/>
+      <stop offset="100%" stop-color="#C4342A"/>
+    </linearGradient>
+    <linearGradient id="fireOver" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%"   stop-color="#FFD06A"/>
+      <stop offset="100%" stop-color="#FBB040"/>
+    </linearGradient>
+    <linearGradient id="creamOver" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%"   stop-color="#FFFFFF"/>
+      <stop offset="100%" stop-color="#F6EFE4"/>
+    </linearGradient>
+    <linearGradient id="creamGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%"   stop-color="#F6EFE4"/>
+      <stop offset="100%" stop-color="#CDBBA6"/>
+    </linearGradient>
+    <linearGradient id="darkGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%"   stop-color="#1B2725"/>
+      <stop offset="100%" stop-color="#121A19"/>
+    </linearGradient>
+    <linearGradient id="night" x1="0.1" y1="0" x2="1" y2="1">
+      <stop offset="0%"   stop-color="#1B2725"/>
+      <stop offset="60%"  stop-color="#121A19"/>
+      <stop offset="100%" stop-color="#0B100F"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="50%" cy="45%" r="55%">
+      <stop offset="0%"   stop-color="#F5871F" stop-opacity="0.30"/>
+      <stop offset="100%" stop-color="#F5871F" stop-opacity="0"/>
+    </radialGradient></defs>
+  <rect width="512" height="512" rx="116" fill="#121A19"/>
+  
+    <path d="M 256,250 C 51,82 51,418 256,250 C 461,82 461,418 256,250" fill="none" stroke="url(#creamGrad)" stroke-width="44"
+          stroke-linecap="round" stroke-linejoin="round"/>
+    <line x1="214.2" y1="208.2" x2="297.8" y2="291.8"
+          stroke="#121A19" stroke-width="68.2" stroke-linecap="butt"/>
+    <line x1="221.68" y1="215.68" x2="290.32" y2="284.32"
+          stroke="url(#creamOver)" stroke-width="44" stroke-linecap="round"/>
+</svg>

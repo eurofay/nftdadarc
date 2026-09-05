@@ -18,6 +18,7 @@
 import { Telegraf, Telegram, Markup } from "telegraf";
 import { UserStores } from "./user-stores";
 import { registerWalletFilter, FILTER_INTRO } from "./wallet-filter-flow";
+import { cleanToken } from "./token";
 
 export interface AlertsBot {
   telegram: Telegram;
@@ -48,10 +49,21 @@ export function startAlertsBot(
   ownerId: number,
   stores: UserStores
 ): AlertsBot | null {
-  const trimmed = (token ?? "").trim();
-  if (!trimmed) return null;
+  const cleaned = cleanToken(token);
+  if (!cleaned.token) return null;
 
-  const bot = new Telegraf(trimmed);
+  // Said out loud, because the only other symptom is a bare 401 that gives
+  // no hint the value itself was mangled on the way in.
+  for (const note of cleaned.notes) console.warn(`TELEGRAM_ALERTS_BOT_TOKEN: ${note}.`);
+  if (!cleaned.looksValid) {
+    console.error(
+      "TELEGRAM_ALERTS_BOT_TOKEN is not shaped like a bot token (digits, a colon, then the secret). " +
+        "Alerts and the wallet filter stay on the main bot."
+    );
+    return null;
+  }
+
+  const bot = new Telegraf(cleaned.token);
   const filter = registerWalletFilter(bot, { ownerId, stores });
 
   const handle: AlertsBot = {

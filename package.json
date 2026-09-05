@@ -1,7 +1,7 @@
 {
   "name": "nft-public-mint",
   "version": "1.0.0",
-  "description": "CLI sniper for public SeaDrop NFT mints — builds calldata on-chain, no OpenSea token required",
+  "description": "CLI sniper for public SeaDrop NFT mints \u2014 builds calldata on-chain, no OpenSea token required",
   "main": "dist/index.js",
   "bin": {
     "nft-public-mint": "dist/index.js"
@@ -12,7 +12,8 @@
     "dev": "ts-node src/index.ts",
     "bot": "node dist/telegram-bot.js",
     "test": "vitest run",
-    "cli": "node dist/index.js"
+    "cli": "node dist/index.js",
+    "logo": "node scripts/make-logo.mjs"
   },
   "keywords": [
     "nft",

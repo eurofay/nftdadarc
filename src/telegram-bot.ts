@@ -7,6 +7,7 @@ dotenv.config({ path: path.resolve(process.cwd(), ".env") });
 
 import { createBot } from "./telegram/bot";
 import { startAlertsBot } from "./telegram/alerts-bot";
+import { cleanToken } from "./telegram/token";
 import { UserStores } from "./telegram/user-stores";
 import { AccessControl } from "./telegram/access-control";
 
@@ -20,7 +21,19 @@ function required(name: string): string {
 }
 
 async function main(): Promise<void> {
-  const token = required("TELEGRAM_BOT_TOKEN");
+  // The main token gets the same cleaning as the companion one. A dashboard
+  // field stores quotes literally, and the resulting 401 says nothing about
+  // why -- worth catching for the bot that cannot start without it.
+  const rawToken = required("TELEGRAM_BOT_TOKEN");
+  const cleanedToken = cleanToken(rawToken);
+  for (const note of cleanedToken.notes) console.warn(`TELEGRAM_BOT_TOKEN: ${note}.`);
+  if (!cleanedToken.looksValid) {
+    console.error(
+      "TELEGRAM_BOT_TOKEN is not shaped like a bot token (digits, a colon, then the secret). " +
+        "Paste only the value @BotFather gave you -- no quotes, no NAME= prefix."
+    );
+  }
+  const token = cleanedToken.token;
   const ownerId = Number(required("TELEGRAM_OWNER_ID"));
   if (!Number.isFinite(ownerId)) {
     console.error("TELEGRAM_OWNER_ID must be a numeric Telegram user id.");
