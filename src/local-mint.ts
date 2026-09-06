@@ -56,6 +56,13 @@ export interface SnipeOutcome {
   minted: { address: string; txHash: string; block: number }[];
 }
 
+// How long before the target to take the round-trip measurement.
+//
+// Far enough out that a slow measurement cannot eat into the lead itself,
+// close enough that it describes the network the send will meet. Inside the
+// warm keeper's hot window, so the socket being timed is the hot one.
+const MEASURE_BEFORE_MS = 5_000;
+
 export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<SnipeOutcome> {
   const {
     nftContract, quantity, walletKeys, rpcUrls,
@@ -178,8 +185,16 @@ export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<SnipeOutco
   const stopWarmKeeper = startWarmKeeper(rpcUrls, targetStart ? targetStart.getTime() : null);
   try {
     if (targetStart) {
-      // Measured on the warm socket the send will actually use, so the number
-      // describes this path rather than a general idea of the internet.
+      // Two-phase wait, so the measurement is fresh rather than hours old.
+      //
+      // A scheduled stage can be a long way off, and a round trip measured
+      // when it was armed says nothing about the network at fire time. So:
+      // wait until shortly before the target, measure THEN on the warm socket
+      // the send will actually use, and only then apply the lead.
+      if (earlyFireMs !== 0) {
+        const preRoll = targetStart.getTime() - MEASURE_BEFORE_MS;
+        if (Date.now() < preRoll) await waitForMintTime(new Date(preRoll), 0);
+      }
       const roundTrip = earlyFireMs === 0 ? null : await measureRoundTripMs(rpcUrls[0]);
       const lead = resolveEarlyFire(earlyFireMs, roundTrip);
       if (earlyFireMs !== 0) log.info(`  ${describeEarlyFire(earlyFireMs, roundTrip, lead)}`);
