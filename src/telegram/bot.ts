@@ -2273,6 +2273,7 @@ Send the new name.`,
     "maxFeeGwei",
     "priorityGwei",
     "gasLimit",
+    "earlyFireMs",
     "autoMaxQuantity",
     "copyMintMaxPriceEth",
     "copyMintMaxQuantity",
@@ -2799,6 +2800,7 @@ Send the new name.`,
           maxFeePerGas: gweiToWei(settings.maxFeeGwei),
           maxPriorityFee: gweiToWei(settings.priorityGwei),
           gasLimit: settings.gasLimit,
+          earlyFireMs: settings.earlyFireMs,
           targetStart: null,
           plan,
           logger,
@@ -2891,6 +2893,7 @@ Send the new name.`,
           maxFeePerGas: gweiToWei(settings.maxFeeGwei),
           maxPriorityFee: gweiToWei(settings.priorityGwei),
           gasLimit: settings.gasLimit,
+          earlyFireMs: settings.earlyFireMs,
           targetStart: null,
           // OpenSea returned a complete transaction, so there is no public
           // drop to read — the engine only needs somewhere to send bytes.
@@ -3052,6 +3055,7 @@ Send the new name.`,
         maxFeePerGas: gweiToWei(settings.maxFeeGwei),
         maxPriorityFee: gweiToWei(settings.priorityGwei),
         gasLimit: settings.gasLimit,
+        earlyFireMs: settings.earlyFireMs,
         targetStart: null,
         plan: {
           to: encoded.to,
@@ -3243,6 +3247,7 @@ Send the new name.`,
         maxFeePerGas: gweiToWei(settings.maxFeeGwei),
         maxPriorityFee: gweiToWei(settings.priorityGwei),
         gasLimit: settings.gasLimit,
+        earlyFireMs: settings.earlyFireMs,
         targetStart: null,
         plan,
         logger,
@@ -3470,6 +3475,7 @@ Send the new name.`,
         maxFeePerGas: gweiToWei(settings.maxFeeGwei),
         maxPriorityFee: gweiToWei(settings.priorityGwei),
         gasLimit: settings.gasLimit,
+        earlyFireMs: settings.earlyFireMs,
         targetStart,
         plan,
         logger,
@@ -4527,6 +4533,27 @@ Send the new name.`,
       // "auto" on the gas limit means size it from the quantity being minted,
       // which is stored as 0. A fixed limit both over-reserves for a small
       // mint and runs out of gas on a large one.
+      // "auto" measures the round trip at fire time and leads by a fraction
+      // of the one-way flight. "off" restores sending at the stage start.
+      if (field === "earlyFireMs") {
+        const word = raw.toLowerCase();
+        if (word === "auto") {
+          ctx.store.updateSettings({ earlyFireMs: -1 });
+          return ctx.reply(
+            "✅ Early fire is now *auto*." + NL + NL +
+              "Before each scheduled mint I measure the round trip to the sequencer on the same warm " +
+              "socket the send uses, then fire a little under half of it early — so the transaction " +
+              "*arrives* as the stage opens instead of a flight time after it." + NL + NL +
+              "It leans late on purpose. Arriving early does not wait, it reverts, and a revert costs gas.",
+            { parse_mode: "Markdown", ...settingsMenu(ctx.store.getSettings()) }
+          );
+        }
+        if (word === "off" || word === "0") {
+          ctx.store.updateSettings({ earlyFireMs: 0 });
+          return ctx.reply("✅ Early fire off — sending at the stage start.", settingsMenu(ctx.store.getSettings()));
+        }
+      }
+
       if (field === "maxFeeGwei" && raw.toLowerCase() === "auto") {
         // 0 means "read the base fee at signing time". A hand-set ceiling is
         // a guess that ages: too low and nothing lands, too high and every

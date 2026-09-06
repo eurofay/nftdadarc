@@ -79,6 +79,12 @@ export interface BotSettings {
   // 0 means "size it from the quantity being minted" (see gas.ts). A fixed
   // number over-reserves for a small mint and runs out of gas on a large one.
   gasLimit: number;
+  /**
+   * Milliseconds to send before a stage opens, so the transaction arrives as
+   * it opens rather than a flight time later. 0 is off, -1 measures the round
+   * trip and decides. Landing early reverts, so this defaults to off.
+   */
+  earlyFireMs: number;
   autoEnabled: boolean;
   autoMaxQuantity?: number;
   // Which chain(s) Auto Mint watches — independent of chainKey, since this
@@ -173,6 +179,7 @@ const DEFAULT_SETTINGS: BotSettings = {
   maxFeeGwei: 2,
   priorityGwei: 0.05,
   gasLimit: 250_000,
+  earlyFireMs: 0,
   autoEnabled: false,
   // On by default: the whole point of the bot is that it copies without being
   // asked each time. Turning it off is a deliberate act and is remembered.

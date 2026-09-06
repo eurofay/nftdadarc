@@ -62,6 +62,32 @@ export async function warmConnections(rpcUrls: string[], logger: Logger = defaul
   logger.success("  Connections hot.");
 }
 
+/**
+ * Round trip to one endpoint, in milliseconds.
+ *
+ * Deliberately the same ping: same method, same endpoint, same warm socket as
+ * the real send. A probe that used a different method or a cold connection
+ * would measure something other than the thing being compensated for.
+ *
+ * Returns null rather than a number when it cannot measure. A missing
+ * measurement makes the caller send at the stage start, which is late but
+ * safe; a made-up one would make it send early, which reverts.
+ */
+export async function measureRoundTripMs(url: string): Promise<number | null> {
+  const started = Date.now();
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: PING_BODY,
+    });
+    await res.arrayBuffer();
+    return Date.now() - started;
+  } catch {
+    return null;
+  }
+}
+
 /** Whether the keeper should be pinging yet, given how far off the target is. */
 export function shouldPing(msUntilTarget: number, hotWindowMs = HOT_WINDOW_MS): boolean {
   return msUntilTarget <= hotWindowMs;

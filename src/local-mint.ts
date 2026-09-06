@@ -16,7 +16,8 @@
 import { performance } from "perf_hooks";
 import { Wallet, formatEther, formatUnits } from "ethers";
 import { blastToAll, parseRpcEndpoints, prepareBlast, waitForReceipt, PreparedBlast } from "./rpc-blast";
-import { warmConnections, startWarmKeeper } from "./connection-warmer";
+import { warmConnections, startWarmKeeper, measureRoundTripMs } from "./connection-warmer";
+import { resolveEarlyFire, describeEarlyFire } from "./early-fire";
 import { waitForMintTime } from "./timer";
 import { explorerTx } from "./chains";
 import { LocalMintPlan } from "./seadrop-public";
@@ -34,6 +35,12 @@ export interface LocalSnipeOpts {
   maxPriorityFee: bigint;
   gasLimit: number;
   targetStart: Date | null;
+  /**
+   * Send this many ms before the stage opens, so the transaction arrives as
+   * it opens rather than a flight time after. 0 is off, -1 measures and
+   * decides. See early-fire.ts -- landing early reverts.
+   */
+  earlyFireMs?: number;
   plan: LocalMintPlan;
   logger?: Logger; // defaults to printing locally — the Telegram bot passes one that also forwards to a chat
 }
@@ -52,7 +59,7 @@ export interface SnipeOutcome {
 export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<SnipeOutcome> {
   const {
     nftContract, quantity, walletKeys, rpcUrls,
-    maxFeePerGas, maxPriorityFee, gasLimit, targetStart, plan,
+    maxFeePerGas, maxPriorityFee, gasLimit, targetStart, plan, earlyFireMs = 0,
   } = opts;
   const log = opts.logger ?? defaultLogger;
 
@@ -171,7 +178,12 @@ export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<SnipeOutco
   const stopWarmKeeper = startWarmKeeper(rpcUrls, targetStart ? targetStart.getTime() : null);
   try {
     if (targetStart) {
-      await waitForMintTime(targetStart, 0);
+      // Measured on the warm socket the send will actually use, so the number
+      // describes this path rather than a general idea of the internet.
+      const roundTrip = earlyFireMs === 0 ? null : await measureRoundTripMs(rpcUrls[0]);
+      const lead = resolveEarlyFire(earlyFireMs, roundTrip);
+      if (earlyFireMs !== 0) log.info(`  ${describeEarlyFire(earlyFireMs, roundTrip, lead)}`);
+      await waitForMintTime(targetStart, lead);
     } else {
       log.warnBold("\n  🚀 Firing immediately...");
     }
