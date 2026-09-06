@@ -274,6 +274,9 @@ export function walletsMenu(wallets: WalletRecord[]) {
     const flags = `${w.includeInAutoMint === false ? "" : "🎯"}${w.includeInCopyMint === false ? "" : "👀"}` || "—";
     return [Markup.button.callback(`${w.label} (${maskAddress(w.address)}) [${flags}]`, `wallet:manage:${w.address}`)];
   });
+  if (wallets.length > 1) {
+    rows.push([Markup.button.callback("✏️ Rename all", "wallet:renameall")]);
+  }
   rows.push([Markup.button.callback("➕ Add wallet (private key)", "wallet:add")]);
   rows.push([Markup.button.callback("🌱 Generate seed + wallets", "wallet:seed:new")]);
   rows.push([Markup.button.callback("📥 Import seed phrase", "wallet:seed:import")]);
@@ -514,5 +517,14 @@ export function schedConfirmMenu() {
   return Markup.inlineKeyboard([
     [Markup.button.callback("🧪 Dry Run", "sched:dryrun")],
     [Markup.button.callback("✅ Confirm", "sched:confirm"), Markup.button.callback("❌ Cancel", "sched:cancel")],
+  ]);
+}
+
+export function renameAllConfirmMenu() {
+  return Markup.inlineKeyboard([
+    [
+      Markup.button.callback("✅ Rename them", "wallet:renameall:go"),
+      Markup.button.callback("❌ Cancel", "menu:wallets"),
+    ],
   ]);
 }

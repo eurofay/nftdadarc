@@ -31,6 +31,7 @@ import {
   adminInvitesMenu,
   walletsMenu,
   walletDetailMenu,
+  renameAllConfirmMenu,
   copyMenu,
   autoMenu,
   settingsMenu,
@@ -108,6 +109,7 @@ import { findAllowListUri, fetchAllowList, parseAllowList, deriveProof } from ".
 import { renderMintCardPng, renderPnlCardPng } from "../mint-card-render";
 import { computePnl, renderPnl, PnlReport } from "../pnl";
 import { registerWalletFilter } from "./wallet-filter-flow";
+import { loopNames, describeRenamePlan } from "./wallet-naming";
 import { acceptOfferViaSdk, acceptOfferWithFallback, createListing, parseListingPrice } from "../opensea-sell";
 import { createLogger, withPrefix, LogSink } from "../logger";
 import { istTimeToDate, toIST } from "../time-format";
@@ -195,6 +197,8 @@ interface RunningWatcher {
 // twice a second, and editing that often would trip the limit long before the
 // scan did. Slow enough to stay well inside it, quick enough to look alive.
 const PROGRESS_EDIT_MS = 4_000;
+
+const NL = String.fromCharCode(10);
 
 function gweiToWei(gwei: number): bigint {
   return BigInt(Math.round(gwei * 1e9));
@@ -1754,6 +1758,37 @@ export function createBot({ token, ownerId, stores, access, alerts }: BotDeps): 
   }
 
   bot.action(/^wallet:manage:(.+)$/, (ctx) => showWallet(ctx, ctx.match[1]));
+
+  // Bulk rename to l00p-<last characters of the address>.
+  //
+  // A seed derives ten wallets at once and they all arrive with the same
+  // useless default. Naming them from their own address ties the label to the
+  // thing it identifies, so it can never drift onto the wrong wallet.
+  bot.action("wallet:renameall", (ctx) => {
+    const wallets = ctx.store.listWallets();
+    if (wallets.length === 0) return ctx.answerCbQuery("No wallets yet.", { show_alert: true });
+    const names = loopNames(wallets.map((w) => w.address));
+    return ctx.editMessageText(
+      "✏️ *Rename all " + wallets.length + " wallet(s)*" + NL + NL +
+        describeRenamePlan(wallets, names) + NL + NL +
+        "_This replaces every name, including any you set yourself._",
+      { parse_mode: "Markdown", ...renameAllConfirmMenu() }
+    );
+  });
+
+  bot.action("wallet:renameall:go", (ctx) => {
+    const wallets = ctx.store.listWallets();
+    const names = loopNames(wallets.map((w) => w.address));
+    let changed = 0;
+    for (const w of wallets) {
+      const name = names.get(w.address);
+      if (name && name !== w.label && ctx.store.renameWallet(w.address, name)) changed++;
+    }
+    return ctx.editMessageText(
+      "✅ Renamed " + changed + " wallet(s).",
+      walletsMenu(ctx.store.listWallets())
+    );
+  });
 
   bot.action(/^wallet:rename:(.+)$/, (ctx) => {
     const address = ctx.match[1];
