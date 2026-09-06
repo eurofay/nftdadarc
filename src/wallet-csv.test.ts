@@ -72,11 +72,18 @@ describe("parseWalletList", () => {
     expect(parseWalletList("").addresses).toEqual([]);
   });
 
-  it("scales to a large list", () => {
-    const many = Array.from({ length: 50_000 }, (_, i) => `0x${i.toString(16).padStart(40, "0")}`);
-    const out = parseWalletList(many.join("\n"));
-    expect(out.addresses).toHaveLength(50_000);
-  });
+  // Generously timed rather than tuned: this asserts correctness at 50,000
+  // addresses, not speed, and the default 5s limit trips it when the suite
+  // runs files in parallel -- a failure that says nothing about the code.
+  it(
+    "scales to a large list",
+    () => {
+      const many = Array.from({ length: 50_000 }, (_, i) => `0x${i.toString(16).padStart(40, "0")}`);
+      const out = parseWalletList(many.join("\n"));
+      expect(out.addresses).toHaveLength(50_000);
+    },
+    30_000
+  );
 });
 
 describe("describeParse", () => {

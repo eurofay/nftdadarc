@@ -3826,12 +3826,25 @@ Send the new name.`,
 
       ctx.session.osmint = { contract, slug: info.slug, name: info.name, rows };
       const eligible = rows.filter((r) => r.canMint > 0).length;
+      // A wallet that could not be checked is not the same as a wallet that
+      // was checked and cannot mint. Saying "no wallet is eligible" when
+      // OpenSea rate-limited every check reports a fact that was never
+      // established, and sends you looking at the collection instead of at
+      // the thing that actually failed.
+      const unchecked = rows.filter((r) => r.canMint === 0 && r.reason && r.reason !== "no eligible stage");
+      const summary =
+        eligible > 0
+          ? `${eligible} of ${rows.length} wallet(s) eligible. Calldata is fetched fresh when you fire ` +
+            "— a signature is issued for one wallet and moment."
+          : unchecked.length === rows.length
+            ? `None of the ${rows.length} wallet(s) could be checked (${unchecked[0].reason}). ` +
+              "That is OpenSea refusing the request, not a verdict on eligibility — try again shortly."
+            : unchecked.length > 0
+              ? `No wallet is eligible right now, though ${unchecked.length} could not be checked ` +
+                `(${unchecked[0].reason}).`
+              : "No wallet is eligible for any stage right now.";
       return say(
-        `🔐 ${info.name ?? info.slug}\n\n` +
-          (eligible > 0
-            ? `${eligible} of ${rows.length} wallet(s) eligible. Calldata is fetched fresh when you fire — ` +
-              "a signature is issued for one wallet and moment."
-            : "No wallet is eligible for any stage right now."),
+        `🔐 ${info.name ?? info.slug}` + NL + NL + summary,
         osMintStagesMenu(rows)
       );
     }

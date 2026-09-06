@@ -190,27 +190,50 @@ export class OpenSeaMintClient {
    * no funds and approves no spend. It is the message the website asks for.
    */
   async login(wallet: Wallet, chainId: number): Promise<void> {
-    const nonceRes = await this.request(`${this.origin}/__api/auth/siwe/nonce`, { method: "GET" });
-    const nonce = (await nonceRes.text()).trim().replace(/^"|"$/g, "");
+    // POST, not GET. OpenSea moved this endpoint and GET now answers 405 --
+    // and because the old code only treated 401 and 429 as failures, the 405
+    // error body sailed through and was used AS the nonce. That produced a
+    // SIWE message reading `Nonce: {"error":{"message":"Method Not
+    // Allowed"...`, which was duly signed and rejected at verify with a bare
+    // 400. The visible symptom pointed at the signature; the cause was two
+    // steps earlier.
+    const nonceRes = await this.request(`${this.origin}/__api/auth/siwe/nonce`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    });
+    const nonce = parseNonce(await nonceRes.text());
     if (!nonce) throw new OpenSeaMintError("No login nonce was issued.", "protocol");
 
-    const message = createSiweMessage({
+    const issuedAt = this.now().toISOString();
+    const fields = {
       domain: new URL(this.origin).host,
       address: wallet.address,
+      statement: SIWE_STATEMENT,
       uri: this.origin,
+      version: "1",
       chainId,
       nonce,
-      issuedAt: this.now().toISOString(),
-    });
+      issuedAt,
+      // Required, and the value is not what you would guess: OpenSea rejects
+      // "EOA" and names the three it accepts -- Ethereum, Solana, Bitcoin. It
+      // is the chain family, not the account kind.
+      accountType: "Ethereum",
+    };
+
+    // The signed string and the posted fields are built from one object so
+    // they cannot drift: the server reconstructs the message from the fields
+    // and checks the signature against it, so a single mismatched character
+    // reads as a bad signature rather than as a bad field.
+    const message = createSiweMessage(fields);
 
     const verify = await this.request(`${this.origin}/__api/auth/siwe/verify`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        message,
-        signature: await wallet.signMessage(message),
-        address: wallet.address,
-      }),
+      // `message` is an object here, not the signed string. It used to be the
+      // string, and OpenSea now answers "Domain is required" to that -- the
+      // fields moved out of the message and into the payload.
+      body: JSON.stringify({ message: fields, signature: await wallet.signMessage(message) }),
     });
     if (!verify.ok) {
       throw new OpenSeaMintError(`Sign-in was rejected (HTTP ${verify.status}).`, "auth");
@@ -317,8 +340,24 @@ export class OpenSeaMintClient {
       throw new OpenSeaMintError(`Couldn't reach OpenSea: ${err?.message ?? err}`, "transport");
     }
     this.cookies.absorb(res.headers);
-    if (res.status === 401) throw new OpenSeaMintError("Session expired — sign in again.", "auth");
+    // 403 is an auth failure too, and it reaches here now that every non-OK
+    // status is checked. Letting it fall through to the generic branch below
+    // reported a rejected sign-in as a protocol fault, which is the wrong
+    // thing to tell someone and the wrong thing for a caller to branch on.
+    if (res.status === 401 || res.status === 403) {
+      throw new OpenSeaMintError("Session expired — sign in again.", "auth");
+    }
     if (res.status === 429) throw new OpenSeaMintError("Rate limited by OpenSea.", "rate-limited");
+    // Everything else that is not OK is a failure too. Only 401 and 429 used
+    // to be checked, so a 404 or a 405 came back as a Response whose body was
+    // then read as data -- which is exactly how an error blob ended up being
+    // signed as a login nonce.
+    if (!res.ok) {
+      throw new OpenSeaMintError(
+        `OpenSea answered HTTP ${res.status} for ${new URL(url).pathname}.`,
+        res.status >= 500 ? "transport" : "protocol"
+      );
+    }
     return res;
   }
 }
@@ -354,6 +393,31 @@ export function classifyGraphqlErrors(errors: any[]): OpenSeaMintError {
  * TransactionAction carries something sendable. Anything else means the mint
  * is not actually available to this wallet, whatever the stage looked like.
  */
+/**
+ * Pull the nonce out of whatever the endpoint returns.
+ *
+ * It has been a bare string and is currently `{"nonce":"..."}`, so both are
+ * accepted. The shape is then checked rather than trusted: a nonce is short
+ * and alphanumeric, and refusing anything else is what stops a future change
+ * of shape being signed as if it were a nonce.
+ */
+export function parseNonce(body: string): string | null {
+  const raw = body.trim();
+  if (!raw) return null;
+
+  let candidate = raw;
+  if (raw.startsWith("{")) {
+    try {
+      const parsed = JSON.parse(raw);
+      candidate = String(parsed?.nonce ?? parsed?.data?.nonce ?? "");
+    } catch {
+      return null;
+    }
+  }
+  candidate = candidate.trim().replace(/^"|"$/g, "");
+  return /^[A-Za-z0-9_-]{8,128}$/.test(candidate) ? candidate : null;
+}
+
 export function decodeMintAction(data: any): MintCalldata {
   const swap = data?.swap;
   if (!swap) throw new OpenSeaMintError("No mint action was returned.", "protocol");

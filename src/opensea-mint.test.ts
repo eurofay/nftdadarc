@@ -8,6 +8,7 @@ import {
   decodeMintAction,
   classifyGraphqlErrors,
   SIWE_STATEMENT,
+  parseNonce,
 } from "./opensea-mint";
 
 const WALLET = new Wallet("0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
@@ -174,24 +175,58 @@ const withCookie = (body: string, extra: Record<string, string> = {}) => {
 };
 
 describe("login", () => {
+  const NONCE_BODY = JSON.stringify({ nonce: "noncefromserver1234567890" });
+
+  it("asks for the nonce with POST, because GET now answers 405", async () => {
+    const { impl, calls } = stubFetch([() => withCookie(NONCE_BODY), () => withCookie("{}")]);
+    await new OpenSeaMintClient({ fetchImpl: impl }).login(WALLET, 4663);
+    expect(calls[0].url).toContain("/auth/siwe/nonce");
+    expect(calls[0].init.method).toBe("POST");
+  });
+
   it("signs the nonce it was given and keeps the session", async () => {
-    const { impl, calls } = stubFetch([
-      () => withCookie('"nonce-from-server"'),
-      () => withCookie("{}"),
-    ]);
+    const { impl, calls } = stubFetch([() => withCookie(NONCE_BODY), () => withCookie("{}")]);
     const client = new OpenSeaMintClient({ fetchImpl: impl });
     await client.login(WALLET, 4663);
 
     expect(client.isAuthenticated).toBe(true);
     const verify = JSON.parse(String(calls[1].init.body));
-    expect(verify.message).toContain("nonce-from-server");
-    // The signature must recover to this wallet, or the server rejects it.
-    expect(verifyMessage(verify.message, verify.signature)).toBe(WALLET.address);
+    expect(verify.message.nonce).toBe("noncefromserver1234567890");
+    // The server rebuilds the message from the fields and checks the
+    // signature against it, so the signature must recover to this wallet from
+    // the message those fields describe.
+    const rebuilt = createSiweMessage({
+      domain: verify.message.domain,
+      address: verify.message.address,
+      uri: verify.message.uri,
+      chainId: verify.message.chainId,
+      nonce: verify.message.nonce,
+      issuedAt: verify.message.issuedAt,
+    });
+    expect(verifyMessage(rebuilt, verify.signature)).toBe(WALLET.address);
+  });
+
+  it("posts the SIWE fields as an object, not the signed string", async () => {
+    // OpenSea answers "Domain is required" to the old string form.
+    const { impl, calls } = stubFetch([() => withCookie(NONCE_BODY), () => withCookie("{}")]);
+    await new OpenSeaMintClient({ fetchImpl: impl }).login(WALLET, 4663);
+    const verify = JSON.parse(String(calls[1].init.body));
+    expect(typeof verify.message).toBe("object");
+    expect(verify.message.domain).toBe("opensea.io");
+    expect(verify.message.address).toBe(WALLET.address);
+  });
+
+  it("sends accountType Ethereum, the only value that is accepted", async () => {
+    // "EOA" is rejected: OpenSea wants the chain family, one of
+    // [Ethereum, Solana, Bitcoin].
+    const { impl, calls } = stubFetch([() => withCookie(NONCE_BODY), () => withCookie("{}")]);
+    await new OpenSeaMintClient({ fetchImpl: impl }).login(WALLET, 4663);
+    expect(JSON.parse(String(calls[1].init.body)).message.accountType).toBe("Ethereum");
   });
 
   it("sends the session cookie on later requests", async () => {
     const { impl, calls } = stubFetch([
-      () => withCookie('"n"'),
+      () => withCookie(NONCE_BODY),
       () => withCookie("{}"),
       () => new Response(JSON.stringify({ data: { dropBySlug: { stages: [] } } })),
     ]);
@@ -204,7 +239,7 @@ describe("login", () => {
 
   it("refuses when no session cookie comes back", async () => {
     const { impl } = stubFetch([
-      () => new Response('"n"'),
+      () => new Response(NONCE_BODY),
       () => new Response("{}"), // no set-cookie
     ]);
     const client = new OpenSeaMintClient({ fetchImpl: impl });
@@ -214,7 +249,7 @@ describe("login", () => {
 
   it("reports a rejected sign-in as auth, not as a transport fault", async () => {
     const { impl } = stubFetch([
-      () => withCookie('"n"'),
+      () => withCookie(NONCE_BODY),
       () => new Response("nope", { status: 403 }),
     ]);
     const client = new OpenSeaMintClient({ fetchImpl: impl });
@@ -222,9 +257,29 @@ describe("login", () => {
   });
 
   it("refuses an empty nonce instead of signing nothing", async () => {
-    const { impl } = stubFetch([() => withCookie('""')]);
+    const { impl } = stubFetch([() => withCookie('{"nonce":""}')]);
     const client = new OpenSeaMintClient({ fetchImpl: impl });
     await expect(client.login(WALLET, 4663)).rejects.toThrow(/nonce/i);
+  });
+
+  it("never signs an error body as a nonce", async () => {
+    // The regression that broke this feature in production: a 405 body was
+    // non-empty, so it passed the old check and got signed.
+    const { impl } = stubFetch([
+      () =>
+        new Response('{"error":{"message":"Method Not Allowed","code":405}}', {
+          status: 405,
+          headers: { "content-type": "application/json" },
+        }),
+    ]);
+    const client = new OpenSeaMintClient({ fetchImpl: impl });
+    await expect(client.login(WALLET, 4663)).rejects.toThrow(/405/);
+  });
+
+  it("treats any non-OK status as a failure, not as data", async () => {
+    const { impl } = stubFetch([() => new Response("gone", { status: 404 })]);
+    const client = new OpenSeaMintClient({ fetchImpl: impl });
+    await expect(client.login(WALLET, 4663)).rejects.toMatchObject({ kind: "protocol" });
   });
 });
 
@@ -362,5 +417,38 @@ describe("transport failures", () => {
     await expect(
       new OpenSeaMintClient({ fetchImpl: impl }).eligibility("s", WALLET.address)
     ).rejects.toMatchObject({ kind: "protocol" });
+  });
+});
+
+describe("parseNonce", () => {
+  it("reads the current shape", () => {
+    expect(parseNonce('{"nonce":"haghf2dscmkrpsc4pagjeidrka"}')).toBe("haghf2dscmkrpsc4pagjeidrka");
+  });
+
+  it("still reads a bare string, which is what it used to return", () => {
+    expect(parseNonce("haghf2dscmkrpsc4pagjeidrka")).toBe("haghf2dscmkrpsc4pagjeidrka");
+    expect(parseNonce('"haghf2dscmkrpsc4pagjeidrka"')).toBe("haghf2dscmkrpsc4pagjeidrka");
+  });
+
+  it("refuses an error body instead of signing it", () => {
+    // The actual bug: GET started answering 405, the JSON error body was
+    // non-empty so it passed the old check, and it went into the SIWE message
+    // as `Nonce: {"error":{"message":"Method Not Allowed"...`. That was then
+    // signed and rejected at verify with a bare 400, pointing at the wrong
+    // step entirely.
+    const body = '{"error":{"message":"Method Not Allowed","status":"METHOD_NOT_ALLOWED","code":405}}';
+    expect(parseNonce(body)).toBe(null);
+  });
+
+  it("refuses anything not shaped like a nonce", () => {
+    expect(parseNonce("")).toBe(null);
+    expect(parseNonce("   ")).toBe(null);
+    expect(parseNonce("short")).toBe(null);
+    expect(parseNonce("has spaces in it somewhere")).toBe(null);
+    expect(parseNonce("{not json")).toBe(null);
+  });
+
+  it("refuses a JSON object with no nonce in it", () => {
+    expect(parseNonce('{"data":{}}')).toBe(null);
   });
 });
