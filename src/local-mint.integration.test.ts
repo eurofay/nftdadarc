@@ -89,6 +89,71 @@ describe("localPublicSnipe (against a real mock RPC node)", () => {
     logSpy.mockRestore();
   });
 
+  describe("early fire", () => {
+    // The transaction has to ARRIVE as the stage opens. Sending at the open
+    // means arriving a flight time after it; sending a little early means
+    // arriving on it. These pin the direction and the safety margin, because
+    // the failure mode is asymmetric: late costs nothing, early reverts.
+    async function fireAt(targetMs: number, earlyFireMs: number) {
+      const sends: number[] = [];
+      mock = await startMockRpc({
+        eth_chainId: () => "0x2105",
+        eth_getTransactionCount: () => "0x0",
+        eth_sendRawTransaction: (params) => {
+          // The warm-up and measurement pings send "0x00", which is not a
+          // real transaction; only the signed one counts as the fire.
+          if (params[0] !== "0x00") sends.push(Date.now());
+          return keccak256(params[0]);
+        },
+        eth_getTransactionReceipt: () => ({
+          blockNumber: "0x64",
+          transactionIndex: "0x1",
+          gasUsed: "0x5208",
+          status: "0x1",
+        }),
+      });
+      await localPublicSnipe({
+        ...baseOpts(mock.url, basePlan()),
+        targetStart: new Date(targetMs),
+        earlyFireMs,
+      });
+      return sends;
+    }
+
+    it("sends at the stage start when it is off", async () => {
+      const logSpy = captureLogs();
+      const target = Date.now() + 600;
+      const [sentAt] = await fireAt(target, 0);
+      expect(sentAt).toBeGreaterThanOrEqual(target - 30);
+      logSpy.mockRestore();
+    });
+
+    it("sends before the stage start when a lead is set", async () => {
+      const logSpy = captureLogs();
+      const target = Date.now() + 900;
+      const [sentAt] = await fireAt(target, 200);
+      expect(sentAt).toBeLessThan(target);
+      logSpy.mockRestore();
+    });
+
+    it("never leads by more than asked, so it cannot land far early", async () => {
+      const logSpy = captureLogs();
+      const target = Date.now() + 900;
+      const [sentAt] = await fireAt(target, 200);
+      // 200ms of lead, plus scheduler slack. Well short of anything that
+      // would put the transaction in front of the stage opening.
+      expect(sentAt).toBeGreaterThan(target - 400);
+      logSpy.mockRestore();
+    });
+
+    it("still fires when the target has already passed", async () => {
+      const logSpy = captureLogs();
+      const sends = await fireAt(Date.now() - 5_000, 200);
+      expect(sends).toHaveLength(1);
+      logSpy.mockRestore();
+    });
+  });
+
   it("reports every wallet as rejected when no RPC accepts the transaction", async () => {
     const logSpy = captureLogs();
 
