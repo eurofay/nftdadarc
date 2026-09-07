@@ -32,6 +32,23 @@ export const DEFAULT_ORIGIN = "https://opensea.io";
 export const DEFAULT_GRAPHQL_URL = "https://gql.opensea.io/graphql";
 export const DEFAULT_APP_ID = "os2-web";
 
+/**
+ * A browser User-Agent, because Cloudflare answers 429 without one.
+ *
+ * Measured, and worth stating plainly because the symptom lies: a request
+ * with no User-Agent header comes back `{"detail":"Request was throttled."}`
+ * with HTTP 429 on the very first call, from an IP that has sent nothing.
+ * That reads as rate limiting and is not — the identical request one second
+ * later, with this header, answers 200. Node's fetch sends no User-Agent at
+ * all, which is what put us in that bucket.
+ *
+ * So this is not evasion or impersonation; it is sending the header every
+ * HTTP client except this one sends by default.
+ */
+export const DEFAULT_USER_AGENT =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+  "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
 /** EIP-4361 layout, field order included — the verifier is strict about it. */
 export function createSiweMessage(opts: {
   domain: string;
@@ -330,6 +347,7 @@ export class OpenSeaMintClient {
         ...init,
         headers: {
           accept: "application/json",
+          "user-agent": DEFAULT_USER_AGENT,
           origin: this.origin,
           referer: `${this.origin}/`,
           ...(this.cookies.size > 0 ? { cookie: this.cookies.header() } : {}),

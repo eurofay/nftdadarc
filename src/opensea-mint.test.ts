@@ -9,6 +9,7 @@ import {
   classifyGraphqlErrors,
   SIWE_STATEMENT,
   parseNonce,
+  DEFAULT_USER_AGENT,
 } from "./opensea-mint";
 
 const WALLET = new Wallet("0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
@@ -280,6 +281,25 @@ describe("login", () => {
     const { impl } = stubFetch([() => new Response("gone", { status: 404 })]);
     const client = new OpenSeaMintClient({ fetchImpl: impl });
     await expect(client.login(WALLET, 4663)).rejects.toMatchObject({ kind: "protocol" });
+  });
+});
+
+describe("the User-Agent header", () => {
+  it("is sent on every request", async () => {
+    // Cloudflare answers 429 "Request was throttled" to a request with no
+    // User-Agent, on the first call, from an IP that has sent nothing. That
+    // looks exactly like rate limiting and is not, which cost real time to
+    // find. Node's fetch sends no User-Agent unless told to.
+    const { impl, calls } = stubFetch([
+      () => new Response(JSON.stringify({ data: { dropBySlug: { stages: [] } } })),
+    ]);
+    await new OpenSeaMintClient({ fetchImpl: impl }).eligibility("s", WALLET.address);
+    const headers = calls[0].init.headers as Record<string, string>;
+    expect(headers["user-agent"]).toBe(DEFAULT_USER_AGENT);
+  });
+
+  it("names a browser, since that is the whole point of sending it", () => {
+    expect(DEFAULT_USER_AGENT).toMatch(/Mozilla/);
   });
 });
 
