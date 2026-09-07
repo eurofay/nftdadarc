@@ -37,6 +37,7 @@ import { gasLimitForQuantity } from "../gas";
 import { resolveMaxFee, marketFee } from "../gas-fit";
 import { parseNftLink } from "../nft-link";
 import { buildLocalMintPlan } from "../seadrop-public";
+import { simulateMint } from "../preflight";
 import { checkEligibility } from "../seadrop-stages";
 import { stageWindow, assessWallet } from "../mint-readiness";
 import { resolveSlug, isSlug } from "../slug-resolver";
@@ -538,6 +539,45 @@ export function startWebServer(deps: WebServerDeps): { close: () => void } | nul
           symbol: chain?.nativeSymbol ?? "ETH",
           wallets: rows,
         });
+        return;
+      }
+
+      // Simulate rather than send. Costs nothing, spends nothing, and on an
+      // allow-list stage armed in advance it separates "your proof is wrong"
+      // from "you are simply early" -- which at fire time look identical and
+      // by then cannot be fixed.
+      if (req.method === "POST" && route === "/api/mint/preflight") {
+        const body = await readBody(req);
+        let contract: string;
+        try {
+          contract = await resolveMintTarget(String(body.contract ?? "").trim(), settings.chainKey);
+        } catch (err: any) {
+          json(res, 400, { error: `Couldn't read that as a collection: ${err?.message ?? err}` });
+          return;
+        }
+        const quantity = Math.max(1, Math.floor(Number(body.quantity) || 1));
+        const chosen: string[] = Array.isArray(body.wallets) ? body.wallets.map(String) : [];
+        const plan = await raceReadOrNull(urls, (url) => buildLocalMintPlan(url, contract, quantity));
+        if (!plan) {
+          json(res, 404, { error: "That collection has no readable public stage on this chain." });
+          return;
+        }
+
+        const rpcUrl = readableRpcs(urls)[0];
+        const wallets = store.listWallets().filter((w) => chosen.includes(w.address));
+        const results = await Promise.all(
+          wallets.map(async (w) => {
+            const p = await simulateMint({
+              rpcUrl,
+              from: w.address,
+              to: plan.to,
+              data: plan.data,
+              value: plan.value,
+            });
+            return { address: w.address, label: w.label, ...p };
+          })
+        );
+        json(res, 200, { results });
         return;
       }
 

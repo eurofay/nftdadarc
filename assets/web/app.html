@@ -273,6 +273,7 @@ h2{font-size:20px;font-weight:700;letter-spacing:-.5px}
           <div id="mintAtWrap" hidden><div class="lbl">TIME (LOCAL)</div><input class="in" id="mintAt" type="datetime-local"></div>
         </div>
         <div style="display:flex;gap:9px;align-items:center;margin-top:16px">
+          <button class="btn q" id="mintDry">Dry run</button>
           <button class="btn" id="mintGo">Arm</button>
           <span class="note" id="mintN"></span>
         </div>
@@ -621,6 +622,30 @@ function syncWhen() {
   $("#mintGo").textContent = v === "now" ? "Fire now" : "Arm";
 }
 $("#mintWhen").addEventListener("change", syncWhen);
+
+$("#mintDry").addEventListener("click", async (e) => {
+  e.preventDefault();
+  if (!preview) return;
+  const wallets = $$("#mintWallets input[data-w]:checked").map((c) => c.dataset.w);
+  if (!wallets.length) { toast("Pick at least one wallet.", "bad"); return; }
+  const btn = $("#mintDry");
+  btn.disabled = true; btn.textContent = "Simulating…";
+  try {
+    const d = await post("/api/mint/preflight", {
+      contract: preview.contract, wallets, quantity: Number($("#mintQty").value) || 1,
+    });
+    const n = $("#mintN");
+    // "Too early" is the passing result for something armed in advance, so it
+    // is counted with the successes rather than against them.
+    const ok = d.results.filter((r) => r.wouldSucceed || r.onlyTooEarly).length;
+    n.className = ok === d.results.length ? "note ok" : "note";
+    n.textContent = d.results.map((r) =>
+      `${r.label}: ${r.wouldSucceed ? "would mint" : r.onlyTooEarly ? "armed correctly, " + r.detail : r.detail}`
+    ).join(" · ");
+    toast(`${ok}/${d.results.length} would go through.`, ok === d.results.length ? "good" : "bad");
+  } catch (err) { toast(err.message, "bad"); }
+  finally { btn.disabled = false; btn.textContent = "Dry run"; }
+});
 
 $("#mintGo").addEventListener("click", async (e) => {
   e.preventDefault();
