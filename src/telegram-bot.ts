@@ -7,6 +7,7 @@ dotenv.config({ path: path.resolve(process.cwd(), ".env") });
 
 import { createBot } from "./telegram/bot";
 import { startAlertsBot } from "./telegram/alerts-bot";
+import { startWebServer } from "./web/server";
 import { cleanToken } from "./telegram/token";
 import { UserStores } from "./telegram/user-stores";
 import { AccessControl } from "./telegram/access-control";
@@ -61,6 +62,20 @@ async function main(): Promise<void> {
   const alerts = startAlertsBot(process.env.TELEGRAM_ALERTS_BOT_TOKEN, ownerId, stores);
 
   const bot = createBot({ token, ownerId, stores, access, alerts });
+
+  // Optional web UI. Same store and engine as the bot -- the point of it is
+  // that a browser has no 90-second handler timeout, so a scan that takes
+  // minutes can just stream its progress instead of racing a clock.
+  //
+  // Silent when unconfigured, loud when misconfigured: a weak token on a door
+  // to a key store should stop the door opening, not be discovered later.
+  startWebServer({
+    stores,
+    ownerId,
+    token: process.env.WEB_ACCESS_TOKEN,
+    port: Number(process.env.PORT) || 8080,
+    secureCookies: (process.env.WEB_PUBLIC_URL ?? "").startsWith("https://"),
+  });
 
   process.once("SIGINT", () => {
     bot.stop("SIGINT");

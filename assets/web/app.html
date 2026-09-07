@@ -1,0 +1,420 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>l00p</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --void:#121A19; --ground:#1B2725; --lift:#263634;
+    --ember:#C4342A; --ember-deep:#7E1D18;
+    --flame:#F5871F; --flame-hot:#FBB040;
+    --cream:#F6EFE4; --cream-dim:#93A5A2;
+    --mint:#5FD6A4; --salmon:#F0B9B7;
+    --edge:rgba(246,239,228,.09);
+    --sans:'DM Sans',Inter,system-ui,-apple-system,sans-serif;
+    --mono:'DM Mono','SF Mono',ui-monospace,monospace;
+    --ease:cubic-bezier(.22,.61,.36,1);
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{
+    margin:0;font-family:var(--sans);color:var(--cream);
+    background:
+      radial-gradient(1200px 700px at 12% -10%, rgba(245,135,31,.10), transparent 60%),
+      radial-gradient(900px 600px at 108% 8%, rgba(196,52,42,.10), transparent 55%),
+      linear-gradient(160deg,var(--ground) 0%,var(--void) 55%,#0B100F 100%);
+    background-attachment:fixed;
+    -webkit-font-smoothing:antialiased;
+  }
+  ::selection{background:rgba(245,135,31,.28)}
+
+  /* ---------- the mark ---------- */
+  .mark{width:1em;height:1em;display:block;overflow:visible}
+  .mark path{fill:none;stroke:url(#fire);stroke-width:44;stroke-linecap:round}
+  .mark .over{stroke:url(#fireOver)}
+  .mark .gap{stroke:var(--void);stroke-width:68}
+  @keyframes trace{to{stroke-dashoffset:0}}
+  .mark.animate path:first-of-type{stroke-dasharray:1400;stroke-dashoffset:1400;animation:trace 1.4s var(--ease) forwards}
+
+  /* ---------- login ---------- */
+  .gate{min-height:100dvh;display:grid;place-items:center;padding:24px}
+  .gate-card{width:min(420px,100%);text-align:center;animation:rise .7s var(--ease) both}
+  .gate .mark{font-size:88px;margin:0 auto 26px}
+  .wordmark{font-size:44px;font-weight:700;letter-spacing:-2px;margin:0}
+  .tag{font-family:var(--mono);font-size:11px;letter-spacing:5px;color:var(--flame);margin:6px 0 34px}
+  @keyframes rise{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:none}}
+
+  input,button,textarea{font:inherit;color:inherit}
+  .field{
+    width:100%;padding:15px 17px;border-radius:14px;border:1px solid var(--edge);
+    background:rgba(0,0,0,.28);font-family:var(--mono);font-size:14px;letter-spacing:.4px;
+    transition:border-color .18s var(--ease),box-shadow .18s var(--ease),background .18s var(--ease);
+  }
+  .field:focus{outline:none;border-color:var(--flame);box-shadow:0 0 0 4px rgba(245,135,31,.13);background:rgba(0,0,0,.4)}
+  .field::placeholder{color:var(--cream-dim);opacity:.55}
+
+  .btn{
+    width:100%;margin-top:12px;padding:15px 18px;border-radius:14px;border:0;cursor:pointer;
+    font-weight:700;letter-spacing:.2px;color:#1A0F06;
+    background:linear-gradient(135deg,var(--flame-hot),var(--flame) 55%,var(--ember));
+    transition:transform .16s var(--ease),filter .16s var(--ease),box-shadow .16s var(--ease);
+    box-shadow:0 8px 26px -12px rgba(245,135,31,.75);
+  }
+  .btn:hover{transform:translateY(-1px);filter:brightness(1.06)}
+  .btn:active{transform:translateY(0) scale(.995)}
+  .btn[disabled]{opacity:.5;cursor:progress;transform:none}
+  .btn.ghost{
+    background:transparent;border:1px solid var(--edge);color:var(--cream);
+    box-shadow:none;font-weight:500;
+  }
+  .btn.ghost:hover{border-color:var(--flame);background:rgba(245,135,31,.06)}
+
+  .err{
+    margin-top:14px;font-size:13px;color:var(--salmon);min-height:19px;
+    opacity:0;transform:translateY(-4px);transition:all .2s var(--ease);
+  }
+  .err.show{opacity:1;transform:none}
+
+  /* ---------- shell ---------- */
+  .shell{display:none;min-height:100dvh;grid-template-columns:236px 1fr}
+  .shell.on{display:grid}
+  @media(max-width:820px){.shell.on{grid-template-columns:1fr}}
+
+  aside{
+    border-right:1px solid var(--edge);padding:26px 16px;
+    background:rgba(0,0,0,.18);backdrop-filter:blur(8px);
+    display:flex;flex-direction:column;gap:4px;
+  }
+  @media(max-width:820px){
+    aside{
+      flex-direction:row;overflow-x:auto;border-right:0;border-bottom:1px solid var(--edge);
+      padding:12px;position:sticky;top:0;z-index:20;
+      /* Without this the row stretches every item to its own height, and the
+         selected one becomes a tall block instead of a pill. */
+      align-items:center;
+      -webkit-overflow-scrolling:touch;scrollbar-width:none;
+    }
+    aside::-webkit-scrollbar{display:none}
+    .brand{display:none}
+  }
+  .brand{display:flex;align-items:center;gap:11px;padding:0 10px 26px}
+  .brand .mark{font-size:30px}
+  .brand b{font-size:21px;letter-spacing:-.7px}
+
+  .nav{
+    display:flex;align-items:center;gap:11px;padding:11px 13px;border-radius:11px;
+    cursor:pointer;color:var(--cream-dim);font-size:14px;font-weight:500;
+    border:1px solid transparent;white-space:nowrap;
+    transition:background .16s var(--ease),color .16s var(--ease),border-color .16s var(--ease);
+  }
+  .nav:hover{background:rgba(246,239,228,.05);color:var(--cream)}
+  .nav.on{background:rgba(245,135,31,.11);color:var(--flame-hot);border-color:rgba(245,135,31,.22)}
+  .nav .ic{width:19px;text-align:center;font-size:15px}
+
+  main{padding:34px 30px 70px;max-width:1080px;width:100%}
+  @media(max-width:820px){main{padding:22px 16px 60px}}
+
+  .head{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;margin-bottom:26px}
+  h1{font-size:29px;font-weight:700;letter-spacing:-.8px;margin:0}
+  .sub{color:var(--cream-dim);font-size:13.5px;margin:7px 0 0;line-height:1.55}
+
+  .view{display:none;animation:fade .34s var(--ease) both}
+  .view.on{display:block}
+  @keyframes fade{from{opacity:0;transform:translateY(9px)}to{opacity:1;transform:none}}
+
+  .grid{display:grid;gap:13px}
+  .cols{grid-template-columns:repeat(auto-fill,minmax(252px,1fr))}
+
+  .card{
+    border:1px solid var(--edge);border-radius:16px;padding:17px 19px;
+    background:linear-gradient(160deg,rgba(38,54,52,.5),rgba(18,26,25,.34));
+    transition:border-color .18s var(--ease),transform .18s var(--ease);
+  }
+  .card.tap{cursor:pointer}
+  .card.tap:hover{border-color:rgba(245,135,31,.34);transform:translateY(-2px)}
+  .k{font-family:var(--mono);font-size:10.5px;letter-spacing:2.4px;color:var(--cream-dim)}
+  .v{font-size:22px;font-weight:600;margin-top:7px;letter-spacing:-.4px}
+  .v.sm{font-size:15px;font-weight:500}
+  .addr{font-family:var(--mono);font-size:11.5px;color:var(--cream-dim);margin-top:5px}
+
+  .row{display:flex;align-items:center;justify-content:space-between;gap:14px;
+    padding:14px 17px;border:1px solid var(--edge);border-radius:14px;
+    background:rgba(0,0,0,.16);transition:border-color .16s var(--ease)}
+  .row:hover{border-color:rgba(246,239,228,.16)}
+
+  .pill{font-family:var(--mono);font-size:10px;letter-spacing:1.4px;padding:4px 9px;
+    border-radius:999px;border:1px solid var(--edge);color:var(--cream-dim)}
+  .pill.on{color:var(--mint);border-color:rgba(95,214,164,.34);background:rgba(95,214,164,.09)}
+  .pill.off{color:var(--salmon);border-color:rgba(240,185,183,.28)}
+
+  /* ---------- streaming progress: the reason this exists ---------- */
+  .stream{margin-top:20px;border:1px solid var(--edge);border-radius:16px;overflow:hidden;
+    background:rgba(0,0,0,.24);display:none}
+  .stream.on{display:block;animation:fade .3s var(--ease) both}
+  .bar{height:3px;background:rgba(246,239,228,.08);overflow:hidden}
+  .bar i{display:block;height:100%;width:0;border-radius:0 3px 3px 0;
+    background:linear-gradient(90deg,var(--ember),var(--flame),var(--flame-hot));
+    transition:width .35s var(--ease)}
+  .log{font-family:var(--mono);font-size:12px;line-height:1.85;padding:15px 17px;
+    max-height:320px;overflow:auto;white-space:pre-wrap;word-break:break-word}
+  .log div{animation:slip .26s var(--ease) both}
+  @keyframes slip{from{opacity:0;transform:translateX(-5px)}to{opacity:1;transform:none}}
+  .log .ok{color:var(--mint)} .log .bad{color:var(--salmon)} .log .dim{color:var(--cream-dim)}
+
+  .empty{border:1px dashed var(--edge);border-radius:16px;padding:42px 20px;text-align:center;color:var(--cream-dim)}
+  .spin{display:inline-block;width:13px;height:13px;border:2px solid rgba(246,239,228,.2);
+    border-top-color:var(--flame);border-radius:50%;animation:sp .7s linear infinite;vertical-align:-2px}
+  @keyframes sp{to{transform:rotate(360deg)}}
+  @media(prefers-reduced-motion:reduce){*{animation-duration:.01ms!important;transition-duration:.01ms!important}}
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <linearGradient id="fire" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0%" stop-color="#FBB040"/><stop offset="55%" stop-color="#F5871F"/><stop offset="100%" stop-color="#C4342A"/>
+  </linearGradient>
+  <linearGradient id="fireOver" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0%" stop-color="#FFD06A"/><stop offset="100%" stop-color="#FBB040"/>
+  </linearGradient>
+</defs></svg>
+
+<template id="markTpl">
+  <svg class="mark" viewBox="0 0 512 512" aria-hidden="true">
+    <path d="M 256,250 C 51,82 51,418 256,250 C 461,82 461,418 256,250"/>
+    <line class="gap" x1="214" y1="208" x2="298" y2="292"/>
+    <line class="over" x1="222" y1="216" x2="290" y2="284"/>
+  </svg>
+</template>
+
+<!-- ------------------------------ login ------------------------------ -->
+<section class="gate" id="gate">
+  <div class="gate-card">
+    <div id="gateMark"></div>
+    <h1 class="wordmark">l00p</h1>
+    <p class="tag">MINT BOT</p>
+    <form id="loginForm" autocomplete="off">
+      <input class="field" id="token" type="password" placeholder="access token"
+             autocomplete="current-password" spellcheck="false" required>
+      <button class="btn" id="loginBtn" type="submit">Unlock</button>
+    </form>
+    <p class="err" id="loginErr"></p>
+  </div>
+</section>
+
+<!-- ------------------------------ app ------------------------------ -->
+<div class="shell" id="shell">
+  <aside>
+    <div class="brand"><span id="navMark"></span><b>l00p</b></div>
+    <div class="nav on" data-view="overview"><span class="ic">◎</span>Overview</div>
+    <div class="nav" data-view="wallets"><span class="ic">▣</span>Wallets</div>
+    <div class="nav" data-view="find"><span class="ic">⌕</span>Find NFT</div>
+    <div class="nav" data-view="pnl"><span class="ic">◈</span>P&amp;L</div>
+    <div class="nav" data-view="sweep"><span class="ic">⇥</span>Consolidate</div>
+  </aside>
+
+  <main>
+    <!-- overview -->
+    <section class="view on" id="v-overview">
+      <div class="head"><div>
+        <h1>Overview</h1>
+        <p class="sub">Live from the same store and engine the Telegram bot uses.</p>
+      </div></div>
+      <div class="grid cols" id="stats"><div class="empty"><span class="spin"></span></div></div>
+    </section>
+
+    <!-- wallets -->
+    <section class="view" id="v-wallets">
+      <div class="head"><div>
+        <h1>Wallets</h1>
+        <p class="sub">Balances read from the chain. Private keys are never sent to this page &mdash; use Telegram for those.</p>
+      </div></div>
+      <div class="grid" id="wallets"><div class="empty"><span class="spin"></span></div></div>
+    </section>
+
+    <!-- find -->
+    <section class="view" id="v-find">
+      <div class="head"><div>
+        <h1>Find an NFT</h1>
+        <p class="sub">Paste a contract. Every wallet is checked on-chain, so it works on collections nothing has indexed.</p>
+      </div></div>
+      <form class="grid" id="findForm">
+        <input class="field" id="findCa" placeholder="0x… contract address" spellcheck="false" required>
+        <button class="btn" type="submit">Scan wallets</button>
+      </form>
+      <div class="stream" id="findStream"><div class="bar"><i></i></div><div class="log"></div></div>
+    </section>
+
+    <!-- pnl -->
+    <section class="view" id="v-pnl">
+      <div class="head"><div>
+        <h1>P&amp;L</h1>
+        <p class="sub">Holdings counted on-chain, priced against floor and best offer.</p>
+      </div></div>
+      <form class="grid" id="pnlForm">
+        <input class="field" id="pnlCa" placeholder="0x… contract address" spellcheck="false" required>
+        <button class="btn" type="submit">Calculate</button>
+      </form>
+      <div class="stream" id="pnlStream"><div class="bar"><i></i></div><div class="log"></div></div>
+    </section>
+
+    <!-- sweep -->
+    <section class="view" id="v-sweep">
+      <div class="head"><div>
+        <h1>Consolidate</h1>
+        <p class="sub">Gather a collection into one wallet. Scans can run for minutes here &mdash; there is no handler timeout to race.</p>
+      </div></div>
+      <form class="grid" id="sweepForm">
+        <input class="field" id="sweepCa" placeholder="0x… contract address" spellcheck="false" required>
+        <button class="btn" type="submit">Scan holdings</button>
+      </form>
+      <div class="stream" id="sweepStream"><div class="bar"><i></i></div><div class="log"></div></div>
+    </section>
+  </main>
+</div>
+
+<script>
+(() => {
+  const $ = (s, r = document) => r.querySelector(s);
+  const mark = () => document.importNode($("#markTpl").content, true);
+
+  const gm = mark(); gm.querySelector(".mark").classList.add("animate");
+  $("#gateMark").appendChild(gm);
+  $("#navMark").appendChild(mark());
+
+  const api = async (path, opts = {}) => {
+    const res = await fetch(path, { credentials: "same-origin", ...opts });
+    if (res.status === 401) { show(false); throw new Error("Session expired — unlock again."); }
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.error || `Request failed (${res.status})`);
+    return body;
+  };
+
+  function show(authed) {
+    $("#gate").style.display = authed ? "none" : "grid";
+    $("#shell").classList.toggle("on", authed);
+    if (authed) loadOverview();
+  }
+
+  // ---- login ----
+  $("#loginForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const btn = $("#loginBtn"), err = $("#loginErr");
+    btn.disabled = true; btn.textContent = "Checking…"; err.classList.remove("show");
+    try {
+      await api("/api/login", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ token: $("#token").value }),
+      });
+      $("#token").value = "";
+      show(true);
+    } catch (e2) {
+      err.textContent = e2.message; err.classList.add("show");
+    } finally {
+      btn.disabled = false; btn.textContent = "Unlock";
+    }
+  });
+
+  // ---- nav ----
+  document.querySelectorAll(".nav").forEach((n) =>
+    n.addEventListener("click", () => {
+      document.querySelectorAll(".nav").forEach((x) => x.classList.remove("on"));
+      document.querySelectorAll(".view").forEach((x) => x.classList.remove("on"));
+      n.classList.add("on");
+      $("#v-" + n.dataset.view).classList.add("on");
+      if (n.dataset.view === "wallets") loadWallets();
+      if (n.dataset.view === "overview") loadOverview();
+    })
+  );
+
+  const esc = (s) => String(s).replace(/[<>&"]/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;", '"': "&quot;" }[c]));
+  const mask = (a) => a.slice(0, 6) + "…" + a.slice(-4);
+
+  async function loadOverview() {
+    const el = $("#stats");
+    try {
+      const d = await api("/api/overview");
+      el.innerHTML = [
+        ["WALLETS", d.wallets],
+        ["CHAIN", d.chain],
+        ["TOTAL BALANCE", d.totalBalance + " " + d.symbol],
+        ["COPY MINT", d.copyRunning ? "running" : "stopped"],
+        ["WATCHING", d.copyTargets + " wallet(s)"],
+        ["EARLY FIRE", d.earlyFire],
+      ].map(([k, v]) => `<div class="card"><div class="k">${k}</div><div class="v">${esc(v)}</div></div>`).join("");
+    } catch (e) { el.innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
+  }
+
+  async function loadWallets() {
+    const el = $("#wallets");
+    el.innerHTML = '<div class="empty"><span class="spin"></span></div>';
+    try {
+      const d = await api("/api/wallets");
+      el.innerHTML = d.wallets.length
+        ? d.wallets.map((w) => `
+            <div class="row">
+              <div>
+                <div class="v sm">${esc(w.label)}</div>
+                <div class="addr">${esc(mask(w.address))}</div>
+              </div>
+              <div style="text-align:right">
+                <div class="v sm">${esc(w.balance)} ${esc(d.symbol)}</div>
+                <div style="margin-top:6px;display:flex;gap:6px;justify-content:flex-end">
+                  <span class="pill ${w.auto ? "on" : "off"}">AUTO</span>
+                  <span class="pill ${w.copy ? "on" : "off"}">COPY</span>
+                </div>
+              </div>
+            </div>`).join("")
+        : '<div class="empty">No wallets yet. Add them in Telegram.</div>';
+    } catch (e) { el.innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
+  }
+
+  /**
+   * Stream a long job. This is the whole point of the web UI: the server can
+   * take minutes and just keeps sending lines, with no handler timeout to beat.
+   */
+  function stream(boxSel, url, ca) {
+    const box = $(boxSel), log = $(".log", box), bar = $(".bar i", box);
+    box.classList.add("on"); log.innerHTML = ""; bar.style.width = "0%";
+    const put = (text, cls = "") => {
+      const d = document.createElement("div");
+      if (cls) d.className = cls;
+      d.textContent = text;
+      log.appendChild(d);
+      log.scrollTop = log.scrollHeight;
+    };
+    const src = new EventSource(url + "?contract=" + encodeURIComponent(ca));
+    src.addEventListener("progress", (e) => {
+      const d = JSON.parse(e.data);
+      if (typeof d.percent === "number") bar.style.width = d.percent + "%";
+      if (d.message) put(d.message, "dim");
+    });
+    src.addEventListener("line", (e) => put(JSON.parse(e.data).text));
+    src.addEventListener("done", (e) => {
+      const d = JSON.parse(e.data);
+      bar.style.width = "100%";
+      put(d.message || "Done.", "ok");
+      src.close();
+    });
+    src.addEventListener("failed", (e) => {
+      put(JSON.parse(e.data).message || "Failed.", "bad");
+      src.close();
+    });
+    src.onerror = () => { put("Connection lost.", "bad"); src.close(); };
+  }
+
+  $("#findForm").addEventListener("submit", (e) => { e.preventDefault(); stream("#findStream", "/api/stream/find", $("#findCa").value.trim()); });
+  $("#pnlForm").addEventListener("submit", (e) => { e.preventDefault(); stream("#pnlStream", "/api/stream/pnl", $("#pnlCa").value.trim()); });
+  $("#sweepForm").addEventListener("submit", (e) => { e.preventDefault(); stream("#sweepStream", "/api/stream/scan", $("#sweepCa").value.trim()); });
+
+  // Resume an existing session rather than asking again on every reload.
+  api("/api/overview").then(() => show(true)).catch(() => show(false));
+})();
+</script>
+</body>
+</html>

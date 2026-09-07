@@ -15,8 +15,9 @@ ENV NODE_ENV=production
 COPY package*.json ./
 RUN npm ci --omit=dev
 COPY --from=build /app/dist ./dist
-# Card rendering loads these at runtime; without them text falls back to a
-# serif face that isn't in the design.
+# Card rendering loads the fonts at runtime, and the web UI is served from
+# assets/web/app.html. Without this, cards fall back to a serif face that
+# isn't in the design and the web UI 500s on a missing file.
 COPY assets ./assets
 
 # Wallets live here. This MUST be a mounted volume, attached by the host —
