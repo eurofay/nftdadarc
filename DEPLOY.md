@@ -102,6 +102,67 @@ not overwrite an existing per-user store, so a repeat start is harmless.
 `WALLET_ENCRYPTION_KEY` must match the machine the store came from. A different
 key leaves the file readable but every private key in it undecryptable.
 
+## Getting closer to the sequencer
+
+The sequencer for Robinhood Chain sits in AWS `us-east-2` (Ohio). At fire time
+the bot's critical path is a single round trip — the transaction is signed
+before the wait and the socket is held warm through it — so the only remaining
+lever is how long that one round trip takes.
+
+Measured round trips to the sequencer:
+
+| From | Round trip | In flight one way |
+| --- | --- | --- |
+| Europe | ~103ms | ~52ms |
+| Railway US East | ~15ms | ~7.5ms |
+| AWS `us-east-2`, same region | ~1ms | ~0.5ms |
+
+### Read this before moving anything
+
+Early fire (Settings → Early fire → `auto`) already recovers most of the
+distance without moving hosts. It measures the round trip seconds before the
+stage opens and sends a little early, so the transaction *arrives* as the stage
+opens instead of a flight time afterwards:
+
+| Setup | Transaction arrives |
+| --- | --- |
+| Railway, early fire off | stage open + 7.5ms |
+| Railway, early fire auto | stage open + 2.5ms |
+| `us-east-2`, early fire auto | stage open + 0.5ms |
+
+So the move is worth about **2ms of arrival time**, not the 15ms it looks like
+on paper. Turn early fire on first and see whether that is enough.
+
+The better argument for moving is **jitter**, not the average. Early fire leads
+by three quarters of the measured flight time, and that quarter is margin for
+the network varying between the measurement and the send. In-region, that
+variance is far smaller, so the timing is not just faster but more predictable —
+which is what decides a contested mint.
+
+### If you do move
+
+The bot is a container with one volume, so nothing about it is Railway-specific.
+
+1. **Pick the compute.** `us-east-2` is the target region. EC2 with Docker and
+   an EBS volume is the direct route and lets you pin the availability zone.
+   App Runner has no persistent volume and is the wrong shape for this.
+2. **Copy `WALLET_ENCRYPTION_KEY` first.** Same value, exactly. A different key
+   leaves the store readable and every private key in it undecryptable — the
+   backup file will not save you.
+3. **Move the wallets** with 💾 Backup on the old host, then ♻️ Restore on the
+   new one. See *Moving an existing install* above.
+4. **Mount the volume at `/data`.** The Dockerfile sets `DATA_DIR=/data` and
+   declares no `VOLUME`; the host has to attach one. On an ephemeral filesystem
+   every redeploy destroys every stored wallet.
+5. **Run exactly one instance.** Two bots polling the same Telegram token fight
+   over updates, and two watchers on the same wallets double-mint.
+6. **Re-measure.** Settings → Status shows the RPC latency. If the number is not
+   close to 1ms you are not as near the sequencer as you think — check the
+   region and the availability zone before assuming the move worked.
+
+Keep the old deployment stopped but not deleted until the new one has fired a
+mint successfully.
+
 ## Now that other people can use it
 
 Each Telegram user gets their own isolated store, but the keys still sit on
