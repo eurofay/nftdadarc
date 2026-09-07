@@ -56,11 +56,27 @@ in the dashboard, which is the step below.
    | `OPENSEA_API_KEY` | optional; only for names, art and floors |
    | `ANTHROPIC_API_KEY` | optional; enables 🛠 Admin -> Ask the assistant |
    | `DATA_DIR` | leave unset — the image sets `/data` |
+   | `WEB_ACCESS_TOKEN` | optional; enables the web UI. See below before setting it |
+   | `WEB_PUBLIC_URL` | your Railway URL, if the web UI is on — `https://` turns on Secure cookies |
 
    Do **not** set `AUTO_WALLET_KEYS` in the cloud. It's for the local CLI's
    headless mode and would put a raw private key in a dashboard.
 
 4. Deploy. The log should say `Telegram bot running.`
+
+### If you turn the web UI on
+
+`WEB_ACCESS_TOKEN` publishes a login page, on Railway's public URL, in front
+of the same encrypted key store the bot uses. Nothing else in this deployment
+is reachable without a Telegram account id that can't be forged — this is.
+
+Generate the token with `openssl rand -hex 32`, set `WEB_PUBLIC_URL` to your
+Railway URL so cookies get `Secure`, and use it nowhere else. A weak token is
+refused at startup rather than accepted, so a failed boot here means the token,
+not the deploy. Leave `WEB_ACCESS_TOKEN` unset and no web UI is served at all.
+
+Turning it on does **not** change the one-instance rule below — the web UI
+runs inside the same process as the bot.
 
 ### Run exactly one instance
 
