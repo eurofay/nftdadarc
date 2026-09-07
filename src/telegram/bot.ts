@@ -498,9 +498,17 @@ export interface BotDeps {
    * alerts in the same thread as the menus buries the menus.
    */
   alerts?: { telegram: Telegram; username?: string } | null;
+  /**
+   * Filled in by createBot, for other surfaces to call.
+   *
+   * armScheduled arms ONE record. The web UI needs that after arming a mint
+   * from a browser -- calling rearmScheduled instead would re-run every other
+   * pending record too, firing them twice.
+   */
+  hooks?: { armScheduled?: (userId: number, id: string) => void };
 }
 
-export function createBot({ token, ownerId, stores, access, alerts }: BotDeps): Telegraf<BotContext> {
+export function createBot({ token, ownerId, stores, access, alerts, hooks }: BotDeps): Telegraf<BotContext> {
   const bot = new Telegraf<BotContext>(token);
 
   // Without this, a throw inside any handler propagates out through
@@ -3498,6 +3506,10 @@ Send the new name.`,
    * Without this a redeploy silently dropped every armed mint: the record
    * said "pending" forever and nothing was waiting on it.
    */
+  if (hooks) {
+    hooks.armScheduled = (userId, id) => void runScheduled(stores.for(userId), id, userId);
+  }
+
   function rearmScheduled(userId: number): number {
     const store = stores.for(userId);
     const pending = store.listPendingScheduled();

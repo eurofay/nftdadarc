@@ -28,7 +28,7 @@ import { UserStores } from "../telegram/user-stores";
 import { resolveRpcsForChain } from "../rpc-resolver";
 import { resolveChain, CHAINS } from "../chains";
 import { createProvider } from "../rpc-provider";
-import { readableRpcs, tryInOrder } from "../fast-read";
+import { readableRpcs, tryInOrder, raceReadOrNull } from "../fast-read";
 import { scanHoldings, holders } from "../nft-consolidate";
 import { lookupContract, isLookupFailure } from "../slug-resolver";
 import { fetchCollection, fetchStats, fetchBestCollectionOffer } from "../opensea-market";
@@ -36,6 +36,10 @@ import { computePnl, renderPnl, PnlReport } from "../pnl";
 import { gasLimitForQuantity } from "../gas";
 import { resolveMaxFee, marketFee } from "../gas-fit";
 import { parseNftLink } from "../nft-link";
+import { buildLocalMintPlan } from "../seadrop-public";
+import { checkEligibility } from "../seadrop-stages";
+import { stageWindow, assessWallet } from "../mint-readiness";
+import { resolveSlug, isSlug } from "../slug-resolver";
 import { loopNames } from "../telegram/wallet-naming";
 import { parseWalletList, describeParse, toCsv } from "../wallet-csv";
 import { parseCriteria, describeCriteria, fieldsNeeded, applyCriteria, Criteria } from "../wallet-criteria";
@@ -58,6 +62,12 @@ export interface WebServerDeps {
   port: number;
   /** True when the deployment is reachable over https, so cookies get Secure. */
   secureCookies?: boolean;
+  /**
+   * Called when the web arms a mint, so the bot picks it up without waiting
+   * for a restart. Without this the record would sit in the store until the
+   * next boot re-armed it -- correct, but no use for a drop this afternoon.
+   */
+  onScheduled?: (id: string) => void;
 }
 
 const UI_FILE = path.resolve(__dirname, "..", "..", "assets", "web", "app.html");
@@ -454,6 +464,142 @@ export function startWebServer(deps: WebServerDeps): { close: () => void } | nul
         return;
       }
 
+      // ---- minting ----
+      //
+      // These spend. You asked for them here, so the line moved -- but it
+      // moved once and deliberately, and it stopped in a different place
+      // rather than being erased:
+      //
+      //   the web MAY spend      (fire a mint, arm one for later)
+      //   the web MAY NOT read   (no key, no seed, ever leaves this process)
+      //
+      // Signing happens server-side from the encrypted store, exactly as the
+      // Telegram path does. A stolen session can therefore cost you a mint's
+      // worth of gas, and cannot cost you a wallet.
+      if (req.method === "POST" && route === "/api/mint/preview") {
+        const body = await readBody(req);
+        let contract: string;
+        try {
+          contract = await resolveMintTarget(String(body.contract ?? "").trim(), settings.chainKey);
+        } catch (err: any) {
+          json(res, 400, { error: `Couldn't read that as a collection: ${err?.message ?? err}` });
+          return;
+        }
+
+        const quantity = Math.max(1, Math.floor(Number(body.quantity) || 1));
+        const plan = await raceReadOrNull(urls, (url) => buildLocalMintPlan(url, contract, quantity));
+        if (!plan) {
+          json(res, 404, { error: "That collection has no readable public stage on this chain." });
+          return;
+        }
+
+        const window = stageWindow(plan.drop.startTime, plan.drop.endTime);
+        const info = await lookupContract(settings.chainKey, contract, process.env.OPENSEA_API_KEY);
+        const wallets = store.listWallets();
+
+        const rows = await Promise.all(
+          wallets.map(async (w) => {
+            const [balance, elig] = await Promise.all([
+              tryInOrder(readableRpcs(urls), (url) => createProvider(url).getBalance(w.address)).catch(() => null),
+              tryInOrder(urls, (url) =>
+                checkEligibility(url, contract, w.address, plan.drop.maxTotalMintableByWallet)
+              ).catch(() => null),
+            ]);
+            const r = assessWallet(w.address, {
+              balanceWei: balance,
+              mintPriceWei: plan.drop.mintPrice,
+              maxFeePerGas: BigInt(Math.round(settings.maxFeeGwei * 1e9)) || 1_000_000_000n,
+              gasLimit: settings.gasLimit,
+              maxPerWallet: plan.drop.maxTotalMintableByWallet,
+              alreadyMinted: elig?.alreadyMinted ?? 0,
+              supplyRemaining: elig?.supplyRemaining ?? Number.MAX_SAFE_INTEGER,
+              requested: quantity,
+            });
+            return {
+              address: w.address,
+              label: w.label,
+              canMint: r.canMint,
+              reason: r.reason ?? null,
+              balance: balance === null ? null : Number(formatEther(balance)).toFixed(4),
+            };
+          })
+        );
+
+        json(res, 200, {
+          contract,
+          name: isLookupFailure(info) ? null : info.name,
+          priceEth: Number(formatEther(plan.drop.mintPrice)),
+          maxPerWallet: plan.drop.maxTotalMintableByWallet,
+          startTime: plan.drop.startTime,
+          endTime: plan.drop.endTime,
+          live: window.live,
+          opensInMs: window.opensInMs,
+          ended: window.ended,
+          symbol: chain?.nativeSymbol ?? "ETH",
+          wallets: rows,
+        });
+        return;
+      }
+
+      if (req.method === "POST" && route === "/api/mint/schedule") {
+        const body = await readBody(req);
+        let contract: string;
+        try {
+          contract = await resolveMintTarget(String(body.contract ?? "").trim(), settings.chainKey);
+        } catch (err: any) {
+          json(res, 400, { error: `Couldn't read that as a collection: ${err?.message ?? err}` });
+          return;
+        }
+        const chosen = Array.isArray(body.wallets) ? body.wallets.map(String) : [];
+        if (chosen.length === 0) {
+          json(res, 400, { error: "Pick at least one wallet." });
+          return;
+        }
+        const quantity = Math.max(1, Math.floor(Number(body.quantity) || 1));
+        // "now" arms it for immediate fire; anything else must be a future
+        // moment, since arming for the past is a fire with extra steps.
+        const at = body.at === "now" ? Date.now() : Number(body.at);
+        if (!Number.isFinite(at)) {
+          json(res, 400, { error: "That is not a time." });
+          return;
+        }
+
+        const info = await lookupContract(settings.chainKey, contract, process.env.OPENSEA_API_KEY);
+        const record = store.addScheduled({
+          chainKey: settings.chainKey,
+          nftContract: contract,
+          name: isLookupFailure(info) ? undefined : info.name,
+          slug: isLookupFailure(info) ? undefined : info.slug,
+          quantity,
+          wallets: chosen,
+          targetStartMs: at,
+        });
+        deps.onScheduled?.(record.id);
+        json(res, 200, { ok: true, id: record.id, targetStartMs: record.targetStartMs });
+        return;
+      }
+
+      if (req.method === "GET" && route === "/api/scheduled") {
+        json(res, 200, {
+          armed: store.listPendingScheduled().map((r) => ({
+            id: r.id,
+            name: r.name ?? null,
+            contract: r.nftContract,
+            quantity: r.quantity,
+            wallets: r.wallets.length,
+            targetStartMs: r.targetStartMs,
+          })),
+        });
+        return;
+      }
+
+      if (req.method === "POST" && route === "/api/scheduled/cancel") {
+        const body = await readBody(req);
+        const removed = store.removeScheduled(String(body.id ?? ""));
+        json(res, 200, { ok: removed });
+        return;
+      }
+
       // ---- streaming jobs ----
       const streamRoute = /^\/api\/stream\/(find|pnl|scan|filter)$/.exec(route);
       if (req.method === "GET" && streamRoute) {
@@ -695,4 +841,19 @@ async function runFilterJob(
   } catch (err: any) {
     stream.failed(`Filter failed: ${err?.shortMessage ?? err?.message ?? err}`);
   }
+}
+
+/**
+ * Turn whatever was pasted into a contract address.
+ *
+ * The same three shapes the bot accepts: a raw address, an OpenSea link, or a
+ * bare slug. Kept here rather than imported from bot.ts because that module
+ * builds a Telegraf instance on import, which a web request has no business
+ * doing.
+ */
+async function resolveMintTarget(link: string, chainKey: string): Promise<string> {
+  const parsed = parseNftLink(link);
+  if (parsed.kind === "address") return parsed.value;
+  const info = await resolveSlug(parsed.value, process.env.OPENSEA_API_KEY, chainKey);
+  return info.contractAddress;
 }

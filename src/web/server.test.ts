@@ -24,7 +24,23 @@ const UI = fs.readFileSync(path.resolve(__dirname, "..", "..", "assets", "web", 
  * that depends on nobody adding the wrong line later is not a boundary, so it
  * is checked here instead of trusted.
  */
-describe("the web surface never exposes secrets", () => {
+describe("the web may spend, but may not read secrets", () => {
+  // The line moved once, deliberately, when minting was asked for here. It
+  // moved rather than being erased:
+  //
+  //   MAY spend    -- arm and fire a mint, which costs gas and buys tokens
+  //   MAY NOT read -- no private key or seed phrase leaves this process
+  //
+  // So a stolen session costs a mint's worth of gas and cannot cost a wallet.
+  // Signing still happens on the Telegram side: this server writes a
+  // scheduled record and hands the id over, which is why the assertions below
+  // about Wallet and localPublicSnipe still hold even though minting works.
+  it("delegates the actual signing rather than doing it here", () => {
+    expect(SERVER).toContain("addScheduled");
+    expect(SERVER).toContain("onScheduled");
+    expect(SERVER).not.toContain("signTransaction");
+  });
+
   it("never decrypts a private key", () => {
     expect(SERVER).not.toContain("getDecryptedKey");
     expect(SERVER).not.toContain("getDecryptedKeys");

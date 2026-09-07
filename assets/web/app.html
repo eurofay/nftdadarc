@@ -217,6 +217,7 @@ h2{font-size:20px;font-weight:700;letter-spacing:-.5px}
     <button class="nav" data-v="home" aria-current="page"><i class="d"></i>Overview</button>
     <button class="nav" data-v="wallets"><i class="d"></i>Wallets</button>
     <button class="nav" data-v="copy"><i class="d"></i>Copy Mint</button>
+    <button class="nav" data-v="mint"><i class="d"></i>Mint</button>
     <button class="nav" data-v="find"><i class="d"></i>Find NFT</button>
     <button class="nav" data-v="pnl"><i class="d"></i>P&amp;L</button>
     <button class="nav" data-v="sweep"><i class="d"></i>Consolidate</button>
@@ -250,6 +251,35 @@ h2{font-size:20px;font-weight:700;letter-spacing:-.5px}
         <input class="in" id="copyLabel" placeholder="label (optional)">
       </form>
       <div class="list" id="cl" style="margin-top:16px"><div class="empty">Loading…</div></div>
+    </section>
+
+    <section class="view" id="v-mint">
+      <div class="top"><div><h2>Mint</h2><p class="hint">Read the stage, pick wallets, fire now or arm it for the drop.</p></div></div>
+      <form class="form" id="mintF"><div class="pair">
+        <input class="in" id="mintCa" placeholder="0x… contract or OpenSea link" spellcheck="false" required>
+        <button class="btn" type="submit">Read stage</button>
+      </div></form>
+      <div id="mintOut" hidden>
+        <dl class="tiles" id="mintTiles" style="margin-top:16px"></dl>
+        <div class="lbl" style="margin-top:18px">WALLETS</div>
+        <div class="list" id="mintWallets"></div>
+        <div class="fields" style="margin-top:16px;max-width:520px">
+          <div><div class="lbl">QUANTITY EACH</div><input class="in" id="mintQty" type="number" min="1" value="1"></div>
+          <div><div class="lbl">WHEN</div><select class="in" id="mintWhen">
+            <option value="now">Fire now</option>
+            <option value="stage">At the stage opening</option>
+            <option value="custom">At a time I choose</option>
+          </select></div>
+          <div id="mintAtWrap" hidden><div class="lbl">TIME (LOCAL)</div><input class="in" id="mintAt" type="datetime-local"></div>
+        </div>
+        <div style="display:flex;gap:9px;align-items:center;margin-top:16px">
+          <button class="btn" id="mintGo">Arm</button>
+          <span class="note" id="mintN"></span>
+        </div>
+      </div>
+
+      <div class="lbl" style="margin-top:26px">ARMED</div>
+      <div class="list" id="armed"><div class="empty">Nothing armed.</div></div>
     </section>
 
     <section class="view" id="v-find">
@@ -379,6 +409,7 @@ function load(v) {
   if (v === "home") return loadHome();
   if (v === "wallets") return loadWallets();
   if (v === "copy") return loadCopy();
+  if (v === "mint") return loadArmed();
   if (v === "settings") return loadSettings();
 }
 
@@ -537,6 +568,116 @@ const go = (formSel, boxSel, inputSel, path) =>
 go("#findF", "#findO", "#findCa", "/api/stream/find");
 go("#pnlF", "#pnlO", "#pnlCa", "/api/stream/pnl");
 go("#swF", "#swO", "#swCa", "/api/stream/scan");
+
+// ---- mint ----
+let preview = null;
+
+$("#mintF").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const btn = e.submitter || $("#mintF button");
+  btn.disabled = true;
+  try {
+    preview = await post("/api/mint/preview", { contract: $("#mintCa").value.trim(), quantity: Number($("#mintQty").value) || 1 });
+    renderPreview();
+  } catch (err) { toast(err.message, "bad"); }
+  finally { btn.disabled = false; }
+});
+
+function renderPreview() {
+  const d = preview;
+  $("#mintOut").hidden = false;
+  const when = d.ended ? "ended" : d.live ? "live now" : `opens in ${Math.ceil(d.opensInMs / 60000)} min`;
+  $("#mintTiles").innerHTML = [
+    ["COLLECTION", d.name || d.contract.slice(0, 10) + "…"],
+    ["PRICE EACH", d.priceEth === 0 ? "free" : d.priceEth + " " + d.symbol],
+    ["MAX / WALLET", d.maxPerWallet || "—"],
+    ["STAGE", when],
+  ].map(([k, v]) => `<div class="tile"><dt>${k}</dt><dd${String(v).length > 9 ? ' class="s"' : ""}>${esc(v)}</dd></div>`).join("");
+
+  // Eligible wallets are pre-selected. Picking them one by one is the common
+  // case done the slow way, and the ineligible ones cannot be chosen at all.
+  $("#mintWallets").innerHTML = d.wallets.map((w) => `
+    <label class="item" style="cursor:${w.canMint > 0 ? "pointer" : "not-allowed"};opacity:${w.canMint > 0 ? 1 : .5}">
+      <div style="display:flex;align-items:center;gap:11px">
+        <input type="checkbox" data-w="${esc(w.address)}" ${w.canMint > 0 ? "checked" : "disabled"}>
+        <div><div class="nm">${esc(w.label)}</div><div class="ad">${esc(mask(w.address))}</div></div>
+      </div>
+      <div class="rt">
+        <span class="num">${w.balance === null ? "—" : esc(w.balance)}</span>
+        <span class="chip ${w.canMint > 0 ? "on" : ""}">${w.canMint > 0 ? "CAN MINT " + w.canMint : esc((w.reason || "no").toUpperCase().slice(0, 22))}</span>
+      </div>
+    </label>`).join("");
+
+  // "At the stage opening" only means something when there is one to wait for.
+  const sel = $("#mintWhen");
+  sel.querySelector('option[value="stage"]').disabled = d.live || d.ended || !d.startTime;
+  if (sel.value === "stage" && sel.selectedOptions[0].disabled) sel.value = d.live ? "now" : "custom";
+  syncWhen();
+}
+
+function syncWhen() {
+  const v = $("#mintWhen").value;
+  $("#mintAtWrap").hidden = v !== "custom";
+  $("#mintGo").textContent = v === "now" ? "Fire now" : "Arm";
+}
+$("#mintWhen").addEventListener("change", syncWhen);
+
+$("#mintGo").addEventListener("click", async (e) => {
+  e.preventDefault();
+  if (!preview) return;
+  const wallets = $$("#mintWallets input[data-w]:checked").map((c) => c.dataset.w);
+  if (!wallets.length) { toast("Pick at least one wallet.", "bad"); return; }
+
+  const mode = $("#mintWhen").value;
+  let at;
+  if (mode === "now") at = "now";
+  else if (mode === "stage") at = preview.startTime * 1000;
+  else {
+    const v = $("#mintAt").value;
+    if (!v) { toast("Pick a time.", "bad"); return; }
+    at = new Date(v).getTime();
+  }
+
+  const n = $("#mintN");
+  const btn = $("#mintGo");
+  btn.disabled = true;
+  try {
+    await post("/api/mint/schedule", {
+      contract: preview.contract,
+      wallets,
+      quantity: Number($("#mintQty").value) || 1,
+      at,
+    });
+    n.className = "note ok";
+    n.textContent = mode === "now" ? "Firing — watch Telegram for the result." : "Armed.";
+    toast(mode === "now" ? "Firing." : "Armed.", "good");
+    loadArmed();
+  } catch (err) { toast(err.message, "bad"); }
+  finally { btn.disabled = false; }
+});
+
+async function loadArmed() {
+  const el = $("#armed");
+  try {
+    const d = await api("/api/scheduled");
+    el.innerHTML = d.armed.length
+      ? d.armed.map((a) => `
+          <div class="item" data-id="${esc(a.id)}">
+            <div>
+              <div class="nm">${esc(a.name || mask(a.contract))}</div>
+              <div class="ad">${esc(new Date(a.targetStartMs).toLocaleString())} · ${a.wallets} wallet(s) · ×${a.quantity}</div>
+            </div>
+            <div class="rt"><button class="btn danger sm" data-cancel>Cancel</button></div>
+          </div>`).join("")
+      : '<div class="empty">Nothing armed.</div>';
+    $$("#armed [data-cancel]").forEach((b) =>
+      b.addEventListener("click", async () => {
+        try { await post("/api/scheduled/cancel", { id: b.closest(".item").dataset.id }); loadArmed(); toast("Cancelled.", "good"); }
+        catch (e) { toast(e.message, "bad"); }
+      })
+    );
+  } catch (e) { el.innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
+}
 
 // ---- filter: upload, then describe, then run ----
 let filterJob = null;

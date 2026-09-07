@@ -61,7 +61,8 @@ async function main(): Promise<void> {
   // default, in which case both stay on the main bot.
   const alerts = startAlertsBot(process.env.TELEGRAM_ALERTS_BOT_TOKEN, ownerId, stores);
 
-  const bot = createBot({ token, ownerId, stores, access, alerts });
+  const hooks: { armScheduled?: (userId: number, id: string) => void } = {};
+  const bot = createBot({ token, ownerId, stores, access, alerts, hooks });
 
   // Optional web UI. Same store and engine as the bot -- the point of it is
   // that a browser has no 90-second handler timeout, so a scan that takes
@@ -75,6 +76,8 @@ async function main(): Promise<void> {
     token: process.env.WEB_ACCESS_TOKEN,
     port: Number(process.env.PORT) || 8080,
     secureCookies: (process.env.WEB_PUBLIC_URL ?? "").startsWith("https://"),
+    // So a mint armed in a browser fires without waiting for a restart.
+    onScheduled: (id) => hooks.armScheduled?.(ownerId, id),
   });
 
   process.once("SIGINT", () => {
