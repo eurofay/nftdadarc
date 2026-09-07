@@ -26,7 +26,7 @@ import path from "path";
 import { formatEther } from "ethers";
 import { UserStores } from "../telegram/user-stores";
 import { resolveRpcsForChain } from "../rpc-resolver";
-import { resolveChain } from "../chains";
+import { resolveChain, CHAINS } from "../chains";
 import { createProvider } from "../rpc-provider";
 import { readableRpcs, tryInOrder } from "../fast-read";
 import { scanHoldings, holders } from "../nft-consolidate";
@@ -36,6 +36,10 @@ import { computePnl, renderPnl, PnlReport } from "../pnl";
 import { gasLimitForQuantity } from "../gas";
 import { resolveMaxFee, marketFee } from "../gas-fit";
 import { parseNftLink } from "../nft-link";
+import { loopNames } from "../telegram/wallet-naming";
+import { parseWalletList, describeParse, toCsv } from "../wallet-csv";
+import { parseCriteria, describeCriteria, fieldsNeeded, applyCriteria, Criteria } from "../wallet-criteria";
+import { enrichWallets, describeEta } from "../wallet-enrich";
 import {
   checkTokenStrength,
   mintSession,
@@ -96,6 +100,26 @@ async function readBody(req: IncomingMessage, limit = 8_192): Promise<any> {
     });
     req.on("error", () => resolve({}));
   });
+}
+
+/**
+ * Parsed wallet lists, held between the upload and the stream that consumes
+ * them.
+ *
+ * An event stream is a GET, and a list of fifty thousand addresses does not
+ * fit in a query string — so the upload posts the list, gets a handle back,
+ * and the stream quotes the handle. Entries expire because an abandoned
+ * upload should not pin megabytes in memory for the life of the process.
+ */
+const FILTER_JOB_TTL_MS = 30 * 60 * 1000;
+const filterJobs = new Map<string, { addresses: string[]; at: number }>();
+
+function putFilterJob(addresses: string[]): string {
+  const now = Date.now();
+  for (const [id, job] of filterJobs) if (now - job.at > FILTER_JOB_TTL_MS) filterJobs.delete(id);
+  const id = mintSession(String(now), now, 0).slice(0, 22);
+  filterJobs.set(id, { addresses, at: now });
+  return id;
 }
 
 /** An open event stream, with helpers for the shapes the page listens for. */
@@ -270,14 +294,191 @@ export function startWebServer(deps: WebServerDeps): { close: () => void } | nul
         return;
       }
 
+      // ---- settings ----
+      if (req.method === "GET" && route === "/api/settings") {
+        json(res, 200, {
+          settings: {
+            chainKey: settings.chainKey,
+            maxFeeGwei: settings.maxFeeGwei,
+            priorityGwei: settings.priorityGwei,
+            gasLimit: settings.gasLimit,
+            earlyFireMs: settings.earlyFireMs,
+            copyMintMaxPriceEth: settings.copyMintMaxPriceEth,
+            copyBackfillHours: settings.copyBackfillHours,
+          },
+          chains: CHAINS.map((c) => ({ key: c.key, name: c.name })),
+        });
+        return;
+      }
+
+      if (req.method === "POST" && route === "/api/settings") {
+        const body = await readBody(req);
+        // Allow-listed rather than spread: an open updateSettings from a web
+        // request would let anything in the body become a setting.
+        const patch: Record<string, unknown> = {};
+        const numeric = [
+          "maxFeeGwei",
+          "priorityGwei",
+          "gasLimit",
+          "earlyFireMs",
+          "copyMintMaxPriceEth",
+          "copyBackfillHours",
+        ];
+        for (const field of numeric) {
+          if (body[field] === undefined) continue;
+          const value = Number(body[field]);
+          if (!Number.isFinite(value)) {
+            json(res, 400, { error: `${field} must be a number.` });
+            return;
+          }
+          patch[field] = value;
+        }
+        if (typeof body.chainKey === "string") {
+          if (!CHAINS.some((c) => c.key === body.chainKey)) {
+            json(res, 400, { error: "Unknown chain." });
+            return;
+          }
+          patch.chainKey = body.chainKey;
+        }
+        store.updateSettings(patch as any);
+        json(res, 200, { ok: true, settings: store.getSettings() });
+        return;
+      }
+
+      // ---- wallet edits: naming and which watchers use them ----
+      // Configuration only. Nothing here can move a token or reveal a key.
+      if (req.method === "POST" && route === "/api/wallets/rename") {
+        const body = await readBody(req);
+        const renamed = store.renameWallet(String(body.address ?? ""), String(body.label ?? ""));
+        if (!renamed) {
+          json(res, 404, { error: "No such wallet." });
+          return;
+        }
+        json(res, 200, { ok: true, label: renamed.label });
+        return;
+      }
+
+      if (req.method === "POST" && route === "/api/wallets/toggle") {
+        const body = await readBody(req);
+        const feature = body.feature === "auto" ? "auto" : "copy";
+        try {
+          const updated = store.setWalletInclusion(String(body.address ?? ""), feature, Boolean(body.on));
+          json(res, 200, { ok: true, auto: updated.includeInAutoMint !== false, copy: updated.includeInCopyMint !== false });
+        } catch (err: any) {
+          json(res, 404, { error: err?.message ?? "No such wallet." });
+        }
+        return;
+      }
+
+      if (req.method === "POST" && route === "/api/wallets/rename-all") {
+        const wallets = store.listWallets();
+        const names = loopNames(wallets.map((w) => w.address));
+        let changed = 0;
+        for (const w of wallets) {
+          const name = names.get(w.address);
+          if (name && name !== w.label && store.renameWallet(w.address, name)) changed++;
+        }
+        json(res, 200, { ok: true, changed });
+        return;
+      }
+
+      // ---- copy-mint watchlist ----
+      if (req.method === "GET" && route === "/api/copy") {
+        json(res, 200, {
+          enabled: settings.copyMintEnabled,
+          targets: store.listCopyTargets().map((t) => ({ label: t.label, address: t.address })),
+        });
+        return;
+      }
+
+      if (req.method === "POST" && route === "/api/copy/add") {
+        const body = await readBody(req);
+        const address = String(body.address ?? "").trim();
+        if (!/^0x[a-fA-F0-9]{40}$/.test(address)) {
+          json(res, 400, { error: "That is not a wallet address." });
+          return;
+        }
+        try {
+          const added = store.addCopyTarget(String(body.label ?? "").trim(), address);
+          json(res, 200, { ok: true, label: added.label });
+        } catch (err: any) {
+          json(res, 409, { error: err?.message ?? "Already watched." });
+        }
+        return;
+      }
+
+      if (req.method === "POST" && route === "/api/copy/remove") {
+        const body = await readBody(req);
+        store.removeCopyTarget(String(body.address ?? ""));
+        json(res, 200, { ok: true });
+        return;
+      }
+
+      if (req.method === "POST" && route === "/api/copy/rename") {
+        const body = await readBody(req);
+        const renamed = store.renameCopyTarget(String(body.address ?? ""), String(body.label ?? ""));
+        if (!renamed) {
+          json(res, 404, { error: "That wallet is not watched." });
+          return;
+        }
+        json(res, 200, { ok: true, label: renamed.label });
+        return;
+      }
+
+      // ---- wallet filter ----
+      // Reads balances and nonces for a pasted list. Touches no wallet of
+      // yours and signs nothing; the addresses are someone else's.
+      if (req.method === "POST" && route === "/api/filter/parse") {
+        const body = await readBody(req, 24 * 1024 * 1024);
+        const parsed = parseWalletList(String(body.text ?? ""));
+        if (parsed.addresses.length === 0) {
+          json(res, 400, { error: "No wallet addresses in that file." });
+          return;
+        }
+        json(res, 200, {
+          job: putFilterJob(parsed.addresses),
+          count: parsed.addresses.length,
+          summary: describeParse(parsed),
+        });
+        return;
+      }
+
+      if (req.method === "POST" && route === "/api/filter/criteria") {
+        const body = await readBody(req);
+        const criteria = parseCriteria(String(body.text ?? ""));
+        if (!criteria) {
+          json(res, 400, { error: "I can filter on balance and transactions. Try 'more than 5 transactions'." });
+          return;
+        }
+        json(res, 200, { criteria, description: describeCriteria(criteria), fields: fieldsNeeded(criteria) });
+        return;
+      }
+
       // ---- streaming jobs ----
-      const streamRoute = /^\/api\/stream\/(find|pnl|scan)$/.exec(route);
+      const streamRoute = /^\/api\/stream\/(find|pnl|scan|filter)$/.exec(route);
       if (req.method === "GET" && streamRoute) {
         const raw = (url.searchParams.get("contract") ?? "").trim();
         const stream = new Stream(res);
         req.on("close", () => {
           /* the client went away; the job below checks stream.closed */
         });
+
+        // The filter works on a posted list rather than a contract, so it
+        // takes the other path entirely.
+        if (streamRoute[1] === "filter") {
+          const job = filterJobs.get(url.searchParams.get("job") ?? "");
+          const criteria = parseCriteria(url.searchParams.get("criteria") ?? "");
+          if (!job) {
+            stream.failed("That upload expired. Send the file again.");
+            return;
+          }
+          if (!criteria) {
+            stream.failed("I could not read that as a filter.");
+            return;
+          }
+          await runFilterJob(stream, job.addresses, criteria, urls);
+          return;
+        }
 
         let contract: string;
         try {
@@ -432,4 +633,66 @@ async function runScanJob(
     if (line.trim()) stream.line(line.replace(/\*/g, "").replace(/_/g, ""));
   }
   stream.done("P&L complete.");
+}
+
+/**
+ * Read balances and nonces for a pasted list, and report what matches.
+ *
+ * This is the job that most wanted a browser. Fifty thousand wallets is
+ * hundreds of thousands of chain reads and can run for a long time; on
+ * Telegram that meant a progress message edited every four seconds to stay
+ * inside a rate limit, and a hard ceiling that killed it anyway. Here it is
+ * just a stream that keeps talking.
+ *
+ * These addresses are someone else's. Nothing is signed and no wallet of
+ * yours is touched.
+ */
+async function runFilterJob(
+  stream: Stream,
+  addresses: string[],
+  criteria: Criteria,
+  urls: string[]
+): Promise<void> {
+  const fields = fieldsNeeded(criteria);
+  stream.line(`${addresses.length.toLocaleString()} wallet(s) · ${describeCriteria(criteria)}`);
+  stream.line(`${(addresses.length * fields.length).toLocaleString()} chain read(s) to do.`);
+
+  try {
+    const result = await enrichWallets({
+      rpcUrl: readableRpcs(urls)[0],
+      addresses,
+      fields,
+      shouldStop: () => stream.closed,
+      onProgress: (p) => {
+        if (stream.closed) return;
+        stream.progress(
+          Math.min(100, Math.round((p.done / p.total) * 100)),
+          `${p.done.toLocaleString()} of ${p.total.toLocaleString()} · ${p.rate.toFixed(0)}/sec · ${describeEta(
+            p.etaSeconds
+          )} left`
+        );
+      },
+    });
+
+    const matched = applyCriteria(result.stats, criteria);
+    const csv = toCsv(
+      matched.map((m) => ({
+        address: m.address,
+        ...(m.balance !== undefined ? { balance: m.balance } : {}),
+        ...(m.txCount !== undefined ? { transactions: m.txCount } : {}),
+      }))
+    );
+
+    stream.line("");
+    stream.line(`Matched ${matched.length.toLocaleString()} of ${addresses.length.toLocaleString()}.`);
+    if (result.unreadable.length > 0) {
+      stream.line(`${result.unreadable.length.toLocaleString()} could not be read and are excluded.`);
+    }
+    // Handed over as data rather than a file the server has to keep: the
+    // page turns it into a download without another round trip.
+    stream.send("result", { csv, matched: matched.length, total: addresses.length });
+    stream.done(result.stopped ? "Stopped early — results are what it found." : "Filter complete.");
+  } catch (err: any) {
+    stream.failed(`Filter failed: ${err?.shortMessage ?? err?.message ?? err}`);
+  }
 }

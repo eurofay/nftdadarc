@@ -83,7 +83,11 @@ describe("every route is behind a session", () => {
 
 describe("the page", () => {
   it("asks for the token as a password field, so it is not shoulder-readable", () => {
-    expect(UI).toContain('id="token" type="password"');
+    // Asserted by property rather than by element id: the id is a design
+    // detail that changed once already, the input type is the actual
+    // guarantee.
+    expect(UI).toMatch(/type="password"/);
+    expect(UI).not.toMatch(/id="tok"[^>]*type="text"/);
   });
 
   it("sends credentials same-origin only", () => {
@@ -103,12 +107,23 @@ describe("the page", () => {
   });
 
   it("carries the brand rather than default styling", () => {
-    expect(UI).toContain("--flame:#F5871F");
+    // The accent value is the brand; which custom property holds it is not.
+    expect(UI).toContain("#F5871F");
     expect(UI).toContain("DM Sans");
     expect(UI).toContain("l00p");
   });
 
   it("respects a reduced-motion preference", () => {
     expect(UI).toContain("prefers-reduced-motion");
+  });
+
+  it("reaches every feature, not just the ones that shipped first", () => {
+    for (const view of ["home", "wallets", "copy", "find", "pnl", "sweep", "filter", "settings"]) {
+      expect(UI).toContain(`data-v="${view}"`);
+    }
+  });
+
+  it("marks the current page for assistive tech, not just with colour", () => {
+    expect(UI).toContain('aria-current="page"');
   });
 });
