@@ -15,7 +15,7 @@
 // mints — so maxPriceEth is the one guardrail against blindly following it
 // into an expensive mint.
 
-import { Wallet, formatEther } from "ethers";
+import { Wallet, formatEther, parseEther } from "ethers";
 import { buildLocalMintPlan } from "./seadrop-public";
 import { raceRead, raceReadOrNull } from "./fast-read";
 import { RepeatFilter } from "./copy-mint-message";
@@ -28,6 +28,41 @@ import { backoffMs, createProvider, describeRpcError } from "./rpc-provider";
 import { ChainProfile, backfillBlocksFor, catchupBlocksFor } from "./chains";
 import { defaultLogger, Logger } from "./logger";
 
+
+/**
+ * How many this wallet may mint without going over the spend cap.
+ *
+ * THE BUG THIS REPLACES: the cap was compared against the price of ONE item,
+ * and then the mint went ahead at the drop's full per-wallet maximum. A drop
+ * priced at 0.15 of your cap passed the check and then spent twenty times it.
+ * The option was always documented as a per-wallet cap; only the check was
+ * per-item.
+ *
+ * Trimming rather than skipping, because a cap is a budget, not a filter: if
+ * six fit and twenty do not, six is what was asked for. Zero means even one
+ * is over, and that is the only case worth skipping outright.
+ *
+ * A free drop is unbounded by price, so only the drop's own limit applies --
+ * which also preserves what a cap of 0 has always meant here: free only.
+ */
+export function quantityWithinBudget(opts: {
+  unitPriceWei: bigint;
+  maxSpendWei: bigint;
+  dropMaxPerWallet: number;
+  requested?: number;
+}): { quantity: number; trimmed: boolean; affordable: number } {
+  const ceiling = Math.max(
+    0,
+    Math.min(opts.dropMaxPerWallet, opts.requested ?? opts.dropMaxPerWallet)
+  );
+  if (opts.unitPriceWei === 0n) return { quantity: ceiling, trimmed: false, affordable: ceiling };
+
+  // Integer division: a partial item cannot be minted, and rounding up would
+  // reintroduce the overspend in miniature.
+  const affordable = Number(opts.maxSpendWei / opts.unitPriceWei);
+  const quantity = Math.min(ceiling, affordable);
+  return { quantity, trimmed: quantity < ceiling, affordable };
+}
 
 export interface CopyAttemptReport {
   sourceWallet: string;
@@ -104,7 +139,11 @@ export interface CopyMintOpts {
   maxPriorityFee: bigint;
   gasLimit: number;
   pollIntervalMs: number;
-  maxPriceEth: number; // skip anything pricier than this per wallet
+  /**
+   * Total spend allowed per wallet on one copied mint -- price x quantity,
+   * not the price of a single item. 0 means free mints only.
+   */
+  maxPriceEth: number;
   quantityPerWallet?: number; // default: the drop's own max-per-wallet cap
   // Blocks to look back on startup. Defaults to the chain's 12-hour span;
   // 0 starts at the head. See backfillBlocksFor.
@@ -129,12 +168,12 @@ export async function runCopyMintWatcher(opts: CopyMintOpts): Promise<void> {
   log.title("\n── COPY-MINT WATCHER ──");
   log.info(`  Chain:    ${chain.name} (${chain.chainId})`);
   log.info(`  Watching: ${watchTargets.length} wallet(s)`);
-  log.info(`  Max price accepted: ${opts.maxPriceEth} ETH per wallet`);
+  log.info(`  Max spend accepted: ${opts.maxPriceEth} ETH per wallet, total`);
   log.warn("  Any mintPublic call from a watched wallet is copied with your own wallets. Ctrl+C to stop.\n");
   // The banner and config dump above are terminal-only now, so the chat gets
   // one line saying the watcher is up rather than nothing at all.
   log.successBold(
-    `👀 Copy Mint on — watching ${watchTargets.length} wallet(s), up to ${opts.maxPriceEth} ETH each.`
+    `👀 Copy Mint on — watching ${watchTargets.length} wallet(s), spending up to ${opts.maxPriceEth} ETH per wallet per mint.`
   );
 
   const chunkBlocks = opts.logChunkBlocks ?? DEFAULT_CHUNK_BLOCKS;
@@ -362,21 +401,39 @@ export async function runCopyMintWatcher(opts: CopyMintOpts): Promise<void> {
           await report({ sourceWallet: sighting.from, sourceTxHash: sighting.txHash, nftContract: sighting.nftContract, quantity: 0, outcome: "skipped", reason, txHashes: [] });
           continue;
         }
-        const priceEth = Number(drop.drop.mintPrice) / 1e18;
-        if (priceEth > opts.maxPriceEth) {
-          const reason = `price ${priceEth} ETH exceeds your ${opts.maxPriceEth} ETH cap`;
-          log.error(`     ✗ Skipped — ${reason}.`);
+        // The cap is a budget for the whole wallet, so it is measured
+        // against unit price x quantity -- not against one item's price with
+        // the quantity decided afterwards, which is how a 0.15-of-cap drop
+        // used to spend twenty times the cap.
+        const unitPriceWei = drop.drop.mintPrice;
+        const maxSpendWei = parseEther(String(opts.maxPriceEth));
+        const budget = quantityWithinBudget({
+          unitPriceWei,
+          maxSpendWei,
+          dropMaxPerWallet: drop.drop.maxTotalMintableByWallet,
+          requested: opts.quantityPerWallet,
+        });
+
+        if (budget.quantity < 1) {
+          const reason =
+            `${formatEther(unitPriceWei)} ETH each exceeds your ` +
+            `${opts.maxPriceEth} ETH per-wallet cap`;
+          log.error(`     x Skipped -- ${reason}.`);
           await report({ sourceWallet: sighting.from, sourceTxHash: sighting.txHash, nftContract: sighting.nftContract, quantity: 0, outcome: "skipped", reason, txHashes: [] });
           continue;
         }
 
-        // Cap at whichever is smaller — the drop's own per-wallet max, or your
-        // chosen cap. Using quantityPerWallet outright when it's above the
-        // drop's real max would revert on-chain (SeaDrop enforces that limit
-        // itself) instead of just minting what's actually available.
-        const quantity = opts.quantityPerWallet
-          ? Math.min(drop.drop.maxTotalMintableByWallet, opts.quantityPerWallet)
-          : drop.drop.maxTotalMintableByWallet;
+        const quantity = budget.quantity;
+        if (budget.trimmed) {
+          // Said out loud: silently minting fewer than the drop allows looks
+          // like a failure unless the reason is visible.
+          log.warnBold(
+            `Trimmed to ${quantity} per wallet -- ${drop.drop.maxTotalMintableByWallet} ` +
+              `at ${formatEther(unitPriceWei)} ETH would be ` +
+              `${formatEther(unitPriceWei * BigInt(drop.drop.maxTotalMintableByWallet))} ETH, ` +
+              `over your ${opts.maxPriceEth} ETH cap.`
+          );
+        }
         // Reuse the drop already fetched: only the encoded quantity differs,
         // and re-reading it was two more round trips on the critical path.
         // Fire only with wallets the chain will actually accept.
