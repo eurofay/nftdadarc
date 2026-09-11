@@ -49,9 +49,13 @@ describe("logChunkBlocksFor", () => {
   it("uses each chain's measured default", () => {
     // Robinhood's public RPC serves 10k-block ranges; Ethereum's public
     // endpoints cap around 10. A single global value cannot serve both.
-    expect(logChunkBlocksFor("robinhood", {})).toBe(2000);
-    expect(logChunkBlocksFor("ethereum", {})).toBe(10);
-    expect(logChunkBlocksFor("base", {})).toBe(10);
+    expect(logChunkBlocksFor("robinhood", {})).toBe(10_000);
+    // Measured per endpoint, not borrowed from Alchemy's free tier. At 12s
+    // blocks, the old 10 was two minutes of chain per call -- a 12-hour
+    // backfill took 359 sequential round trips and never caught up.
+    expect(logChunkBlocksFor("ethereum", {})).toBe(500);
+    expect(logChunkBlocksFor("base", {})).toBe(2000);
+    expect(logChunkBlocksFor("arbitrum", {})).toBe(10_000);
   });
 
   it("lets a global override raise every chain", () => {
@@ -69,15 +73,15 @@ describe("logChunkBlocksFor", () => {
   });
 
   it("ignores non-numeric or non-positive overrides rather than breaking scans", () => {
-    expect(logChunkBlocksFor("ethereum", { AUTO_LOG_CHUNK_BLOCKS: "abc" } as any)).toBe(10);
-    expect(logChunkBlocksFor("ethereum", { AUTO_LOG_CHUNK_BLOCKS: "0" } as any)).toBe(10);
-    expect(logChunkBlocksFor("ethereum", { AUTO_LOG_CHUNK_BLOCKS: "-5" } as any)).toBe(10);
+    expect(logChunkBlocksFor("ethereum", { AUTO_LOG_CHUNK_BLOCKS: "abc" } as any)).toBe(500);
+    expect(logChunkBlocksFor("ethereum", { AUTO_LOG_CHUNK_BLOCKS: "0" } as any)).toBe(500);
+    expect(logChunkBlocksFor("ethereum", { AUTO_LOG_CHUNK_BLOCKS: "-5" } as any)).toBe(500);
   });
 });
 
 describe("blocksForSeconds", () => {
   it("converts a time span using each chain's own block rate", () => {
-    expect(blocksForSeconds("ethereum", 3600)).toBe(297); // ~12.12s blocks
+    expect(blocksForSeconds("ethereum", 3600)).toBe(299); // ~12.05s blocks, measured
     expect(blocksForSeconds("base", 3600)).toBe(1800);    // 2s blocks
     expect(blocksForSeconds("robinhood", 3600)).toBe(36000); // 0.1s blocks
   });
@@ -117,7 +121,7 @@ describe("catchupBlocksFor", () => {
 describe("backfillBlocksFor", () => {
   it("looks back half a day by default, because drops stay open for days", () => {
     expect(backfillBlocksFor("robinhood", {} as any)).toBe(432000); // 12h at 0.1s
-    expect(backfillBlocksFor("ethereum", {} as any)).toBe(3564);
+    expect(backfillBlocksFor("ethereum", {} as any)).toBe(3585);
   });
 
   it("can be switched off entirely", () => {

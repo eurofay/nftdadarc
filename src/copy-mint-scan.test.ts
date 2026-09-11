@@ -292,7 +292,7 @@ describe("runCopyMintWatcher backfill cost", () => {
     expect(warning).toBeDefined();
     expect(warning).toContain("43200 scans");
     // Names the fix, and the fact that a global setting is what silenced the
-    // chain's own 2000.
-    expect(warning).toContain("AUTO_LOG_CHUNK_BLOCKS_ROBINHOOD=2000");
+    // chain's own 10000.
+    expect(warning).toContain("AUTO_LOG_CHUNK_BLOCKS_ROBINHOOD=10000");
   });
 });
