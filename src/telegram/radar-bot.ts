@@ -103,11 +103,63 @@ export function startRadarBot(
     return b;
   };
 
+  /** Which chains the radar watches. Falls back to the shipped default. */
+  function radarChains(store: ReturnType<UserStores["for"]>): string[] {
+    const chosen = store.getSettings().radarChainKeys;
+    if (chosen && chosen.length > 0) return chosen.filter((k) => resolveChain(k));
+    return CHAINS.filter((c) => c.key !== "avalanche").map((c) => c.key);
+  }
+
+  function chainsMenu(store: ReturnType<UserStores["for"]>) {
+    const on = new Set(radarChains(store));
+    const rows = CHAINS.map((c) => [
+      Markup.button.callback(
+        `${on.has(c.key) ? "✅" : "⬜"} ${c.name}${watchers.has(c.key) ? " · watching" : ""}`,
+        `radar:chain:${c.key}`
+      ),
+    ]);
+    rows.push([Markup.button.callback("⬅ Back", "radar:menu")]);
+    return Markup.inlineKeyboard(rows);
+  }
+
+  bot.action("radar:chains", async (ctx) => {
+    if (!owner(ctx)) return;
+    await ctx.answerCbQuery();
+    return ctx.editMessageText(
+      "Chains the radar watches.\n\n" +
+        "Watching only reads, so there is no cost to adding one — the only reason to leave a " +
+        "chain off is that it runs no drops.",
+      chainsMenu(stores.for(ownerId))
+    );
+  });
+
+  bot.action(/^radar:chain:([a-z0-9-]+)$/, async (ctx) => {
+    if (!owner(ctx)) return;
+    const key = ctx.match[1];
+    const store = stores.for(ownerId);
+    const current = new Set(radarChains(store));
+    if (current.has(key)) {
+      current.delete(key);
+      // Stop it now rather than at the next restart, or the toggle is a lie.
+      const running = watchers.get(key);
+      if (running) running.stopped = true;
+    } else {
+      current.add(key);
+    }
+    store.updateSettings({ radarChainKeys: [...current] });
+    await ctx.answerCbQuery(current.has(key) ? "Watching" : "Off");
+
+    // A chain switched on while the radar is running starts immediately.
+    if (current.has(key) && watchers.size > 0) startWatching(ctx.chat!.id);
+    return ctx.editMessageReplyMarkup(chainsMenu(store).reply_markup).catch(() => {});
+  });
+
   function menu() {
     const on = [...watchers.keys()];
     return Markup.inlineKeyboard([
       [Markup.button.callback("📡 Board", "radar:board"), Markup.button.callback("🔭 Scout", "radar:scout")],
       [Markup.button.callback("🧠 Smart wallets", "smart:list"), Markup.button.callback("⬇ Export CSV", "smart:export")],
+      [Markup.button.callback("🌐 Chains", "radar:chains")],
       [Markup.button.callback(on.length ? `⏸ Stop (${on.length})` : "▶️ Start watching", "radar:toggle")],
     ]);
   }
@@ -140,7 +192,7 @@ export function startRadarBot(
 
     const headline = verdict === "changed" ? "♻️ Stage changed" : live ? "🔴 Live now" : "📡 Incoming drop";
     const caption =
-      `${headline} — ${named?.name ?? "Unknown collection"}\n` +
+      `${headline} — ${named?.name ?? "Unknown collection"} on ${chain.name}\n` +
       `${countdown(leadMs(drop))} · ${priceLabel(drop.priceWei, chain.nativeSymbol)} · max ${drop.maxPerWallet}/wallet\n` +
       `${ready} of ${wallets.length} wallets funded\n\n` +
       `\`${drop.contract}\``;
@@ -160,9 +212,9 @@ export function startRadarBot(
 
   function startWatching(chatId: number): number {
     const store = stores.for(ownerId);
-    const keys = store.getSettings().autoChainKeys?.length
-      ? store.getSettings().autoChainKeys!
-      : [store.getSettings().chainKey];
+    // The radar's own list, not Auto Mint's. Watching is free; minting is not,
+    // so the two lists want different lengths.
+    const keys = radarChains(store);
     let started = 0;
     for (const key of keys) {
       if (watchers.has(key)) continue;
@@ -219,18 +271,35 @@ export function startRadarBot(
   bot.action("radar:board", async (ctx) => {
     if (!owner(ctx)) return;
     await ctx.answerCbQuery();
-    const lines: string[] = [];
+
+    // One board across every chain, sorted by when each opens rather than
+    // grouped by chain. A countdown answers "what is next", and that question
+    // does not care which chain the answer is on — but every row has to SAY
+    // which, or the board is unreadable the moment a second chain is watched.
+    const rows: { at: number; text: string }[] = [];
     for (const [key, board] of boards) {
       const chain = resolveChain(key);
       for (const d of board.board()) {
-        lines.push(
-          `${isLive(d) ? "🔴" : "⏳"} \`${mask(d.contract)}\` — ${countdown(leadMs(d))} · ` +
-            `${priceLabel(d.priceWei, chain?.nativeSymbol ?? "ETH")} · max ${d.maxPerWallet}`
-        );
+        rows.push({
+          at: d.startTime,
+          text:
+            `${isLive(d) ? "🔴" : "⏳"} *${chain?.name ?? key}* · \`${mask(d.contract)}\`\n` +
+            `   ${countdown(leadMs(d))} · ${priceLabel(d.priceWei, chain?.nativeSymbol ?? "ETH")}` +
+            ` · max ${d.maxPerWallet}`,
+        });
       }
     }
+    rows.sort((a, b) => a.at - b.at);
+
+    const watching = [...watchers.keys()].map((k) => resolveChain(k)?.name ?? k);
+    const header = watching.length
+      ? `📡 *Board* — watching ${watching.join(", ")}`
+      : "📡 *Board* — radar is off";
+
     return ctx.editMessageText(
-      lines.length ? `📡 *Board*\n\n${lines.join("\n")}` : "Nothing on the board yet.",
+      rows.length
+        ? `${header}\n\n${rows.map((r) => r.text).join("\n\n")}`
+        : `${header}\n\nNothing upcoming yet.`,
       { parse_mode: "Markdown", ...menu() }
     );
   });
@@ -239,6 +308,12 @@ export function startRadarBot(
     if (!owner(ctx)) return;
     await ctx.answerCbQuery("Scanning…");
     return runScout(ctx.chat!.id);
+  });
+
+  bot.action(/^scout:on:([a-z0-9-]+)$/, async (ctx) => {
+    if (!owner(ctx)) return;
+    await ctx.answerCbQuery("Scanning…");
+    return runScout(ctx.chat!.id, ctx.match[1]);
   });
 
   bot.command("scout", (ctx) => {
@@ -251,9 +326,9 @@ export function startRadarBot(
     return ctx.reply("📡 Radar:", menu());
   });
 
-  async function runScout(chatId: number) {
+  async function runScout(chatId: number, chainKey?: string) {
     const store = stores.for(ownerId);
-    const key = store.getSettings().chainKey;
+    const key = chainKey ?? store.getSettings().chainKey;
     const chain = resolveChain(key);
     if (!chain) return;
     const { urls } = resolveRpcsForChain(key);
@@ -291,6 +366,16 @@ export function startRadarBot(
           "Ranked by how early they get in, across how many drops. " +
           "_Not realised profit — that needs sale prices, which are not on-chain._"
       );
+
+      // Scouting is per chain: minters on Ink are a different population from
+      // minters on Ethereum, and averaging them would describe neither.
+      await bot.telegram.sendMessage(chatId, "Scout another chain:", {
+        ...Markup.inlineKeyboard(
+          radarChains(store)
+            .filter((k) => k !== key)
+            .map((k) => [Markup.button.callback(resolveChain(k)?.name ?? k, `scout:on:${k}`)])
+        ),
+      });
 
       for (const m of top) {
         await bot.telegram.sendMessage(

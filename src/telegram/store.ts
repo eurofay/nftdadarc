@@ -98,6 +98,16 @@ export interface BotSettings {
   // comma-list). Empty/unset means "just chainKey", so existing setups
   // don't change behavior until this is deliberately turned into a list.
   autoChainKeys?: string[];
+  /**
+   * Chains the radar watches, independent of Auto Mint's list.
+   *
+   * It borrowed autoChainKeys at first, which sounds tidy and is wrong: Auto
+   * Mint SPENDS on every chain it is given, so that list is kept deliberately
+   * short. The radar only reads and notifies, so there is no reason to watch
+   * fewer chains than actually run drops -- and borrowing meant it quietly
+   * fell back to the single current chain and looked like it only knew one.
+   */
+  radarChainKeys?: string[];
   copyMintEnabled: boolean;
   // Copy-mint isn't restricted to free drops, so this is the one guardrail
   // against blindly following a watched wallet into an expensive mint.
@@ -268,6 +278,15 @@ export function migrateGasSettings<T extends { maxFeeGwei: number; priorityGwei:
   return { settings: { ...settings, maxFeeGwei: 0, priorityGwei: 0, gasLimit: 0 }, migrated: true };
 }
 
+/**
+ * Exported for tests only.
+ *
+ * The shipped defaults carry real decisions -- which chains the radar watches,
+ * that gas figures are measured rather than hand-set -- and a test that
+ * re-declares them proves nothing about what actually ships.
+ */
+export const DEFAULT_SETTINGS_FOR_TEST = (): BotSettings => ({ ...DEFAULT_SETTINGS });
+
 const DEFAULT_SETTINGS: BotSettings = {
   chainKey: "base",
   // All three are "let the code work it out", and all three used to be
@@ -283,6 +302,11 @@ const DEFAULT_SETTINGS: BotSettings = {
   //                     the measured 33-mint model never ran.
   //
   // Zero means measure it: fee follows the chain, limit follows the quantity.
+  // The four with measured SeaDrop traffic. Avalanche is deliberately absent:
+  // SeaDrop is deployed there and nothing is using it -- 0 drops and 0 mints
+  // across a 5.9 hour sample -- so watching it is a poll loop that can never
+  // fire. Add it from the picker if that changes.
+  radarChainKeys: ["robinhood", "ethereum", "ink", "base"],
   maxFeeGwei: 0,
   priorityGwei: 0,
   gasLimit: 0,
