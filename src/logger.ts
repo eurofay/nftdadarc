@@ -29,29 +29,50 @@ function stripAnsi(s: string): string {
   return s.replace(ANSI, "");
 }
 
-export function createLogger(sink?: LogSink): Logger {
-  // `info`/`highlight` are the routine, high-volume lines (per-sighting scan
-  // output, per-field summaries) — a busy chain can produce several a
-  // minute. Forwarding those to Telegram would flood the chat and risk
-  // hitting Telegram's flood limits, so only the headline events (a mint
-  // firing, a result, a stop) get forwarded. Everything still prints
-  // locally either way.
-  const emit = (styled: string, forward = true) => {
+/**
+ * How much of a run reaches the sink.
+ *
+ * "all"       — the user pressed a button and is waiting for this. Every
+ *               result line goes, because the result IS what they asked for.
+ * "headlines" — nobody asked. A watcher fired on its own, so only the moments
+ *               worth a push notification go: a mint dispatched, a receipt, a
+ *               rejection. The running commentary stays in the terminal.
+ */
+export type ForwardLevel = "all" | "headlines";
+
+export function createLogger(sink?: LogSink, level: ForwardLevel = "all"): Logger {
+  // These same calls drive two very different places. A terminal is a running
+  // log: scrollback is free, indentation lines things up, and a banner marks
+  // where a run began. A chat is a notification feed, where twenty lines for
+  // one mint is not detail — it is noise burying the one line that mattered.
+  //
+  // Two things are suppressed no matter what. Furniture (title, and the
+  // high-volume info/highlight tiers) is meaningless on a phone: rules,
+  // banners, config dumps, per-field commentary. And under "headlines", so is
+  // everything that is not a bold tier.
+  //
+  // What is NOT suppressed by default is a result. A consolidation reports
+  // what it moved through done() and success(); silencing those would mean
+  // asking the bot to sweep 200 NFTs and being told nothing at all.
+  const headlinesOnly = level === "headlines";
+  const emit = (styled: string, tier: "furniture" | "detail" | "headline") => {
     console.log(styled);
-    if (sink && forward) sink(stripAnsi(styled));
+    if (!sink || tier === "furniture") return;
+    if (headlinesOnly && tier !== "headline") return;
+    sink(stripAnsi(styled));
   };
   return {
-    raw: (msg) => emit(msg),
-    title: (msg) => emit(chalk.bold.magenta(msg)),
-    info: (msg) => emit(chalk.gray(msg), false),
-    success: (msg) => emit(chalk.green(msg)),
-    successBold: (msg) => emit(chalk.bold.green(msg)),
-    warn: (msg) => emit(chalk.yellow(msg)),
-    warnBold: (msg) => emit(chalk.bold.yellow(msg)),
-    error: (msg) => emit(chalk.red(msg)),
-    errorBold: (msg) => emit(chalk.bold.red(msg)),
-    highlight: (msg) => emit(chalk.cyan(msg), false),
-    done: (msg) => emit(chalk.bold.white(msg)),
+    raw: (msg) => emit(msg, "detail"),
+    title: (msg) => emit(chalk.bold.magenta(msg), "furniture"),
+    info: (msg) => emit(chalk.gray(msg), "furniture"),
+    success: (msg) => emit(chalk.green(msg), "detail"),
+    successBold: (msg) => emit(chalk.bold.green(msg), "headline"),
+    warn: (msg) => emit(chalk.yellow(msg), "detail"),
+    warnBold: (msg) => emit(chalk.bold.yellow(msg), "headline"),
+    error: (msg) => emit(chalk.red(msg), "detail"),
+    errorBold: (msg) => emit(chalk.bold.red(msg), "headline"),
+    highlight: (msg) => emit(chalk.cyan(msg), "furniture"),
+    done: (msg) => emit(chalk.bold.white(msg), "detail"),
   };
 }
 

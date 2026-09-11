@@ -14,43 +14,70 @@ describe("createLogger", () => {
     expect(logSpy).toHaveBeenCalledTimes(2);
   });
 
-  it("forwards headline events (errorBold, successBold, warnBold, done, title) to the sink", () => {
+  it("forwards only the bold tiers, because a chat line is a push notification", () => {
     vi.spyOn(console, "log").mockImplementation(() => {});
     const forwarded: string[] = [];
     const log = createLogger((msg) => forwarded.push(msg));
 
-    log.title("title");
     log.successBold("success bold");
     log.warnBold("warn bold");
     log.errorBold("error bold");
-    log.done("done");
-    log.success("success");
-    log.warn("warn");
-    log.error("error");
-    log.raw("raw");
 
-    expect(forwarded).toEqual([
-      "title",
-      "success bold",
-      "warn bold",
-      "error bold",
-      "done",
-      "success",
-      "warn",
-      "error",
-      "raw",
-    ]);
+    expect(forwarded).toEqual(["success bold", "warn bold", "error bold"]);
   });
 
-  it("does not forward the high-volume info/highlight tiers to the sink", () => {
+  it("keeps terminal furniture out of the chat", () => {
     vi.spyOn(console, "log").mockImplementation(() => {});
     const forwarded: string[] = [];
     const log = createLogger((msg) => forwarded.push(msg));
 
-    log.info("routine detail");
-    log.highlight("routine sighting");
+    // Furniture is suppressed whoever is listening: a banner, a config dump
+    // and per-field commentary mean nothing on a phone. All of it still
+    // prints locally, unchanged.
+    log.title("-- COPY-MINT WATCHER --");
+    log.info("  Chain: Robinhood");
+    log.highlight("sighting");
 
     expect(forwarded).toEqual([]);
+  });
+
+  it("still prints every tier locally", () => {
+    const printed = vi.spyOn(console, "log").mockImplementation(() => {});
+    const log = createLogger(() => {});
+
+    log.title("t");
+    log.info("i");
+    log.done("d");
+
+    expect(printed).toHaveBeenCalledTimes(3);
+  });
+
+  it("keeps a requested run's results, since the result is what was asked for", () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const forwarded: string[] = [];
+    const log = createLogger((msg) => forwarded.push(msg));
+
+    // Consolidation and fund transfer report what they moved through these.
+    // Silencing them would mean asking to sweep 200 NFTs and hearing nothing.
+    log.success("moved #12");
+    log.error("#13 failed");
+    log.done("COMPLETE: 199/200 confirmed");
+
+    expect(forwarded).toEqual(["moved #12", "#13 failed", "COMPLETE: 199/200 confirmed"]);
+  });
+
+  it("drops everything but headlines for a watcher nobody asked to run", () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const forwarded: string[] = [];
+    const log = createLogger((msg) => forwarded.push(msg), "headlines");
+
+    log.success("checked a wallet");
+    log.error("skipped: price too high");
+    log.done("scan complete");
+    log.warnBold("copying a mint");
+    log.successBold("DISPATCHED 2 tx(s)");
+
+    expect(forwarded).toEqual(["copying a mint", "DISPATCHED 2 tx(s)"]);
   });
 
   it("strips ANSI color codes before forwarding to the sink", () => {
@@ -74,9 +101,9 @@ describe("withPrefix", () => {
     const base = createLogger((msg) => forwarded.push(msg));
     const log = withPrefix("robinhood", base);
 
-    log.title("watching");
+    log.warnBold("watching");
     log.errorBold("failed");
-    log.done("stopped");
+    log.successBold("stopped");
 
     expect(forwarded).toEqual(["[robinhood] watching", "[robinhood] failed", "[robinhood] stopped"]);
   });
@@ -88,6 +115,7 @@ describe("withPrefix", () => {
 
     log.info("routine");
     log.highlight("routine sighting");
+    log.title("banner");
 
     expect(forwarded).toEqual([]);
   });

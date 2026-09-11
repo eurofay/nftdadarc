@@ -225,7 +225,7 @@ export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<SnipeOutco
       if (earlyFireMs !== 0) log.info(`  ${describeEarlyFire(earlyFireMs, roundTrip, lead)}`);
       await waitForMintTime(targetStart, lead);
     } else {
-      log.warnBold("\n  🚀 Firing immediately...");
+      log.warn("\n  🚀 Firing immediately...");
     }
   } finally {
     // Stop before dispatching: a ping racing the real transaction for the

@@ -131,6 +131,11 @@ export async function runCopyMintWatcher(opts: CopyMintOpts): Promise<void> {
   log.info(`  Watching: ${watchTargets.length} wallet(s)`);
   log.info(`  Max price accepted: ${opts.maxPriceEth} ETH per wallet`);
   log.warn("  Any mintPublic call from a watched wallet is copied with your own wallets. Ctrl+C to stop.\n");
+  // The banner and config dump above are terminal-only now, so the chat gets
+  // one line saying the watcher is up rather than nothing at all.
+  log.successBold(
+    `👀 Copy Mint on — watching ${watchTargets.length} wallet(s), up to ${opts.maxPriceEth} ETH each.`
+  );
 
   const chunkBlocks = opts.logChunkBlocks ?? DEFAULT_CHUNK_BLOCKS;
 
@@ -334,10 +339,10 @@ export async function runCopyMintWatcher(opts: CopyMintOpts): Promise<void> {
         const name =
           (await opts.describeCollection?.(sighting.nftContract).catch(() => null)) ??
           sighting.nftContract;
-        log.warnBold(
-          `
-  👀 ${name} — minted by ${sighting.from.slice(0, 8)}… (block ${sighting.blockNumber}), copying`
-        );
+        // One line, no leading rule and no indent: this is the push
+        // notification for the whole sighting, and the terminal gets the
+        // detail either side of it regardless.
+        log.warnBold(`👀 ${name} — ${sighting.from.slice(0, 8)}… minted it, copying`);
 
         // Raced across every endpoint rather than pinned to rpcUrls[0]. That
         // one is chosen for scan width, which is not the same as being quick:

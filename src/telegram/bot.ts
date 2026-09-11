@@ -404,7 +404,12 @@ function createTelegramSink(bot: { telegram: Telegram }, chatId: number): LogSin
   };
 
   return (text: string) => {
-    buffer.push(text);
+    // Terminal indentation lines a log up under its heading. In a chat it
+    // just makes every line look broken, so it goes -- along with the blank
+    // spacer lines, which arrive as empty messages.
+    const line = text.replace(/^[\s]+/gm, "").trim();
+    if (!line) return;
+    buffer.push(line);
     if (buffer.length >= BATCH_MAX_LINES) {
       flush();
       return;
@@ -1470,7 +1475,7 @@ export function createBot({ token, ownerId, stores, access, alerts, hooks }: Bot
     // Alerts go to the second bot when one is configured, and to this one
     // otherwise. The chat id is the same either way: a Telegram private chat
     // is identified by the user, not by the bot.
-    const logger = withPrefix("activity", createLogger(createTelegramSink(alerts ?? bot, chatId)));
+    const logger = withPrefix("activity", createLogger(createTelegramSink(alerts ?? bot, chatId), "headlines"));
     const promise = runActivityWatcher({
       collections,
       apiKey: process.env.OPENSEA_API_KEY,
@@ -1901,7 +1906,7 @@ Send the new name.`,
     // Prefixed like the auto-mint watchers are. Without this, copy-mint's
     // output is the only unlabelled stream in the log and gets lost among
     // the [chain]-tagged auto-mint lines running alongside it.
-    const logger = withPrefix(`copy:${settings.chainKey}`, createLogger(createTelegramSink(bot, chatId)));
+    const logger = withPrefix(`copy:${settings.chainKey}`, createLogger(createTelegramSink(bot, chatId), "headlines"));
     const promise = runCopyMintWatcher({
       chain,
       rpcUrls: urls,
@@ -2127,7 +2132,7 @@ Send the new name.`,
 
       const { urls } = resolveRpcsForChain(key);
       const stopSignal = { stopped: false };
-      const logger = withPrefix(key, createLogger(createTelegramSink(bot, chatId)));
+      const logger = withPrefix(key, createLogger(createTelegramSink(bot, chatId), "headlines"));
       const promise = runAutoMintWatcher({
         chain,
         rpcUrls: urls,
