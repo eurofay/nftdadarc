@@ -6,6 +6,7 @@ const resolveFeeRecipient = vi.fn();
 const fetchAllowListRoot = vi.fn();
 const findAllowListUri = vi.fn();
 const deriveProof = vi.fn();
+const readStages = vi.fn();
 
 vi.mock("./seadrop-public", async (orig) => ({
   ...(await orig<Record<string, unknown>>()),
@@ -15,6 +16,10 @@ vi.mock("./seadrop-public", async (orig) => ({
 vi.mock("./seadrop-allowlist", async (orig) => ({
   ...(await orig<Record<string, unknown>>()),
   fetchAllowListRoot: (...a: unknown[]) => fetchAllowListRoot(...a),
+}));
+vi.mock("./seadrop-stages", async (orig) => ({
+  ...(await orig<Record<string, unknown>>()),
+  readStages: (...a: unknown[]) => readStages(...a),
 }));
 vi.mock("./allowlist-fetch", async (orig) => ({
   ...(await orig<Record<string, unknown>>()),
@@ -83,13 +88,14 @@ const LIST_JSON = JSON.stringify([
 ]);
 
 beforeEach(() => {
-  for (const m of [buildLocalMintPlan, resolveFeeRecipient, fetchAllowListRoot, findAllowListUri, deriveProof]) {
+  for (const m of [buildLocalMintPlan, resolveFeeRecipient, fetchAllowListRoot, findAllowListUri, deriveProof, readStages]) {
     m.mockReset();
   }
   buildLocalMintPlan.mockResolvedValue(null);
   fetchAllowListRoot.mockResolvedValue(null);
   findAllowListUri.mockResolvedValue(null);
   resolveFeeRecipient.mockResolvedValue({ address: FEE });
+  readStages.mockResolvedValue([{ kind: "public", present: true, mintable: true, detail: "" }]);
 });
 
 describe("source order", () => {
@@ -138,17 +144,119 @@ describe("source order", () => {
     expect(out.quantity).toBe(2); // maxTotalMintableByWallet
   });
 
-  it("stops at 'nobody is on the list' instead of asking OpenSea the same thing slower", async () => {
+  it("keeps looking when the Merkle list excludes everyone", async () => {
+    // This used to stop here. That was wrong: the Merkle list and the signed
+    // stage are different gates, and being absent from one says nothing about
+    // the other. Stopping meant a wallet holding a signature was told it
+    // could not mint.
+    readStages.mockResolvedValue([
+      { kind: "public", present: false, mintable: false, detail: "" },
+      { kind: "allowlist", present: true, mintable: false, detail: "" },
+    ]);
     fetchAllowListRoot.mockResolvedValue("0xroot");
     findAllowListUri.mockResolvedValue({ uri: "ipfs://list", block: 1 });
     deriveProof.mockReturnValue(null);
-    const signerFor = vi.fn();
+    const signerFor = vi.fn(() => new Wallet("0x" + "1".repeat(64)));
 
-    const out = (await resolveMint({ ...base, signerFor, fetchList: async () => LIST_JSON }))!;
+    // Stubbed, or this reaches the real client and the network.
+    const made = {
+      login: vi.fn(async () => {}),
+      mintCalldata: vi.fn(async () => {
+        throw new Error("not eligible");
+      }),
+    };
 
-    expect(out.plans).toHaveLength(0);
-    expect(out.skipped).toHaveLength(2);
-    expect(signerFor).not.toHaveBeenCalled();
+    await resolveMint({
+      ...base,
+      signerFor,
+      makeClient: () => made as never,
+      fetchList: async () => LIST_JSON,
+    });
+
+    expect(signerFor).toHaveBeenCalled();
+  });
+});
+
+describe("which stage gets picked", () => {
+  const gated = [
+    { kind: "public", present: true, mintable: true, detail: "", startTime: 1_800_000_000 },
+    { kind: "allowlist", present: true, mintable: false, detail: "" },
+  ];
+
+  it("does NOT hand a whitelisted wallet the public stage", async () => {
+    // The bug this exists for. A gated collection nearly always has a public
+    // stage configured as well -- later, dearer, and contested by everyone.
+    // Trying public first because it is cheapest to RESOLVE meant a wallet
+    // that was on the allow list was given public anyway, which threw away
+    // the entire reason for being on the list.
+    readStages.mockResolvedValue(gated);
+    buildLocalMintPlan.mockResolvedValue(PUBLIC_PLAN);
+    fetchAllowListRoot.mockResolvedValue("0xroot");
+    findAllowListUri.mockResolvedValue({ uri: "ipfs://list", block: 1 });
+    deriveProof.mockReturnValue({ proof: PROOF, params: PARAMS, matchesChain: true });
+
+    const out = (await resolveMint({ ...base, fetchList: async () => LIST_JSON }))!;
+
+    expect(out.source).toBe("allowlist");
+    expect(out.startTimeMs).toBe(Number(PARAMS.startTime) * 1000);
+  });
+
+  it("falls back to public, and says so, when no wallet can use the gated stage", async () => {
+    readStages.mockResolvedValue(gated);
+    buildLocalMintPlan.mockResolvedValue(PUBLIC_PLAN);
+    fetchAllowListRoot.mockResolvedValue("0xroot");
+    findAllowListUri.mockResolvedValue({ uri: "ipfs://list", block: 1 });
+    deriveProof.mockReturnValue(null);
+
+    const out = (await resolveMint({ ...base, fetchList: async () => LIST_JSON }))!;
+
+    expect(out.source).toBe("public");
+    // Never let a public result look like the only stage there was.
+    expect(out.notes.join(" ")).toContain("PUBLIC stage");
+  });
+
+  it("tries OpenSea when the Merkle list excludes a wallet, since signed stages are separate", async () => {
+    readStages.mockResolvedValue([
+      { kind: "public", present: false, mintable: false, detail: "" },
+      { kind: "signed", present: true, mintable: false, detail: "" },
+    ]);
+    fetchAllowListRoot.mockResolvedValue("0xroot");
+    findAllowListUri.mockResolvedValue({ uri: "ipfs://list", block: 1 });
+    deriveProof.mockReturnValue(null);
+    const signerFor = vi.fn(() => new Wallet("0x" + "1".repeat(64)));
+    const made = {
+      login: vi.fn(async () => {}),
+      mintCalldata: vi.fn(async () => ({ to: "0xdrop", data: "0xsigned", value: 8n })),
+    };
+
+    const out = (await resolveMint({
+      ...base,
+      signerFor,
+      makeClient: () => made as never,
+      fetchList: async () => LIST_JSON,
+    }))!;
+
+    expect(out.source).toBe("opensea");
+    expect(signerFor).toHaveBeenCalled();
+  });
+
+  it("takes the public stage first when nothing gated is configured", async () => {
+    readStages.mockResolvedValue([{ kind: "public", present: true, mintable: true, detail: "" }]);
+    buildLocalMintPlan.mockResolvedValue(PUBLIC_PLAN);
+
+    const out = (await resolveMint({ ...base }))!;
+
+    expect(out.source).toBe("public");
+    expect(fetchAllowListRoot).not.toHaveBeenCalled();
+  });
+
+  it("honours an explicit ask for the public stage", async () => {
+    readStages.mockResolvedValue(gated);
+    buildLocalMintPlan.mockResolvedValue(PUBLIC_PLAN);
+
+    const out = (await resolveMint({ ...base, prefer: "public" }))!;
+
+    expect(out.source).toBe("public");
   });
 });
 

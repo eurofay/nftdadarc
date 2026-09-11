@@ -27,6 +27,7 @@ import { LocalMintPlan, buildLocalMintPlan, resolveFeeRecipient } from "./seadro
 import { fetchAllowListRoot, encodeMintAllowList, MintParams } from "./seadrop-allowlist";
 import { findAllowListUri, fetchAllowList, parseAllowList, deriveProof, normalizeUri } from "./allowlist-fetch";
 import { OpenSeaMintClient, OpenSeaMintError } from "./opensea-mint";
+import { readStages, Stage } from "./seadrop-stages";
 
 export type MintSource = "public" | "allowlist" | "opensea";
 
@@ -71,6 +72,11 @@ export interface ResolveOpts {
   makeClient?: () => OpenSeaMintClient;
   /** Fetch a published allow list. Injectable for tests. */
   fetchList?: (uri: string) => Promise<string>;
+  /**
+   * "auto" picks the stage these wallets can actually mint, gated first.
+   * "public" forces the public stage even when a gated one would work.
+   */
+  prefer?: "auto" | "public";
 }
 
 /** First endpoint that answers, rather than the first that is listed. */
@@ -281,12 +287,55 @@ async function tryOpenSea(opts: ResolveOpts): Promise<ResolvedMint | null> {
  * rather than falling through to a slower way of being told the same thing.
  */
 export async function resolveMint(opts: ResolveOpts): Promise<ResolvedMint | null> {
-  const attempts = [tryPublic, tryAllowList, tryOpenSea];
+  const stages = (await firstAnswer(opts.rpcUrls, async (url) => readStages(url, opts.contract))) ?? [];
+  const gatedPresent = stages.some((st) => st.present && st.kind !== "public");
+
+  // ORDER MATTERS, AND GETTING IT WRONG IS EXPENSIVE.
+  //
+  // A whitelist-gated collection almost always has a public stage configured
+  // too -- it opens later, costs more, and is contested by everyone. Trying
+  // public first because it is the cheapest to RESOLVE meant a wallet that
+  // was on the allow list got handed the public stage anyway: it waited hours
+  // longer, paid the public price, and raced the whole world for it. The
+  // allow list was the entire reason for being there.
+  //
+  // So when the contract has any gated stage configured, the gated routes are
+  // tried first, and public is what is left when none of them fit.
+  const gatedFirst = gatedPresent && opts.prefer !== "public";
+  const attempts = gatedFirst ? [tryAllowList, tryOpenSea, tryPublic] : [tryPublic, tryAllowList, tryOpenSea];
+
+  // A source answering "this stage exists and none of your wallets qualify"
+  // is worth keeping -- it is the explanation if nothing else works -- but it
+  // must not stop the search. A wallet off the Merkle list may still hold a
+  // signature for the signed stage.
+  let explanation: ResolvedMint | null = null;
   for (const attempt of attempts) {
     const out = await attempt(opts);
-    if (out) return out;
+    if (!out) continue;
+    if (out.plans.length > 0) return annotate(out, stages, gatedPresent);
+    explanation ??= out;
   }
-  return null;
+  return explanation ? annotate(explanation, stages, gatedPresent) : null;
+}
+
+/**
+ * Say what else the contract has, so a public result is never mistaken for
+ * "this is the only stage there is".
+ */
+function annotate(resolved: ResolvedMint, stages: Stage[], gatedPresent: boolean): ResolvedMint {
+  const notes = [...resolved.notes];
+  if (resolved.source === "public" && gatedPresent) {
+    const kinds = stages.filter((st) => st.present && st.kind !== "public").map((st) => st.kind);
+    notes.push(
+      `Note: this collection also has a ${kinds.join(" and ")} stage, and none of your wallets could use it — ` +
+        "so this is the PUBLIC stage, at the public price and time."
+    );
+  }
+  const publicStage = stages.find((st) => st.kind === "public" && st.present);
+  if (resolved.source !== "public" && publicStage?.startTime) {
+    notes.push(`A public stage also opens later, at ${new Date(publicStage.startTime * 1000).toISOString()}.`);
+  }
+  return { ...resolved, notes };
 }
 
 /** A lookup the fire path uses, so each wallet signs its own calldata. */

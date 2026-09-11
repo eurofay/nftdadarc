@@ -36,12 +36,15 @@ export function mintOpsMenu(isAdmin = false) {
     [Markup.button.callback("⚡ Quick Mint", "menu:quick"), Markup.button.callback("⏰ Scheduled", "menu:sched")],
     [Markup.button.callback("🎯 Auto Mint", "menu:auto"), Markup.button.callback("👀 Copy Mint", "menu:copy")],
   ];
-  if (isAdmin) {
-    rows.push([
-      Markup.button.callback("⚡ FCFS / Allowlist", "menu:fcfs"),
-      Markup.button.callback("🔐 OpenSea Mint", "menu:osmint"),
-    ]);
-  }
+  // No OpenSea Mint entry, and no separate allow-list door. Both asked the
+  // operator to know in advance which kind of stage a collection uses, which
+  // is not visible from a contract address -- and the allow-list one then
+  // asked for a Merkle proof and six stage parameters as pasted JSON, which
+  // projects do not publish in any form a person can copy. Smart Mint answers
+  // the same question by trying every route itself.
+  //
+  // FCFS stays: it lists what is already armed, which is its own question.
+  if (isAdmin) rows.push([Markup.button.callback("⚡ Armed mints", "menu:fcfs")]);
   rows.push(backToMain);
   return Markup.inlineKeyboard(rows);
 }

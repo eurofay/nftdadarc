@@ -78,7 +78,11 @@ describe("nothing was lost in the regrouping", () => {
       "menu:wallets", "menu:settings", "menu:auto", "menu:copy", "menu:fund",
       "menu:sched", "menu:portfolio", "menu:activity", "menu:quick",
       "menu:consolidate", "menu:pnl", "menu:find", "menu:gas", "menu:filter",
-      "menu:status", "menu:fcfs", "menu:osmint", "menu:admin", "menu:smart",
+      "menu:status", "menu:fcfs", "menu:admin", "menu:smart",
+      // menu:osmint is deliberately gone. It asked the operator to know in
+      // advance that a collection used a signed stage, which a contract
+      // address does not tell you -- Smart Mint tries that route itself, so
+      // the separate door was a way to get the answer wrong by hand.
     ]) {
       expect(reachable.has(id), `${id} is no longer reachable from the menus`).toBe(true);
     }

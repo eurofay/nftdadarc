@@ -3395,15 +3395,18 @@ Send the new name.`,
       }
     }
 
-    ctx.session.allowlistContract = contract;
-    ctx.session.step = "awaiting_allowlist_json";
+    // No JSON fallback any more.
+    //
+    // This used to ask for the proof and all six MintParams as pasted JSON.
+    // Projects do not publish that -- not in a form anyone can copy -- so the
+    // prompt was really "you cannot do this", spelled out over eight lines.
+    // Saying so plainly, and naming the route that does work, is more use.
     return ctx.reply(
-      `Allow-list stage found (root ${root.slice(0, 14)}…).\n\n` +
-        "Send the proof and stage terms as JSON — the project publishes these:\n\n" +
-        '{"proof":["0x…","0x…"],"mintParams":{"mintPrice":"0","maxTotalMintableByWallet":2,' +
-        '"startTime":0,"endTime":0,"dropStageIndex":1,"maxTokenSupplyForStage":0,"feeBps":1000,' +
-        '"restrictFeeRecipients":true}}\n\n' +
-        "I'll verify it against that root before anything is sent."
+      `Allow-list stage found (root ${root.slice(0, 14)}...), but I could not derive a proof ` +
+        "for any wallet here: the project publishes no list on-chain for me to read." +
+        "\n\n" +
+        "Try Smart Mint with this address. It also asks OpenSea, which issues calldata " +
+        "directly for allow-list and signed stages to wallets it considers eligible."
     );
   }
 
