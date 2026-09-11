@@ -160,6 +160,23 @@ export interface ScheduledMint {
     proof?: string[];
     params: string;
   };
+  /**
+   * Ready-to-send calldata, one entry per wallet, resolved when this was
+   * armed rather than when it fires.
+   *
+   * Set for mints whose calldata cannot be derived from chain state alone —
+   * a signed stage, where only the project's key can authorise a wallet.
+   * Resolving it at arm time means the network work happens hours early
+   * instead of on the critical path, and means an ineligible wallet is known
+   * about while there is still time to do something about it.
+   *
+   * Values are decimal strings: a bigint does not survive the store's plain
+   * JSON round trip.
+   */
+  prepared?: {
+    source: string;
+    perWallet: Record<string, { to: string; data: string; value: string }>;
+  };
 }
 
 /**
@@ -168,6 +185,18 @@ export interface ScheduledMint {
  * Null means "do not send": no proof is not a slow mint, it is a guaranteed
  * revert with a real gas cost.
  */
+/**
+ * Every wallet on this record that actually has something to send.
+ *
+ * A wallet with no entry is not slow, it is a guaranteed revert with a real
+ * gas cost — so it is left out rather than given another wallet's bytes.
+ */
+export function preparedWallets(record: ScheduledMint): string[] {
+  const p = record.prepared?.perWallet;
+  if (!p) return [];
+  return record.wallets.filter((w) => p[w.toLowerCase()] !== undefined);
+}
+
 export function proofForWallet(record: ScheduledMint, address: string): string[] | null {
   const al = record.allowlist;
   if (!al) return null;

@@ -11,6 +11,7 @@ import { isAddress, formatEther, parseEther, Wallet } from "ethers";
 import { generateMnemonic, deriveWallets, isValidMnemonic } from "../hd-wallet";
 import { createProvider, describeRpcError } from "../rpc-provider";
 import { TelegramStore, WalletRecord, ScheduledMint, BotSettings, proofForWallet } from "./store";
+import { resolveMint, planLookup, describeResolved, ResolvedMint } from "../mint-resolve";
 import { UserStores } from "./user-stores";
 import { ask, BotSnapshot } from "./agent";
 import { AccessControl } from "./access-control";
@@ -28,6 +29,7 @@ import {
   quickWalletsMenu,
   quickConfirmMenu,
   osMintStagesMenu,
+  smartMenu,
   adminInvitesMenu,
   walletsMenu,
   walletDetailMenu,
@@ -126,6 +128,7 @@ interface SessionData {
     | "awaiting_quick_target"
     | "awaiting_quick_quantity"
     | "awaiting_osmint_target"
+    | "awaiting_smart_target"
     | "awaiting_agent_question"
     | "awaiting_copy_target"
     | "awaiting_fund_amount"
@@ -164,6 +167,13 @@ interface SessionData {
   sellPriceEth?: number;
   pendingRestore?: string;
   allowlistContract?: string;
+  smart?: {
+    contract: string;
+    source: string;
+    quantity: number;
+    startTimeMs: number | null;
+    plans: { address: string; to: string; data: string; value: string }[];
+  };
   osmint?: {
     contract: string;
     slug: string;
@@ -2830,6 +2840,115 @@ Send the new name.`,
   // mint, and hands back the transaction — signature or proof already inside
   // the calldata. Firing still goes through the local engine, so the speed
   // work applies here too.
+  /**
+   * Arm what Smart Mint resolved.
+   *
+   * The calldata is stored as resolved, not re-derived later: for a signed
+   * stage there is nothing on-chain to re-derive it from, and for the others
+   * re-deriving would put a list fetch on the critical path -- the opposite
+   * of the point of arming in advance.
+   */
+  bot.action("smart:arm", async (ctx) => {
+    if (!requireOwner(ctx)) return;
+    const ready = ctx.session.smart;
+    ctx.session.smart = undefined;
+    if (!ready) return ctx.answerCbQuery("That expired -- paste the address again.", { show_alert: true });
+
+    const settings = ctx.store.getSettings();
+    const info = await openseaContractInfo(settings.chainKey, ready.contract, process.env.OPENSEA_API_KEY).catch(
+      () => null
+    );
+    const perWallet: Record<string, { to: string; data: string; value: string }> = {};
+    for (const pl of ready.plans) perWallet[pl.address.toLowerCase()] = { to: pl.to, data: pl.data, value: pl.value };
+
+    const record = ctx.store.addScheduled({
+      chainKey: settings.chainKey,
+      nftContract: ready.contract,
+      name: info?.name,
+      slug: info?.slug,
+      quantity: ready.quantity,
+      wallets: ready.plans.map((pl) => pl.address),
+      // A stage already open is armed for now: waiting for a moment that has
+      // passed is a fire with extra steps.
+      targetStartMs: ready.startTimeMs && ready.startTimeMs > Date.now() ? ready.startTimeMs : Date.now(),
+      prepared: { source: ready.source, perWallet },
+    });
+
+    void runScheduled(ctx.store, record.id, ctx.chat!.id);
+    await ctx.answerCbQuery("Armed.");
+    return ctx.editMessageText(
+      `Armed: ${record.name || record.nftContract}\n\n` +
+        `${record.wallets.length} wallet(s), ${record.quantity} each, from the ${ready.source} stage.\n` +
+        "Pre-signed and sockets held warm through the wait. Survives a restart.",
+      fcfsMenu(ctx.store.listPendingScheduled())
+    );
+  });
+
+  bot.action("smart:fire", async (ctx) => {
+    if (!requireOwner(ctx)) return;
+    const ready = ctx.session.smart;
+    ctx.session.smart = undefined;
+    if (!ready) return ctx.answerCbQuery("That expired -- paste the address again.", { show_alert: true });
+
+    await ctx.answerCbQuery("Firing...");
+    const settings = ctx.store.getSettings();
+    const { urls } = resolveRpcsForChain(settings.chainKey);
+    const logger = createLogger(createTelegramSink(bot, ctx.chat!.id));
+
+    const drop = {
+      mintPrice: 0n, startTime: 0, endTime: 0,
+      maxTotalMintableByWallet: ready.quantity, feeBps: 0, restrictFeeRecipients: false,
+    };
+    const byAddress = new Map(ready.plans.map((pl) => [pl.address.toLowerCase(), pl]));
+    const planFor = (address: string) => {
+      const pl = byAddress.get(address.toLowerCase());
+      return pl ? { to: pl.to, data: pl.data, value: BigInt(pl.value), feeRecipient: pl.to, drop } : null;
+    };
+
+    const addresses = ready.plans.map((pl) => pl.address);
+    const representative = planFor(addresses[0])!;
+
+    try {
+      const outcome = await localPublicSnipe({
+        nftContract: ready.contract,
+        quantity: ready.quantity,
+        walletKeys: addresses.map((a) => ctx.store.getDecryptedKey(a)),
+        rpcUrls: urls,
+        maxFeePerGas: gweiToWei(settings.maxFeeGwei),
+        maxPriorityFee: gweiToWei(settings.priorityGwei),
+        gasLimit: settings.gasLimit,
+        earlyFireMs: settings.earlyFireMs,
+        targetStart: null,
+        plan: representative,
+        planFor,
+        logger,
+      });
+      await recordOutcome(ctx.store, settings.chainKey, outcome, {
+        bot,
+        chatId: ctx.chat!.id,
+        source: "Smart Mint",
+      });
+    } catch (err: any) {
+      logger.errorBold(`Smart Mint failed -- ${err?.message ?? err}`);
+    }
+    return undefined;
+  });
+
+  bot.action("menu:smart", (ctx) => {
+    if (!requireOwner(ctx)) return;
+    ctx.session.smart = undefined;
+    ctx.session.step = "awaiting_smart_target";
+    return ctx.editMessageText(
+      "🎯 Smart Mint\n\n" +
+        "Send a contract address. I work out the rest.\n\n" +
+        "Public, allow-list or signed -- the address does not say which, so I try " +
+        "all three, cheapest first, and check every wallet you hold against it. " +
+        "Wallets that can mint get their own calldata; wallets that cannot are " +
+        "left out rather than sent a transaction that would revert.",
+      Markup.inlineKeyboard([[Markup.button.callback("Cancel", "menu:main")]])
+    );
+  });
+
   bot.action("menu:osmint", (ctx) => {
     if (!requireOwner(ctx)) return;
     ctx.session.osmint = undefined;
@@ -3480,7 +3599,27 @@ Send the new name.`,
       // plan is built from those rather than read from the public drop.
       // Nothing is fetched at fire time: a list lookup on the critical path
       // would undo the whole point of arming it in advance.
-      const built = record.allowlist
+      // Calldata stored when this was armed wins, because nothing on-chain
+      // can rebuild it: a signed stage carries an authorisation that only the
+      // project's key can issue.
+      const preparedPlan = record.prepared
+        ? (() => {
+            const drop = {
+              mintPrice: 0n, startTime: 0, endTime: 0,
+              maxTotalMintableByWallet: record.quantity, feeBps: 0, restrictFeeRecipients: false,
+            };
+            const planFor = (address: string) => {
+              const e = record.prepared!.perWallet[address.toLowerCase()];
+              return e ? { to: e.to, data: e.data, value: BigInt(e.value), feeRecipient: e.to, drop } : null;
+            };
+            const rep = record.wallets.map(planFor).find((x) => x !== null);
+            return rep ? { plan: rep, planFor } : null;
+          })()
+        : null;
+
+      const built = preparedPlan
+        ? preparedPlan
+        : record.allowlist
         ? await buildAllowListPlan(urls, record)
         : await buildLocalMintPlan(urls[0], record.nftContract, record.quantity).then((p) =>
             p ? { plan: p, planFor: undefined } : null
@@ -3787,6 +3926,73 @@ Send the new name.`,
       if (ctx.from!.id !== ownerId) return;
       await runAsk(ctx, ctx.message.text.trim());
       return;
+    }
+
+    if (step === "awaiting_smart_target") {
+      ctx.session.step = undefined;
+      if (!requireOwner(ctx)) return;
+
+      let contract: string;
+      try {
+        contract = await resolveMintTarget(ctx.message.text.trim(), ctx.store.getSettings().chainKey);
+      } catch (err: any) {
+        return ctx.reply(`Couldn't read that as a collection: ${err?.message ?? err}`);
+      }
+
+      const settings = ctx.store.getSettings();
+      const chain = resolveChain(settings.chainKey);
+      const { urls } = resolveRpcsForChain(settings.chainKey);
+      const wallets = ctx.store.listWallets().map((w) => w.address);
+      if (wallets.length === 0) return ctx.reply("No wallets yet -- add one first.");
+
+      const note = await ctx.reply("Working out how this one mints...");
+      const say = (text: string, extra?: any) =>
+        ctx.telegram.editMessageText(note.chat.id, note.message_id, undefined, text, extra).catch(() => {});
+
+      let resolved: ResolvedMint | null;
+      try {
+        resolved = await resolveMint({
+          rpcUrls: urls,
+          chainKey: settings.chainKey,
+          chainId: chain?.chainId ?? 1,
+          contract,
+          wallets,
+          quantity: 1,
+          // Only ever used to sign OpenSea's SIWE login, which proves the
+          // address is ours and authorises no spend.
+          signerFor: (address) => new Wallet(ctx.store.getDecryptedKey(address)),
+        });
+      } catch (err: any) {
+        return say(`Couldn't resolve that mint: ${err?.message ?? err}`);
+      }
+
+      if (!resolved) {
+        return say(
+          "I could not find any stage on this contract that these wallets can mint -- " +
+            "no public drop, no allow list naming them, and OpenSea issued nothing."
+        );
+      }
+      if (resolved.plans.length === 0) return say(describeResolved(resolved, maskAddress));
+
+      ctx.session.smart = {
+        contract,
+        source: resolved.source,
+        quantity: resolved.quantity,
+        startTimeMs: resolved.startTimeMs,
+        // Bigints do not survive the session's plain-JSON shape.
+        plans: resolved.plans.map((pl) => ({
+          address: pl.address,
+          to: pl.plan.to,
+          data: pl.plan.data,
+          value: pl.plan.value.toString(),
+        })),
+      };
+
+      const opensLater = resolved.startTimeMs !== null && resolved.startTimeMs > Date.now();
+      const when = opensLater
+        ? `Opens ${toIST(new Date(resolved.startTimeMs!))} IST.`
+        : "The stage is open now.";
+      return say(`${describeResolved(resolved, maskAddress)}\n\n${when}`, smartMenu(!opensLater));
     }
 
     if (step === "awaiting_osmint_target") {

@@ -21,6 +21,7 @@ export function mainMenu(isAdmin = false) {
     [Markup.button.callback("📊 Status", "menu:status")],
   ];
   if (isAdmin) {
+    rows.push([Markup.button.callback("🎯 Smart Mint — paste a CA", "menu:smart")]);
     rows.push([Markup.button.callback("⚡ FCFS / Allowlist", "menu:fcfs")]);
     rows.push([Markup.button.callback("🔐 OpenSea Mint", "menu:osmint")]);
     rows.push([Markup.button.callback("🛠 Admin", "menu:admin")]);
@@ -537,4 +538,18 @@ export function renameAllConfirmMenu() {
       Markup.button.callback("❌ Cancel", "menu:wallets"),
     ],
   ]);
+}
+
+/**
+ * What to do with a contract Smart Mint has finished working out.
+ *
+ * Arming and firing are separate buttons because they are separate decisions:
+ * a stage that has not opened can only be armed, and one that is live is
+ * usually wanted immediately.
+ */
+export function smartMenu(canFireNow: boolean) {
+  const rows = [[Markup.button.callback("⚡ Arm for the stage", "smart:arm")]];
+  if (canFireNow) rows.unshift([Markup.button.callback("🚀 Fire now", "smart:fire")]);
+  rows.push([Markup.button.callback("← Back", "menu:main")]);
+  return Markup.inlineKeyboard(rows);
 }

@@ -27,7 +27,7 @@ export interface MintCardData {
   collection: string;
   contract: string;
   chain: string;
-  source: "Auto Mint" | "Copy Mint" | "Scheduled Mint" | "Manual Mint";
+  source: "Auto Mint" | "Copy Mint" | "Scheduled Mint" | "Manual Mint" | "Smart Mint";
   minted: number;
   wallets: number;
   pricePaidEth: number;
