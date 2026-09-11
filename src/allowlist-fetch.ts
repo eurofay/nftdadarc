@@ -67,23 +67,49 @@ export async function findAllowListUri(
   opts: { chunkBlocks?: number; maxBlocks?: number } = {}
 ): Promise<{ uri: string; block: number } | null> {
   const provider = createProvider(rpcUrl);
-  const chunk = opts.chunkBlocks ?? 10_000;
-  const maxBlocks = opts.maxBlocks ?? 2_000_000;
   const head = await provider.getBlockNumber();
-  const floor = Math.max(0, head - maxBlocks);
-
   const nftTopic = `0x${"0".repeat(24)}${getAddress(nftContract).slice(2).toLowerCase()}`;
+  const filter = { address: SEADROP_ADDRESS, topics: [ALLOWLIST_UPDATED_TOPIC, nftTopic] };
+
+  // One call for all of history, first.
+  //
+  // This used to walk backwards in 10,000-block chunks over a 2,000,000-block
+  // window, which on a 0.1s chain is 2.34 DAYS of history and 200 sequential
+  // round trips. An allow list configured a week before the drop was simply
+  // invisible, and the search took ~4.7 minutes to not find it -- well past
+  // the 90s Telegram allows a handler.
+  //
+  // Measured against this chain's public RPC: fromBlock 0 to latest over
+  // 60,459,988 blocks returns in ~1.5s. The filter is narrow (one contract,
+  // one topic, indexed collection), so the node answers it from an index
+  // rather than by scanning. The chunked walk below is kept only for nodes
+  // that refuse a range that wide.
+  try {
+    const all = await provider.getLogs({ ...filter, fromBlock: 0, toBlock: head });
+    if (all.length > 0) {
+      // Newest wins: a list can be replaced, and only the latest one matches
+      // the root the contract holds now.
+      const log = all[all.length - 1];
+      const uri = decodeAllowListUri(log.data);
+      if (uri) return { uri, block: log.blockNumber };
+    }
+    // An empty answer from a full-history query is authoritative: there is no
+    // AllowListUpdated for this collection, and walking back in chunks would
+    // only ask the same question 200 more times.
+    return null;
+  } catch {
+    // Fall through to the chunked walk.
+  }
+
+  const chunk = opts.chunkBlocks ?? 2_000;
+  const maxBlocks = opts.maxBlocks ?? head;
+  const floor = Math.max(0, head - maxBlocks);
 
   for (let to = head; to > floor; to -= chunk) {
     const from = Math.max(floor, to - chunk + 1);
     let logs;
     try {
-      logs = await provider.getLogs({
-        address: SEADROP_ADDRESS,
-        topics: [ALLOWLIST_UPDATED_TOPIC, nftTopic],
-        fromBlock: from,
-        toBlock: to,
-      });
+      logs = await provider.getLogs({ ...filter, fromBlock: from, toBlock: to });
     } catch {
       continue; // a chunk this endpoint refused; keep walking back
     }

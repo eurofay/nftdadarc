@@ -142,7 +142,44 @@ export interface ScheduledMint {
    * params is JSON with bigints as strings; they don't survive the store's
    * plain-JSON round trip. See seadrop-allowlist.MintParams.
    */
-  allowlist?: { proof: string[]; params: string };
+  allowlist?: {
+    /**
+     * Each wallet's own proof, keyed by lowercased address.
+     *
+     * Keyed rather than a single array because the Merkle leaf is
+     * keccak256(abi.encode(minter, params)) — bound to one address. A record
+     * arming five wallets needs five proofs, and lending one wallet's proof
+     * to another is an InvalidProof revert that still pays the gas.
+     */
+    proofs?: Record<string, string[]>;
+    /**
+     * The old single-proof shape, kept so records armed before proofs existed
+     * still fire. Only ever applied to a single-wallet record — see
+     * proofForWallet — because that is the only case where it is unambiguous.
+     */
+    proof?: string[];
+    params: string;
+  };
+}
+
+/**
+ * This wallet's proof from an armed allow-list record, or null.
+ *
+ * Null means "do not send": no proof is not a slow mint, it is a guaranteed
+ * revert with a real gas cost.
+ */
+export function proofForWallet(record: ScheduledMint, address: string): string[] | null {
+  const al = record.allowlist;
+  if (!al) return null;
+  const keyed = al.proofs?.[address.toLowerCase()];
+  if (keyed) return keyed;
+  // A legacy single-proof record is only unambiguous when it armed exactly
+  // one wallet and this is that wallet. Anything else and we cannot say whose
+  // proof it is, so we decline rather than guess and burn a fee.
+  if (al.proof && record.wallets.length === 1 && record.wallets[0].toLowerCase() === address.toLowerCase()) {
+    return al.proof;
+  }
+  return null;
 }
 
 /**

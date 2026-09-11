@@ -42,6 +42,19 @@ export interface LocalSnipeOpts {
    */
   earlyFireMs?: number;
   plan: LocalMintPlan;
+  /**
+   * A per-wallet plan, where the calldata is not the same for every wallet.
+   *
+   * A public mint sends identical bytes from every wallet, which is why
+   * `plan` above is a single object. An allow-list mint cannot: the Merkle
+   * leaf is keccak256(abi.encode(minter, params)), so the proof is bound to
+   * ONE address. Signing one wallet's proof from another is not a near miss,
+   * it is an InvalidProof revert that still pays gas.
+   *
+   * Returning null skips that wallet — it has no proof, so it has no mint,
+   * and sending anyway would only burn a fee.
+   */
+  planFor?: (address: string) => LocalMintPlan | null;
   logger?: Logger; // defaults to printing locally — the Telegram bot passes one that also forwards to a chat
 }
 
@@ -66,7 +79,7 @@ const MEASURE_BEFORE_MS = 5_000;
 export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<SnipeOutcome> {
   const {
     nftContract, quantity, walletKeys, rpcUrls,
-    maxFeePerGas, maxPriorityFee, gasLimit, targetStart, plan, earlyFireMs = 0,
+    maxFeePerGas, maxPriorityFee, gasLimit, targetStart, plan, planFor, earlyFireMs = 0,
   } = opts;
   const log = opts.logger ?? defaultLogger;
 
@@ -81,7 +94,11 @@ export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<SnipeOutco
   log.info(
     `  Price:         ${formatEther(plan.drop.mintPrice)} × ${quantity} = ${formatEther(plan.value)} per wallet`
   );
-  log.info(`  Calldata:      ${(plan.data.length - 2) / 2} bytes (identical for every wallet)`);
+  log.info(
+    planFor
+      ? `  Calldata:      per wallet — each carries its own proof`
+      : `  Calldata:      ${(plan.data.length - 2) / 2} bytes (identical for every wallet)`
+  );
 
   // ── Warm sockets and pre-fetch everything the signature depends on ──
   await warmConnections(rpcUrls, log);
@@ -124,11 +141,19 @@ export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<SnipeOutco
     let walletMaxFee = ceiling;
     let walletPriority = maxPriorityFee;
 
+    // Whatever this wallet is actually sending. Identical to `plan` for a
+    // public mint; its own proof and value for an allow-list one.
+    const walletPlan = planFor ? planFor(wallets[i].address) : plan;
+    if (!walletPlan) {
+      log.error(`    [W${i}] ${wallets[i].address} skipped — no proof for this wallet.`);
+      continue;
+    }
+
     const balance = balances[i];
     if (balance !== null) {
       const fit = fitFeeToBalance({
         balanceWei: balance,
-        mintValueWei: plan.value,
+        mintValueWei: walletPlan.value,
         gasLimit: effectiveGasLimit,
         configuredMaxFeeWei: ceiling,
         baseFeeWei: baseFee,
@@ -150,9 +175,9 @@ export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<SnipeOutco
     }
 
     const rawTx = await wallets[i].signTransaction({
-      to: plan.to,
-      data: plan.data,
-      value: plan.value,
+      to: walletPlan.to,
+      data: walletPlan.data,
+      value: walletPlan.value,
       nonce: nonces[i],
       maxFeePerGas: walletMaxFee,
       maxPriorityFeePerGas: walletPriority,

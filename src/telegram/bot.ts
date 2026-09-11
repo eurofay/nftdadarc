@@ -10,7 +10,7 @@ import { message } from "telegraf/filters";
 import { isAddress, formatEther, parseEther, Wallet } from "ethers";
 import { generateMnemonic, deriveWallets, isValidMnemonic } from "../hd-wallet";
 import { createProvider, describeRpcError } from "../rpc-provider";
-import { TelegramStore, WalletRecord, ScheduledMint, BotSettings } from "./store";
+import { TelegramStore, WalletRecord, ScheduledMint, BotSettings, proofForWallet } from "./store";
 import { UserStores } from "./user-stores";
 import { ask, BotSnapshot } from "./agent";
 import { AccessControl } from "./access-control";
@@ -180,7 +180,7 @@ interface SessionData {
     chosen: string[];
     quantity?: number;
   };
-  allowlistReady?: { contract: string; wallets: string[]; params: string; proof: string[]; quantity: number }; // snapshot JSON held between upload and confirm
+  allowlistReady?: { contract: string; wallets: string[]; params: string; proofs: Record<string, string[]>; quantity: number }; // snapshot JSON held between upload and confirm
 }
 interface BotContext extends Context {
   session: SessionData;
@@ -2969,7 +2969,7 @@ Send the new name.`,
         `Contract: ${record.nftContract}\n` +
         `Quantity: ${record.quantity} x ${record.wallets.length} wallet(s)\n` +
         `Fires: ${toIST(when)} IST\n` +
-        `Proof: ${record.allowlist?.proof.length ?? 0} hashes, verified against the on-chain root`,
+        `Proof: ${Object.keys(record.allowlist?.proofs ?? {}).length || (record.allowlist?.proof ? 1 : 0)} wallet proof(s), each verified against the on-chain root`,
       fcfsViewMenu(record.id)
     );
   });
@@ -3006,7 +3006,7 @@ Send the new name.`,
       quantity: ready.quantity,
       wallets: ready.wallets,
       targetStartMs,
-      allowlist: { proof: ready.proof, params: ready.params },
+      allowlist: { proofs: ready.proofs, params: ready.params },
     });
 
     void runScheduled(ctx.store, record.id, ctx.chat!.id);
@@ -3050,7 +3050,28 @@ Send the new name.`,
         return ctx.reply("Couldn't resolve an allowed fee recipient for that collection — nothing sent.");
       }
 
-      const encoded = encodeMintAllowList(ready.contract, fee.address, ready.quantity, params, ready.proof);
+      const drop = {
+        mintPrice: params.mintPrice,
+        startTime: Number(params.startTime),
+        endTime: Number(params.endTime),
+        maxTotalMintableByWallet: Number(params.maxTotalMintableByWallet),
+        feeBps: Number(params.feeBps),
+        restrictFeeRecipients: params.restrictFeeRecipients,
+      };
+
+      // One plan per wallet: the proof in the calldata names the minter, so
+      // every wallet must carry its own or it reverts and still pays.
+      const planFor = (address: string) => {
+        const proof = ready.proofs[address.toLowerCase()];
+        if (!proof) return null;
+        const e = encodeMintAllowList(ready.contract, fee.address, ready.quantity, params, proof);
+        return { to: e.to, data: e.data, value: e.value, feeRecipient: fee.address, drop };
+      };
+
+      const representative = ready.wallets.map(planFor).find((x) => x !== null);
+      if (!representative) {
+        return ctx.reply("No armed wallet has a proof for this stage — nothing sent.");
+      }
 
       // Reuse the public-mint engine: it pre-signs, keeps sockets warm and
       // blasts every endpoint in parallel. Only the calldata differs, so the
@@ -3065,20 +3086,8 @@ Send the new name.`,
         gasLimit: settings.gasLimit,
         earlyFireMs: settings.earlyFireMs,
         targetStart: null,
-        plan: {
-          to: encoded.to,
-          data: encoded.data,
-          value: encoded.value,
-          feeRecipient: fee.address,
-          drop: {
-            mintPrice: params.mintPrice,
-            startTime: Number(params.startTime),
-            endTime: Number(params.endTime),
-            maxTotalMintableByWallet: Number(params.maxTotalMintableByWallet),
-            feeBps: Number(params.feeBps),
-            restrictFeeRecipients: params.restrictFeeRecipients,
-          },
-        },
+        plan: representative,
+        planFor,
         logger,
       });
 
@@ -3120,6 +3129,9 @@ Send the new name.`,
         const lines: string[] = [];
         let ready: { wallet: string; derived: NonNullable<ReturnType<typeof deriveProof>> } | null = null;
 
+        // Every eligible wallet, not the first one. Holding nine wallets on a
+        // list and minting from one was the whole reason for having nine.
+        const eligible: { wallet: string; derived: NonNullable<ReturnType<typeof deriveProof>> }[] = [];
         for (const wallet of ctx.store.listWallets()) {
           const derived = deriveProof(entries, wallet.address, root);
           if (!derived) {
@@ -3130,19 +3142,20 @@ Send the new name.`,
             lines.push(`  ⚠️ ${maskAddress(wallet.address)} — list doesn't match the on-chain root`);
           } else {
             lines.push(`  ✅ ${maskAddress(wallet.address)} — proof derived`);
-            if (!ready) ready = { wallet: wallet.address, derived };
+            eligible.push({ wallet: wallet.address, derived });
           }
         }
+        if (eligible.length > 0) ready = eligible[0];
 
         if (ready) {
           const quantity = Number(ready.derived.params.maxTotalMintableByWallet);
           ctx.session.allowlistReady = {
             contract,
-            wallets: [ready.wallet],
+            wallets: eligible.map((e) => e.wallet),
             params: JSON.stringify(ready.derived.params, (_k, v) =>
               typeof v === "bigint" ? v.toString() : v
             ),
-            proof: ready.derived.proof,
+            proofs: Object.fromEntries(eligible.map((e) => [e.wallet.toLowerCase(), e.derived.proof])),
             quantity,
           };
           return ctx.telegram
@@ -3151,7 +3164,7 @@ Send the new name.`,
               note.message_id,
               undefined,
               `Found the list (${entries.length} entries).\n\n${lines.join("\n")}\n\n` +
-                `Mint ${quantity} from the allow-list stage?`,
+                `Mint ${quantity} from ${eligible.length} wallet(s) on the allow-list stage?`,
               fcfsArmMenu()
             )
             .catch(() => {});
@@ -3419,7 +3432,7 @@ Send the new name.`,
   async function buildAllowListPlan(
     urls: string[],
     record: ScheduledMint
-  ): Promise<LocalMintPlan | null> {
+  ): Promise<{ plan: LocalMintPlan; planFor: (address: string) => LocalMintPlan | null } | null> {
     if (!record.allowlist) return null;
     const params = revivedParams(record.allowlist.params);
     const fee = await raceRead(urls, (url) =>
@@ -3427,27 +3440,30 @@ Send the new name.`,
     );
     if (!fee) return null;
 
-    const encoded = encodeMintAllowList(
-      record.nftContract,
-      fee.address,
-      record.quantity,
-      params,
-      record.allowlist.proof
-    );
-    return {
-      to: encoded.to,
-      data: encoded.data,
-      value: encoded.value,
-      feeRecipient: fee.address,
-      drop: {
-        mintPrice: params.mintPrice,
-        startTime: Number(params.startTime),
-        endTime: Number(params.endTime),
-        maxTotalMintableByWallet: Number(params.maxTotalMintableByWallet),
-        feeBps: Number(params.feeBps),
-        restrictFeeRecipients: params.restrictFeeRecipients,
-      },
+    const drop = {
+      mintPrice: params.mintPrice,
+      startTime: Number(params.startTime),
+      endTime: Number(params.endTime),
+      maxTotalMintableByWallet: Number(params.maxTotalMintableByWallet),
+      feeBps: Number(params.feeBps),
+      restrictFeeRecipients: params.restrictFeeRecipients,
     };
+
+    // One plan per wallet, because one proof per wallet. The engine signs
+    // whatever this returns for a given address; null means that wallet has
+    // no proof and must not send.
+    const planFor = (address: string): LocalMintPlan | null => {
+      const proof = proofForWallet(record, address);
+      if (!proof) return null;
+      const encoded = encodeMintAllowList(record.nftContract, fee.address, record.quantity, params, proof);
+      return { to: encoded.to, data: encoded.data, value: encoded.value, feeRecipient: fee.address, drop };
+    };
+
+    // A representative for the logging header, which prints before any wallet
+    // is picked. The first armed wallet that actually has a proof.
+    const representative = record.wallets.map(planFor).find((p): p is LocalMintPlan => p !== null);
+    if (!representative) return null;
+    return { plan: representative, planFor };
   }
 
   async function runScheduled(store: TelegramStore, id: string, chatId: number): Promise<void> {
@@ -3464,9 +3480,12 @@ Send the new name.`,
       // plan is built from those rather than read from the public drop.
       // Nothing is fetched at fire time: a list lookup on the critical path
       // would undo the whole point of arming it in advance.
-      const plan = record.allowlist
+      const built = record.allowlist
         ? await buildAllowListPlan(urls, record)
-        : await buildLocalMintPlan(urls[0], record.nftContract, record.quantity);
+        : await buildLocalMintPlan(urls[0], record.nftContract, record.quantity).then((p) =>
+            p ? { plan: p, planFor: undefined } : null
+          );
+      const plan = built?.plan ?? null;
 
       if (!plan) {
         store.updateScheduled(id, { status: "failed", note: "drop not resolvable on-chain" });
@@ -3486,6 +3505,7 @@ Send the new name.`,
         earlyFireMs: settings.earlyFireMs,
         targetStart,
         plan,
+        planFor: built?.planFor,
         logger,
       });
 
@@ -4035,7 +4055,10 @@ Send the new name.`,
         wallets: eligible,
         // BigInt doesn't survive the session's plain-JSON shape.
         params: JSON.stringify(parsed.params, (_k, v) => (typeof v === "bigint" ? v.toString() : v)),
-        proof: parsed.proof,
+        // A proof names one address in its leaf, so it can only ever verify
+        // for the wallet it was issued to — hence the same proof against each
+        // address that matched, rather than one shared blob.
+        proofs: Object.fromEntries(eligible.map((a) => [a.toLowerCase(), parsed.proof])),
         quantity,
       };
 
