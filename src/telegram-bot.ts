@@ -8,6 +8,7 @@ dotenv.config({ path: path.resolve(process.cwd(), ".env") });
 import { createBot } from "./telegram/bot";
 import { startAlertsBot } from "./telegram/alerts-bot";
 import { startWebServer } from "./web/server";
+import { startRadarBot } from "./telegram/radar-bot";
 import { cleanToken } from "./telegram/token";
 import { UserStores } from "./telegram/user-stores";
 import { AccessControl } from "./telegram/access-control";
@@ -61,8 +62,20 @@ async function main(): Promise<void> {
   // default, in which case both stay on the main bot.
   const alerts = startAlertsBot(process.env.TELEGRAM_ALERTS_BOT_TOKEN, ownerId, stores);
 
+  // Read at click time, not at startup: Telegram only tells us the username
+  // after launch, and the radar's deep link is built long after that.
+  let mainUsername: string | undefined;
   const hooks: { armScheduled?: (userId: number, id: string) => void } = {};
   const bot = createBot({ token, ownerId, stores, access, alerts, hooks });
+
+  // A third bot, for the traffic that arrives unasked: drops announcing
+  // themselves before they open, and the scout's read on who is worth
+  // copying. Its own chat means its own notification setting, which for the
+  // one feed that should interrupt you is the entire point.
+  //
+  // It links back here to arm, rather than arming itself. Spending stays
+  // behind one door.
+  const radar = startRadarBot(process.env.TELEGRAM_RADAR_BOT_TOKEN, ownerId, stores, () => mainUsername);
 
   // Optional web UI. Same store and engine as the bot -- the point of it is
   // that a browser has no 90-second handler timeout, so a scan that takes
@@ -83,10 +96,12 @@ async function main(): Promise<void> {
   process.once("SIGINT", () => {
     bot.stop("SIGINT");
     alerts?.stop("SIGINT");
+    radar?.stop("SIGINT");
   });
   process.once("SIGTERM", () => {
     bot.stop("SIGTERM");
     alerts?.stop("SIGTERM");
+    radar?.stop("SIGTERM");
   });
 
   // launch()'s own promise only resolves after stop() is called — it never
@@ -94,6 +109,13 @@ async function main(): Promise<void> {
   // to come from the onLaunch callback, not an awaited return. The promise
   // still rejects on a genuine startup failure (bad token, network), which
   // is what the catch below is for.
+  bot.telegram
+    .getMe()
+    .then((me) => (mainUsername = me.username))
+    .catch(() => {
+      /* the radar's Arm button degrades to no button, which beats not starting */
+    });
+
   bot
     .launch(() => {
       console.log(

@@ -2,6 +2,7 @@
 // photo. Kept separate from mint-card.ts so the layout stays a pure function
 // with no native dependency — only this file needs the renderer.
 
+import { renderRadarCard, RadarCardData } from "./radar-card";
 import path from "path";
 import { Resvg } from "@resvg/resvg-js";
 import { renderMintCard, MintCardData } from "./mint-card";
@@ -99,4 +100,17 @@ function rasterise(svg: string, opts: RenderOptions): Buffer {
 export async function renderPnlCardPng(data: PnlCardData, opts: RenderOptions = {}): Promise<Buffer> {
   const artHref = data.artHref ? await inlineImage(data.artHref) : null;
   return rasterise(renderPnlCard({ ...data, artHref }), opts);
+}
+
+/**
+ * Same rasteriser again, for the radar card.
+ *
+ * Collection art is fetched and inlined first so the SVG handed to resvg is
+ * self-contained -- resvg does not fetch, so an un-inlined href renders as a
+ * blank rectangle rather than an error, which is the kind of failure nobody
+ * notices until every alert has been artless for a week.
+ */
+export async function renderRadarCardPng(data: RadarCardData, opts: RenderOptions = {}): Promise<Buffer> {
+  const artHref = data.artHref ? await inlineImage(data.artHref) : null;
+  return rasterise(renderRadarCard({ ...data, artHref }), opts);
 }

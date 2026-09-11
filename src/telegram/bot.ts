@@ -656,7 +656,27 @@ export function createBot({ token, ownerId, stores, access, alerts, hooks }: Bot
   };
 
   // ── Menu navigation ──────────────────────────────────────────────────
-  bot.start((ctx) => ctx.reply("NFT Public Mint Sniper — choose an action:", menuFor(ctx)));
+  bot.start((ctx) => {
+    // Arriving from a radar alert carries ?start=mint_0x... The whole value of
+    // that alert is acting on it inside the countdown, so landing on a menu
+    // and being asked to paste an address you were just shown would waste the
+    // minutes the radar exists to buy.
+    const payload = ctx.startPayload ?? "";
+    if (payload.startsWith("mint_") && requireOwner(ctx)) {
+      const contract = payload.slice("mint_".length);
+      if (isAddress(contract)) {
+        ctx.session.step = "awaiting_smart_target";
+        return ctx.reply(
+          `Reading ${contract}...\n\nWorking out which stage your wallets can mint.`,
+          Markup.inlineKeyboard([[Markup.button.callback("Cancel", "menu:main")]])
+        ).then(() => bot.handleUpdate({
+          ...(ctx.update as any),
+          message: { ...(ctx.message as any), text: contract },
+        }));
+      }
+    }
+    return ctx.reply("NFT Public Mint Sniper -- choose an action:", menuFor(ctx));
+  });
   bot.action("menu:main", (ctx) => ctx.editMessageText("Choose an action:", menuFor(ctx)));
 
   // The three groups the start screen collapsed into. Each is only a router:
