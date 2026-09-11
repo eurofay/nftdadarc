@@ -17,6 +17,7 @@ export function mainMenu(isAdmin = false) {
     [Markup.button.callback("🖼 Portfolio", "menu:portfolio"), Markup.button.callback("🔔 Activity Alerts", "menu:activity")],
     [Markup.button.callback("⚡ Quick Mint", "menu:quick"), Markup.button.callback("📦 Consolidate", "menu:consolidate")],
     [Markup.button.callback("📊 P&L", "menu:pnl"), Markup.button.callback("🔎 Find NFT", "menu:find")],
+    [Markup.button.callback("⛽ Gas Used", "menu:gas")],
     [Markup.button.callback("🧮 Wallet Filter", "menu:filter")],
     [Markup.button.callback("📊 Status", "menu:status")],
   ];
@@ -552,4 +553,16 @@ export function smartMenu(canFireNow: boolean) {
   if (canFireNow) rows.unshift([Markup.button.callback("🚀 Fire now", "smart:fire")]);
   rows.push([Markup.button.callback("← Back", "menu:main")]);
   return Markup.inlineKeyboard(rows);
+}
+
+/** Which window a gas report covers. Today is the common question. */
+export function gasMenu() {
+  return Markup.inlineKeyboard([
+    [
+      Markup.button.callback("Today", "gas:today"),
+      Markup.button.callback("7 days", "gas:week"),
+      Markup.button.callback("All time", "gas:all"),
+    ],
+    [Markup.button.callback("← Back", "menu:main")],
+  ]);
 }

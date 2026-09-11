@@ -95,6 +95,19 @@ export function marketFee(baseFeeWei: bigint, priorityWei: bigint, multiplier = 
 }
 
 /**
+ * The tip to actually pay, given what the chain will do with it.
+ *
+ * A tip is a bid for position in the next block. Where ordering is by arrival
+ * at a single sequencer there is no auction to bid in, so the bid is simply
+ * money handed over for nothing. Measured on Robinhood: base fee ~0.106 gwei,
+ * so the old 0.05 gwei default was a 47% surcharge on every transaction, and
+ * the mints landing ahead of ours were paying a tip of zero.
+ */
+export function effectivePriority(configuredWei: bigint, chainBuysNothing: boolean): bigint {
+  return chainBuysNothing ? 0n : configuredWei;
+}
+
+/**
  * The ceiling to sign with, given what the chain costs now.
  *
  * A configured ceiling of 0 means "follow the chain". Anything else is an

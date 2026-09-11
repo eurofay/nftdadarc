@@ -5,6 +5,7 @@
 // Access is restricted to one Telegram user id (TELEGRAM_OWNER_ID) in private
 // chat only; every other update is silently ignored.
 
+import { renderGasReport, windows } from "../gas-report";
 import { Telegraf, Markup, Context, Telegram } from "telegraf";
 import { message } from "telegraf/filters";
 import { isAddress, formatEther, parseEther, Wallet } from "ethers";
@@ -30,6 +31,7 @@ import {
   quickConfirmMenu,
   osMintStagesMenu,
   smartMenu,
+  gasMenu,
   adminInvitesMenu,
   walletsMenu,
   walletDetailMenu,
@@ -2927,6 +2929,7 @@ Send the new name.`,
         plan: representative,
         planFor,
         logger,
+        onGas: (e) => ctx.store.recordGas(e),
       });
       await recordOutcome(ctx.store, settings.chainKey, outcome, {
         bot,
@@ -2938,6 +2941,43 @@ Send the new name.`,
     }
     return undefined;
   });
+
+  /**
+   * What the bot has actually spent, per wallet, per action, per day.
+   *
+   * Every figure comes from a receipt: gasUsed x effectiveGasPrice. The
+   * gasLimit is a ceiling that gets refunded and maxFeePerGas is a bid that is
+   * usually not what you pay, so quoting either as "cost" overstates it by
+   * roughly 20x on this chain.
+   */
+  bot.action("menu:gas", (ctx) => {
+    if (!requireOwner(ctx)) return;
+    return ctx.editMessageText(gasReportText(ctx, "today"), gasMenu());
+  });
+
+  for (const key of ["today", "week", "all"] as const) {
+    bot.action(`gas:${key}`, async (ctx) => {
+      if (!requireOwner(ctx)) return;
+      await ctx.answerCbQuery();
+      // Telegram rejects an edit that changes nothing, which is what pressing
+      // the window you are already on does.
+      return ctx.editMessageText(gasReportText(ctx, key), gasMenu()).catch(() => {});
+    });
+  }
+
+  function gasReportText(ctx: BotContext, key: "today" | "week" | "all"): string {
+    const settings = ctx.store.getSettings();
+    const chain = resolveChain(settings.chainKey);
+    const named = new Map(ctx.store.listWallets().map((w) => [w.address.toLowerCase(), w.label]));
+    return renderGasReport({
+      entries: ctx.store.listGas(),
+      window: windows()[key],
+      symbol: chain?.nativeSymbol ?? "ETH",
+      // A wallet the operator has since removed still spent the money, so it
+      // keeps its address rather than vanishing from its own bill.
+      label: (address) => named.get(address.toLowerCase()) ?? maskAddress(address),
+    });
+  }
 
   bot.action("menu:smart", (ctx) => {
     if (!requireOwner(ctx)) return;
@@ -3213,6 +3253,7 @@ Send the new name.`,
         plan: representative,
         planFor,
         logger,
+        onGas: (e) => ctx.store.recordGas(e),
       });
 
       await recordOutcome(ctx.store, settings.chainKey, outcome, {
@@ -3396,6 +3437,7 @@ Send the new name.`,
         targetStart: null,
         plan,
         logger,
+        onGas: (e) => ctx.store.recordGas(e),
       });
       await recordOutcome(ctx.store, settings.chainKey, outcome, {
         bot,
@@ -3651,6 +3693,7 @@ Send the new name.`,
         plan,
         planFor: built?.planFor,
         logger,
+        onGas: (e) => store.recordGas(e),
       });
 
       store.updateScheduled(id, {

@@ -2,6 +2,7 @@
 // see crypto.ts), a copy-mint watchlist, and settings. One JSON file on disk,
 // git-ignored, since this is a single-owner bot with no concurrent writers.
 
+import { GasEntry } from "../gas-ledger";
 import fs from "fs";
 import path from "path";
 import { randomBytes } from "crypto";
@@ -71,6 +72,9 @@ export interface CopyMintAttempt {
 
 // Bounded so a long-running bot can't grow the store without limit.
 const MAX_COPY_HISTORY = 500;
+// A month of heavy use at a few hundred transactions a day, which is what a
+// spend report needs to answer "where did it go" without growing unbounded.
+const MAX_GAS_HISTORY = 5_000;
 
 export interface BotSettings {
   chainKey: string; // the single chain used by /mint, Fund Wallets, and Copy Mint
@@ -237,14 +241,49 @@ interface StoreData {
   copyTargets: CopyTarget[];
   mints: MintRecord[];
   copyHistory: CopyMintAttempt[];
+  gasHistory: GasEntry[];
   settings: BotSettings;
+}
+
+/**
+ * The gas numbers this shipped with before they were measured.
+ *
+ * A store still holding all three exactly has never had them deliberately
+ * changed, so moving it to the measured defaults is a fix rather than an
+ * override. Any wallet whose owner has touched even one of them is left
+ * alone -- a setting someone chose is not ours to overwrite.
+ */
+export const LEGACY_GAS_DEFAULTS = { maxFeeGwei: 2, priorityGwei: 0.05, gasLimit: 250_000 };
+
+export function migrateGasSettings<T extends { maxFeeGwei: number; priorityGwei: number; gasLimit: number }>(
+  settings: T
+): { settings: T; migrated: boolean } {
+  const stale =
+    settings.maxFeeGwei === LEGACY_GAS_DEFAULTS.maxFeeGwei &&
+    settings.priorityGwei === LEGACY_GAS_DEFAULTS.priorityGwei &&
+    settings.gasLimit === LEGACY_GAS_DEFAULTS.gasLimit;
+  if (!stale) return { settings, migrated: false };
+  return { settings: { ...settings, maxFeeGwei: 0, priorityGwei: 0, gasLimit: 0 }, migrated: true };
 }
 
 const DEFAULT_SETTINGS: BotSettings = {
   chainKey: "base",
-  maxFeeGwei: 2,
-  priorityGwei: 0.05,
-  gasLimit: 250_000,
+  // All three are "let the code work it out", and all three used to be
+  // hand-set numbers that were wrong against the measured chain:
+  //
+  //   maxFeeGwei 2      ~19x the ceiling real mints use, and because a node
+  //                     reserves gasLimit x maxFee up front, it demanded
+  //                     0.0005 ETH in a wallet to send a mint costing
+  //                     0.000011 ETH. That is what refuses a funded wallet.
+  //   priorityGwei 0.05 a 47% surcharge on a 0.106 gwei base fee, buying
+  //                     nothing on a chain that orders by arrival.
+  //   gasLimit 250_000  non-zero, so it OVERRODE gasLimitForQuantity --
+  //                     the measured 33-mint model never ran.
+  //
+  // Zero means measure it: fee follows the chain, limit follows the quantity.
+  maxFeeGwei: 0,
+  priorityGwei: 0,
+  gasLimit: 0,
   earlyFireMs: 0,
   autoEnabled: false,
   // On by default: the whole point of the bot is that it copies without being
@@ -275,7 +314,7 @@ export class TelegramStore {
 
   private load(): StoreData {
     if (!fs.existsSync(this.filePath)) {
-      return { seeds: [], scheduled: [], wallets: [], copyTargets: [], mints: [], copyHistory: [], settings: { ...DEFAULT_SETTINGS } };
+      return { seeds: [], scheduled: [], wallets: [], copyTargets: [], mints: [], copyHistory: [], gasHistory: [], settings: { ...DEFAULT_SETTINGS } };
     }
     const raw = JSON.parse(fs.readFileSync(this.filePath, "utf8"));
     return {
@@ -283,6 +322,7 @@ export class TelegramStore {
       copyTargets: raw.copyTargets ?? [],
       mints: raw.mints ?? [],
       copyHistory: raw.copyHistory ?? [],
+      gasHistory: raw.gasHistory ?? [],
       seeds: raw.seeds ?? [],
       scheduled: raw.scheduled ?? [],
       settings: { ...DEFAULT_SETTINGS, ...(raw.settings ?? {}) },
@@ -516,6 +556,7 @@ export class TelegramStore {
       copyTargets: parsed.copyTargets ?? [],
       mints: parsed.mints ?? [],
       copyHistory: parsed.copyHistory ?? [],
+      gasHistory: parsed.gasHistory ?? [],
       settings: { ...DEFAULT_SETTINGS, ...(parsed.settings ?? {}) },
     };
     this.save();
@@ -648,6 +689,25 @@ export class TelegramStore {
   }
 
   // ── Copy-mint history ────────────────────────────────────────────────
+  /**
+   * Record what a landed transaction cost.
+   *
+   * Only ever called with a receipt in hand: gasUsed and effectiveGasPrice are
+   * both post-hoc, and a "cost" quoted from the limit and the bid would
+   * overstate it by roughly 20x on this chain.
+   */
+  recordGas(entry: GasEntry): void {
+    this.data.gasHistory.push(entry);
+    if (this.data.gasHistory.length > MAX_GAS_HISTORY) {
+      this.data.gasHistory = this.data.gasHistory.slice(-MAX_GAS_HISTORY);
+    }
+    this.save();
+  }
+
+  listGas(fromMs = 0): GasEntry[] {
+    return this.data.gasHistory.filter((e) => e.at >= fromMs);
+  }
+
   recordCopyAttempt(entry: Omit<CopyMintAttempt, "at">): CopyMintAttempt {
     const record: CopyMintAttempt = { at: Date.now(), ...entry };
     this.data.copyHistory.push(record);
@@ -700,7 +760,16 @@ export class TelegramStore {
   getSettings(): BotSettings {
     // load() already merges DEFAULT_SETTINGS over what's on disk, so a store
     // written before a setting existed answers with that setting's default.
-    return { ...this.data.settings };
+    //
+    // The gas migration runs here rather than at load so it also reaches a
+    // store that was written while the old numbers were the defaults: those
+    // values are on disk, not absent, so merging cannot fix them.
+    const { settings, migrated } = migrateGasSettings(this.data.settings);
+    if (migrated) {
+      this.data.settings = settings;
+      this.save();
+    }
+    return { ...settings };
   }
 
 

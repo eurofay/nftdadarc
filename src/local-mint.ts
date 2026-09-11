@@ -19,12 +19,13 @@ import { blastToAll, parseRpcEndpoints, prepareBlast, waitForReceipt, PreparedBl
 import { warmConnections, startWarmKeeper, measureRoundTripMs } from "./connection-warmer";
 import { resolveEarlyFire, describeEarlyFire } from "./early-fire";
 import { waitForMintTime } from "./timer";
-import { explorerTx } from "./chains";
+import { explorerTx, resolveChain } from "./chains";
 import { LocalMintPlan } from "./seadrop-public";
 import { defaultLogger, Logger } from "./logger";
 import { gasLimitForQuantity } from "./gas";
-import { fitFeeToBalance, fitPriority, resolveMaxFee } from "./gas-fit";
+import { fitFeeToBalance, fitPriority, resolveMaxFee, effectivePriority } from "./gas-fit";
 import { createProvider } from "./rpc-provider";
+import { GasEntry } from "./gas-ledger";
 
 export interface LocalSnipeOpts {
   nftContract: string;
@@ -55,6 +56,16 @@ export interface LocalSnipeOpts {
    * and sending anyway would only burn a fee.
    */
   planFor?: (address: string) => LocalMintPlan | null;
+  /**
+   * Called once per landed transaction with what it actually cost.
+   *
+   * A callback rather than a return value because it fires per receipt, and
+   * because the caller owning the store should not have to wait for the
+   * slowest wallet to learn what the fastest one spent.
+   */
+  onGas?: (entry: GasEntry) => void;
+  /** Labels the spend, so a report can say where the money went. */
+  gasLabel?: string;
   logger?: Logger; // defaults to printing locally — the Telegram bot passes one that also forwards to a chat
 }
 
@@ -123,7 +134,18 @@ export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<SnipeOutco
   // picked once and left is wrong in both directions as the base fee moves:
   // too low and nothing is ever included, too high and every wallet is asked
   // to reserve far more than the block actually costs.
-  const { maxFeePerGas: ceiling, fromMarket } = resolveMaxFee(maxFeePerGas, baseFee, maxPriorityFee);
+  // A tip that cannot buy position is money given away. Dropped here rather
+  // than in settings so it holds however the caller was configured, and only
+  // on chains where it is measurably true.
+  const chain = resolveChain(Number(chainId));
+  const priority = effectivePriority(maxPriorityFee, chain?.noPriorityFee === true);
+  if (priority !== maxPriorityFee) {
+    log.info(
+      `  Tip dropped to 0 — ${chain?.name ?? "this chain"} orders by arrival, not by fee, so a tip buys nothing.`
+    );
+  }
+
+  const { maxFeePerGas: ceiling, fromMarket } = resolveMaxFee(maxFeePerGas, baseFee, priority);
   if (baseFee > 0n) {
     log.info(
       `  Base fee ${formatUnits(baseFee, "gwei")} gwei · ceiling ${formatUnits(ceiling, "gwei")} gwei` +
@@ -139,7 +161,7 @@ export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<SnipeOutco
     // still cover a viable fee, sign it at the lower ceiling rather than lose
     // the mint. A wallet that can afford the configured fee is untouched.
     let walletMaxFee = ceiling;
-    let walletPriority = maxPriorityFee;
+    let walletPriority = priority;
 
     // Whatever this wallet is actually sending. Identical to `plan` for a
     // public mint; its own proof and value for an allow-list one.
@@ -157,7 +179,7 @@ export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<SnipeOutco
         gasLimit: effectiveGasLimit,
         configuredMaxFeeWei: ceiling,
         baseFeeWei: baseFee,
-        priorityWei: maxPriorityFee,
+        priorityWei: priority,
       });
       if (!fit) {
         log.error(
@@ -167,7 +189,7 @@ export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<SnipeOutco
       }
       if (fit.reduced) {
         walletMaxFee = fit.maxFeePerGas;
-        walletPriority = fitPriority(fit.maxFeePerGas, maxPriorityFee);
+        walletPriority = fitPriority(fit.maxFeePerGas, priority);
         log.warn(
           `    [W${i}] fee ceiling lowered to ${formatUnits(walletMaxFee, "gwei")} gwei to fit this balance.`
         );
@@ -289,6 +311,18 @@ export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<SnipeOutco
         log.warn(`  [W${idx}] TIMEOUT — check: ${explorerTx(chainId, txHash)}`);
         return;
       }
+      // Recorded whatever the status: a revert burns the gas too, and a
+      // spend report that hid reverts would hide the expensive mistakes.
+      opts.onGas?.({
+        address,
+        at: Date.now(),
+        action: opts.gasLabel ?? "Mint",
+        txHash,
+        gasUsed: receipt.gasUsed,
+        effectiveGasPriceWei: receipt.effectiveGasPriceWei,
+        reverted: receipt.status !== "SUCCESS",
+      });
+
       const emit = receipt.status === "SUCCESS" ? log.successBold : log.errorBold;
       emit(`  [W${idx}] Block: ${receipt.block} | Pos: ${receipt.position} | ${receipt.status} | Gas: ${receipt.gasUsed}`);
       log.info(`  [W${idx}] Track: ${explorerTx(chainId, txHash)}`);

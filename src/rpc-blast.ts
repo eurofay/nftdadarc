@@ -127,7 +127,7 @@ export async function waitForReceipt(
   txHash: string,
   rpcUrl: string,
   timeoutMs: number = 30000
-): Promise<{ block: number; position: number; gasUsed: number; status: string } | null> {
+): Promise<{ block: number; position: number; gasUsed: number; status: string; effectiveGasPriceWei: string } | null> {
   const start = Date.now();
 
   while (Date.now() - start < timeoutMs) {
@@ -151,6 +151,10 @@ export async function waitForReceipt(
           block: parseInt(receipt.blockNumber, 16),
           position: parseInt(receipt.transactionIndex, 16),
           gasUsed: parseInt(receipt.gasUsed, 16),
+          // The price actually charged, which is neither the bid nor the base
+          // fee. Without it a receipt says how much gas burned but not what it
+          // cost, and cost is the only figure anyone cares about.
+          effectiveGasPriceWei: BigInt(receipt.effectiveGasPrice ?? "0x0").toString(),
           status: receipt.status === "0x1" ? "SUCCESS" : "REVERTED",
         };
       }

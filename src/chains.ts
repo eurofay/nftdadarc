@@ -20,6 +20,20 @@ export interface ChainProfile {
   // Robinhood, so any tolerance expressed in blocks is really a per-chain
   // constant in disguise.
   blockSeconds: number;
+  /**
+   * True where a priority fee buys nothing, so paying one is pure waste.
+   *
+   * On Ethereum a tip is a bid for position in the next block. On a single
+   * sequencer with no public mempool there is no auction to bid in: ordering
+   * is by arrival at the sequencer, full stop. Measured on Robinhood --
+   * eth_maxPriorityFeePerGas answers 0x0, and real mints landing in contested
+   * blocks carry a tip of 0 or 1e-8 gwei.
+   *
+   * The cost of ignoring this is not theoretical. Base fee here sits at
+   * ~0.106 gwei, so a 0.05 gwei tip is a 47% surcharge on every transaction
+   * in exchange for no advantage whatsoever.
+   */
+  noPriorityFee?: boolean;
   rpc: {
     alchemyHost?: string; // Alchemy host for this network (docs/reference)
     public: string[];     // public RPC + sequencer endpoints
@@ -76,6 +90,7 @@ export const CHAINS: ChainProfile[] = [
     explorer: "https://robinhoodchain.blockscout.com",
     nativeSymbol: "ETH",
     blockSeconds: 0.1,
+    noPriorityFee: true,
     rpc: {
       alchemyHost: "robinhood-mainnet.g.alchemy.com",
       // Measured: the public endpoint below returns a 10,000-block range in
