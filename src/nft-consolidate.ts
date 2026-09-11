@@ -10,6 +10,7 @@
 // marketplace has indexed, which on this chain is most of the recent ones.
 // Nothing here touches the OpenSea API.
 
+import { GasEntry } from "./gas-ledger";
 import { Contract, Interface, Wallet, formatEther } from "ethers";
 import { createProvider } from "./rpc-provider";
 import { readableRpcs } from "./fast-read";
@@ -425,6 +426,8 @@ export interface ConsolidateOpts {
   maxPriorityFee: bigint;
   logger?: Logger;
   confirmTimeoutMs?: number;
+  /** Called per landed transfer with what the holding wallet actually paid. */
+  onGas?: (entry: GasEntry) => void;
 }
 
 /**
@@ -498,6 +501,19 @@ export async function consolidate(opts: ConsolidateOpts): Promise<TransferResult
     sent.map(async (r): Promise<TransferResult> => {
       if (!r.txHash) return r;
       const receipt = await waitForReceipt(r.txHash, opts.rpcUrl, opts.confirmTimeoutMs ?? 60_000);
+      if (receipt) {
+        // The holding wallet pays, not the destination -- a sweep bills the
+        // wallets being emptied, which is exactly the surprise worth showing.
+        opts.onGas?.({
+          address: r.from,
+          at: Date.now(),
+          action: "Consolidate",
+          txHash: r.txHash,
+          gasUsed: receipt.gasUsed,
+          effectiveGasPriceWei: receipt.effectiveGasPriceWei,
+          reverted: receipt.status !== "SUCCESS",
+        });
+      }
       if (!receipt) return { ...r, status: "TIMEOUT" };
       return { ...r, status: receipt.status === "SUCCESS" ? "SUCCESS" : "FAILED" };
     })

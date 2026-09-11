@@ -10,24 +10,59 @@ export function maskAddress(addr: string): string {
 
 // isAdmin adds the owner-only row; everyone else never sees it exists.
 export function mainMenu(isAdmin = false) {
+  // Four doors, not seventeen.
+  //
+  // Every feature used to sit on the start screen, which meant scrolling past
+  // fourteen buttons to reach the one that gets used most. Grouping costs one
+  // extra tap for the rare things and saves the scroll every single time.
+  //
+  // Smart Mint stays on the front page rather than inside the mint group: it
+  // is the one that needs no prior knowledge -- paste an address and it works
+  // out the stage, the wallets and the calldata -- so it is the answer to
+  // "I want to mint this" almost always.
+  const rows: ReturnType<typeof Markup.button.callback>[][] = [];
+  if (isAdmin) rows.push([Markup.button.callback("🎯 Smart Mint — paste a CA", "menu:smart")]);
+  rows.push([Markup.button.callback("⚡ Minting", "menu:mintops"), Markup.button.callback("💼 Wallets", "menu:walletops")]);
+  rows.push([Markup.button.callback("📊 Insights", "menu:insights"), Markup.button.callback("⚙️ Settings", "menu:settings")]);
+  if (isAdmin) rows.push([Markup.button.callback("🛠 Admin", "menu:admin")]);
+  return Markup.inlineKeyboard(rows);
+}
+
+const backToMain = [Markup.button.callback("← Back", "menu:main")];
+
+/** Every way to start a mint, in rough order of how often each is reached for. */
+export function mintOpsMenu(isAdmin = false) {
   const rows = [
-    [Markup.button.callback("💼 Wallets", "menu:wallets"), Markup.button.callback("⚙️ Settings", "menu:settings")],
+    [Markup.button.callback("⚡ Quick Mint", "menu:quick"), Markup.button.callback("⏰ Scheduled", "menu:sched")],
     [Markup.button.callback("🎯 Auto Mint", "menu:auto"), Markup.button.callback("👀 Copy Mint", "menu:copy")],
-    [Markup.button.callback("💸 Fund Wallets", "menu:fund"), Markup.button.callback("⏰ Scheduled Mint", "menu:sched")],
-    [Markup.button.callback("🖼 Portfolio", "menu:portfolio"), Markup.button.callback("🔔 Activity Alerts", "menu:activity")],
-    [Markup.button.callback("⚡ Quick Mint", "menu:quick"), Markup.button.callback("📦 Consolidate", "menu:consolidate")],
-    [Markup.button.callback("📊 P&L", "menu:pnl"), Markup.button.callback("🔎 Find NFT", "menu:find")],
-    [Markup.button.callback("⛽ Gas Used", "menu:gas")],
-    [Markup.button.callback("🧮 Wallet Filter", "menu:filter")],
-    [Markup.button.callback("📊 Status", "menu:status")],
   ];
   if (isAdmin) {
-    rows.push([Markup.button.callback("🎯 Smart Mint — paste a CA", "menu:smart")]);
-    rows.push([Markup.button.callback("⚡ FCFS / Allowlist", "menu:fcfs")]);
-    rows.push([Markup.button.callback("🔐 OpenSea Mint", "menu:osmint")]);
-    rows.push([Markup.button.callback("🛠 Admin", "menu:admin")]);
+    rows.push([
+      Markup.button.callback("⚡ FCFS / Allowlist", "menu:fcfs"),
+      Markup.button.callback("🔐 OpenSea Mint", "menu:osmint"),
+    ]);
   }
+  rows.push(backToMain);
   return Markup.inlineKeyboard(rows);
+}
+
+/** Holding, moving and funding — everything that acts ON wallets. */
+export function walletOpsMenu() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback("💼 My Wallets", "menu:wallets"), Markup.button.callback("💸 Fund", "menu:fund")],
+    [Markup.button.callback("📦 Consolidate", "menu:consolidate"), Markup.button.callback("🧮 Filter", "menu:filter")],
+    backToMain,
+  ]);
+}
+
+/** Everything that answers a question rather than doing something. */
+export function insightsMenu() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback("🖼 Portfolio", "menu:portfolio"), Markup.button.callback("📊 P&L", "menu:pnl")],
+    [Markup.button.callback("⛽ Gas Used", "menu:gas"), Markup.button.callback("🔎 Find NFT", "menu:find")],
+    [Markup.button.callback("🔔 Activity Alerts", "menu:activity"), Markup.button.callback("📈 Status", "menu:status")],
+    backToMain,
+  ]);
 }
 
 // Armed allow-list mints. Kept apart from Scheduled Mint on purpose: that one

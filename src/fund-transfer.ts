@@ -8,6 +8,7 @@
 // TransactionResponse.wait(), which demands a fully-formed receipt object
 // (logsBloom, cumulativeGasUsed, blockHash, ...) from every provider.
 
+import { GasEntry } from "./gas-ledger";
 import { Wallet, formatEther, TransactionResponse } from "ethers";
 import { waitForReceipt } from "./rpc-blast";
 import { defaultLogger, Logger } from "./logger";
@@ -24,6 +25,8 @@ export interface BatchTransferOpts {
   maxPriorityFee: bigint;
   logger?: Logger;
   confirmTimeoutMs?: number; // per-transfer receipt wait, default 60s
+  /** Called per landed transfer with what the SOURCE wallet paid in gas. */
+  onGas?: (entry: GasEntry) => void;
 }
 
 export interface TransferOutcome {
@@ -90,6 +93,20 @@ export async function batchTransfer(opts: BatchTransferOpts): Promise<TransferOu
     sent.map(async ({ to, response, error }): Promise<TransferOutcome> => {
       if (!response) return { to, txHash: null, error };
       const receipt = await waitForReceipt(response.hash, rpcUrl, opts.confirmTimeoutMs ?? 60_000);
+      if (receipt) {
+        // Billed to the sender. Funding ten wallets is ten transfers out of
+        // ONE wallet, so attributing this to the recipients would show ten
+        // wallets each paying a little and hide that the source paid it all.
+        opts.onGas?.({
+          address: wallet.address,
+          at: Date.now(),
+          action: "Fund Wallets",
+          txHash: response.hash,
+          gasUsed: receipt.gasUsed,
+          effectiveGasPriceWei: receipt.effectiveGasPriceWei,
+          reverted: receipt.status !== "SUCCESS",
+        });
+      }
       if (!receipt) return { to, txHash: response.hash, status: "TIMEOUT" };
       return { to, txHash: response.hash, status: receipt.status === "SUCCESS" ? "SUCCESS" : "FAILED" };
     })

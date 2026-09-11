@@ -5,6 +5,7 @@
 // Access is restricted to one Telegram user id (TELEGRAM_OWNER_ID) in private
 // chat only; every other update is silently ignored.
 
+import { waitForReceipt } from "../rpc-blast";
 import { renderGasReport, windows } from "../gas-report";
 import { Telegraf, Markup, Context, Telegram } from "telegraf";
 import { message } from "telegraf/filters";
@@ -32,6 +33,9 @@ import {
   osMintStagesMenu,
   smartMenu,
   gasMenu,
+  mintOpsMenu,
+  walletOpsMenu,
+  insightsMenu,
   adminInvitesMenu,
   walletsMenu,
   walletDetailMenu,
@@ -655,6 +659,15 @@ export function createBot({ token, ownerId, stores, access, alerts, hooks }: Bot
   bot.start((ctx) => ctx.reply("NFT Public Mint Sniper — choose an action:", menuFor(ctx)));
   bot.action("menu:main", (ctx) => ctx.editMessageText("Choose an action:", menuFor(ctx)));
 
+  // The three groups the start screen collapsed into. Each is only a router:
+  // the feature handlers underneath are untouched and still reachable by
+  // their own callback ids, so nothing that linked to one has broken.
+  bot.action("menu:mintops", (ctx) =>
+    ctx.editMessageText("Minting — pick how:", mintOpsMenu(ctx.from?.id === ownerId))
+  );
+  bot.action("menu:walletops", (ctx) => ctx.editMessageText("Wallets:", walletOpsMenu()));
+  bot.action("menu:insights", (ctx) => ctx.editMessageText("Insights:", insightsMenu()));
+
   bot.action("menu:wallets", (ctx) =>
     ctx.editMessageText("Wallets — tap one to manage it. [🎯 Auto] [👀 Copy]:", walletsMenu(ctx.store.listWallets()))
   );
@@ -929,6 +942,7 @@ export function createBot({ token, ownerId, stores, access, alerts, hooks }: Bot
 
     try {
       const results = await consolidate({
+        onGas: (e) => ctx.store.recordGas(e),
         rpcUrl: urls[0],
         plan,
         keyFor: (owner) => store.getDecryptedKey(owner),
@@ -1285,6 +1299,7 @@ export function createBot({ token, ownerId, stores, access, alerts, hooks }: Bot
           ],
           logger
         );
+        recordGasLater(ctx.store, urls[0], address, "Sell", result.txHash);
         return ctx.reply(
           result.ok
             ? `✅ Sold via the ${result.usedPath} path.\n${result.txHash}`
@@ -1393,6 +1408,7 @@ export function createBot({ token, ownerId, stores, access, alerts, hooks }: Bot
         ],
         logger
       );
+      recordGasLater(ctx.store, urls[0], seller.address, "Sell", result.txHash);
 
       if (result.ok) {
         await ctx.reply(`✅ Sold via the ${result.usedPath} path.\n${result.txHash}`);
@@ -2256,6 +2272,7 @@ Send the new name.`,
     const logger = createLogger(createTelegramSink(bot, ctx.chat!.id));
     try {
       await batchTransfer({
+        onGas: (e) => ctx.store.recordGas(e),
         rpcUrl: urls[0],
         sourceKey: ctx.store.getDecryptedKey(fundSource),
         targets: fundTargets,
@@ -2950,6 +2967,41 @@ Send the new name.`,
    * usually not what you pay, so quoting either as "cost" overstates it by
    * roughly 20x on this chain.
    */
+  /**
+   * Record gas for a transaction we only know the hash of.
+   *
+   * Some paths -- accepting an offer through OpenSea's API -- broadcast and
+   * return immediately rather than waiting, which is right for them and
+   * leaves no receipt to read. This goes and gets one afterwards, in the
+   * background: the spend is worth recording, and nothing should wait on
+   * bookkeeping.
+   */
+  function recordGasLater(
+    store: TelegramStore,
+    rpcUrl: string,
+    address: string,
+    action: string,
+    txHash: string | null | undefined
+  ): void {
+    if (!txHash) return;
+    void waitForReceipt(txHash, rpcUrl, 120_000)
+      .then((receipt) => {
+        if (!receipt) return;
+        store.recordGas({
+          address,
+          at: Date.now(),
+          action,
+          txHash,
+          gasUsed: receipt.gasUsed,
+          effectiveGasPriceWei: receipt.effectiveGasPriceWei,
+          reverted: receipt.status !== "SUCCESS",
+        });
+      })
+      .catch(() => {
+        /* bookkeeping is best-effort; a missed row must not surface as an error */
+      });
+  }
+
   bot.action("menu:gas", (ctx) => {
     if (!requireOwner(ctx)) return;
     return ctx.editMessageText(gasReportText(ctx, "today"), gasMenu());

@@ -15,6 +15,7 @@
 // therefore reports `broadcast`, and the orchestrator refuses to continue
 // once it's true.
 
+import { GasEntry } from "./gas-ledger";
 import { Contract, Interface, Wallet, ZeroHash } from "ethers";
 import { createProvider } from "./rpc-provider";
 import { defaultLogger, Logger } from "./logger";
@@ -117,6 +118,8 @@ export async function ensureApproval(opts: {
   maxFeePerGas: bigint;
   maxPriorityFee: bigint;
   logger?: Logger;
+  /** Called when an approval actually lands, with what it cost. */
+  onGas?: (entry: GasEntry) => void;
 }): Promise<ApprovalResult> {
   const log = opts.logger ?? defaultLogger;
   const provider = createProvider(opts.rpcUrl);
@@ -133,7 +136,21 @@ export async function ensureApproval(opts: {
     maxFeePerGas: opts.maxFeePerGas,
     maxPriorityFeePerGas: opts.maxPriorityFee,
   });
-  await tx.wait(1);
+  // Approval is a real transaction with a real cost, and it is the one people
+  // forget: it is paid once per collection per wallet, separately from the
+  // sale itself, so it never appears on the sale's own receipt.
+  const receipt = await tx.wait(1);
+  if (receipt) {
+    opts.onGas?.({
+      address: wallet.address,
+      at: Date.now(),
+      action: "Sell (approval)",
+      txHash: tx.hash,
+      gasUsed: Number(receipt.gasUsed),
+      effectiveGasPriceWei: (receipt.gasPrice ?? 0n).toString(),
+      reverted: receipt.status !== 1,
+    });
+  }
   log.success(`  ✓ Approval granted (${tx.hash})`);
   return { alreadyApproved: false, txHash: tx.hash, operator };
 }
