@@ -3,6 +3,7 @@
 // git-ignored, since this is a single-owner bot with no concurrent writers.
 
 import { GasEntry } from "../gas-ledger";
+import { SmartWallet } from "../smart-wallet";
 import fs from "fs";
 import path from "path";
 import { randomBytes } from "crypto";
@@ -242,6 +243,7 @@ interface StoreData {
   mints: MintRecord[];
   copyHistory: CopyMintAttempt[];
   gasHistory: GasEntry[];
+  smartWallets: SmartWallet[];
   settings: BotSettings;
 }
 
@@ -314,7 +316,7 @@ export class TelegramStore {
 
   private load(): StoreData {
     if (!fs.existsSync(this.filePath)) {
-      return { seeds: [], scheduled: [], wallets: [], copyTargets: [], mints: [], copyHistory: [], gasHistory: [], settings: { ...DEFAULT_SETTINGS } };
+      return { seeds: [], scheduled: [], wallets: [], copyTargets: [], mints: [], copyHistory: [], gasHistory: [], smartWallets: [], settings: { ...DEFAULT_SETTINGS } };
     }
     const raw = JSON.parse(fs.readFileSync(this.filePath, "utf8"));
     return {
@@ -323,6 +325,7 @@ export class TelegramStore {
       mints: raw.mints ?? [],
       copyHistory: raw.copyHistory ?? [],
       gasHistory: raw.gasHistory ?? [],
+      smartWallets: raw.smartWallets ?? [],
       seeds: raw.seeds ?? [],
       scheduled: raw.scheduled ?? [],
       settings: { ...DEFAULT_SETTINGS, ...(raw.settings ?? {}) },
@@ -557,6 +560,7 @@ export class TelegramStore {
       mints: parsed.mints ?? [],
       copyHistory: parsed.copyHistory ?? [],
       gasHistory: parsed.gasHistory ?? [],
+      smartWallets: parsed.smartWallets ?? [],
       settings: { ...DEFAULT_SETTINGS, ...(parsed.settings ?? {}) },
     };
     this.save();
@@ -696,6 +700,44 @@ export class TelegramStore {
    * both post-hoc, and a "cost" quoted from the limit and the bid would
    * overstate it by roughly 20x on this chain.
    */
+  /**
+   * Record a wallet worth watching.
+   *
+   * Kept apart from copy targets on purpose: a copy target is an instruction
+   * to spend money following someone, and a smart wallet is a note that they
+   * are interesting. Conflating the two would make researching a wallet the
+   * same act as betting on it.
+   */
+  addSmartWallet(entry: SmartWallet): SmartWallet {
+    const existing = this.data.smartWallets.findIndex(
+      (w) => w.address.toLowerCase() === entry.address.toLowerCase()
+    );
+    // Re-recording refreshes the scout numbers but keeps the original date,
+    // which is what makes "watched since" mean anything.
+    if (existing >= 0) {
+      const kept = this.data.smartWallets[existing];
+      this.data.smartWallets[existing] = { ...entry, addedAt: kept.addedAt, note: entry.note ?? kept.note };
+    } else {
+      this.data.smartWallets.push(entry);
+    }
+    this.save();
+    return this.data.smartWallets[existing >= 0 ? existing : this.data.smartWallets.length - 1];
+  }
+
+  listSmartWallets(): SmartWallet[] {
+    return [...this.data.smartWallets].sort((a, b) => (b.scoutedScore ?? 0) - (a.scoutedScore ?? 0));
+  }
+
+  removeSmartWallet(address: string): boolean {
+    const before = this.data.smartWallets.length;
+    this.data.smartWallets = this.data.smartWallets.filter(
+      (w) => w.address.toLowerCase() !== address.toLowerCase()
+    );
+    if (this.data.smartWallets.length === before) return false;
+    this.save();
+    return true;
+  }
+
   recordGas(entry: GasEntry): void {
     this.data.gasHistory.push(entry);
     if (this.data.gasHistory.length > MAX_GAS_HISTORY) {

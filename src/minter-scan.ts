@@ -73,6 +73,8 @@ export async function scanAllMints(
           blockNumber: lg.blockNumber,
           logIndex: lg.index,
           txHash: lg.transactionHash,
+          quantity: Number(parsed.quantityMinted ?? 0n),
+          unitPriceWei: BigInt(parsed.unitMintPrice ?? 0n),
         });
       } catch {
         /* a log that will not decode is not this contract's shape */

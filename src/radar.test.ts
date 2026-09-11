@@ -140,6 +140,8 @@ const mint = (minter: string, collection: string, block: number, logIndex = 0): 
   blockNumber: block,
   logIndex,
   txHash: "0xabc",
+  quantity: 1,
+  unitPriceWei: 0n,
 });
 
 const A = "0x" + "a".repeat(40);

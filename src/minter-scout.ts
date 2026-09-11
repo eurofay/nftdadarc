@@ -30,6 +30,16 @@ export interface MintRecord {
   /** Position within the block, so two mints in one block still order. */
   logIndex: number;
   txHash: string;
+  /** How many this transaction took. */
+  quantity: number;
+  /**
+   * What each one cost, from the event itself.
+   *
+   * This is the real figure, not the stage's advertised price: it is what the
+   * contract recorded being charged. It makes a wallet's actual spend
+   * knowable without asking any marketplace.
+   */
+  unitPriceWei: bigint;
 }
 
 export interface MinterStats {

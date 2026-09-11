@@ -22,6 +22,9 @@ import { RadarBoard, UpcomingDrop, Verdict, countdown, priceLabel, leadMs, isLiv
 import { runDropRadar } from "../radar-watch";
 import { scanAllMints } from "../minter-scan";
 import { scout, why, RankedMinter } from "../minter-scout";
+import { dossierRows, summaryRow, describeDossier } from "../smart-wallet";
+import { buildDossier } from "../smart-wallet-build";
+import { toCsv } from "../wallet-csv";
 import { renderRadarCardPng } from "../mint-card-render";
 import { lookupContract, isLookupFailure } from "../slug-resolver";
 import { createProvider } from "../rpc-provider";
@@ -104,6 +107,7 @@ export function startRadarBot(
     const on = [...watchers.keys()];
     return Markup.inlineKeyboard([
       [Markup.button.callback("📡 Board", "radar:board"), Markup.button.callback("🔭 Scout", "radar:scout")],
+      [Markup.button.callback("🧠 Smart wallets", "smart:list"), Markup.button.callback("⬇ Export CSV", "smart:export")],
       [Markup.button.callback(on.length ? `⏸ Stop (${on.length})` : "▶️ Start watching", "radar:toggle")],
     ]);
   }
@@ -296,7 +300,11 @@ export function startRadarBot(
             parse_mode: "Markdown",
             ...Markup.inlineKeyboard([
               [
-                Markup.button.callback("👀 Copy this wallet", `scout:watch:${m.address}`),
+                Markup.button.callback("🧠 Record", `scout:save:${m.address}:${m.score.toFixed(2)}:${m.earliness.toFixed(3)}`),
+                Markup.button.callback("👀 Copy", `scout:watch:${m.address}`),
+              ],
+              [
+                Markup.button.callback("📊 Dossier", `smart:dossier:${m.address}`),
                 Markup.button.url("🔎 Explorer", `${chain.explorer}/address/${m.address}`),
               ],
             ]),
@@ -319,6 +327,223 @@ export function startRadarBot(
       return ctx.answerCbQuery(err?.message ?? "Could not add that one.", { show_alert: true });
     }
   });
+
+
+  // ── smart wallets: record, read, export ──────────────────────────────────
+
+  bot.action(/^scout:save:(0x[0-9a-fA-F]{40}):([0-9.]+):([0-9.]+)$/, async (ctx) => {
+    if (!owner(ctx)) return;
+    const [, address, sc, early] = ctx.match;
+    const store = stores.for(ownerId);
+    store.addSmartWallet({
+      address,
+      label: `smart-${address.slice(-4)}`,
+      addedAt: Date.now(),
+      chainKey: store.getSettings().chainKey,
+      scoutedScore: Number(sc),
+      scoutedEarliness: Number(early),
+    });
+    await ctx.answerCbQuery("Recorded.");
+    return undefined;
+  });
+
+  bot.action("smart:list", async (ctx) => {
+    if (!owner(ctx)) return;
+    await ctx.answerCbQuery();
+    const list = stores.for(ownerId).listSmartWallets();
+    if (list.length === 0) {
+      return ctx.editMessageText("No smart wallets recorded yet. Run Scout and press Record.", menu());
+    }
+    const body = list
+      .map(
+        (w) =>
+          "`" + mask(w.address) + "` — score " + (w.scoutedScore ?? 0).toFixed(2) +
+          ", " + Math.round((w.scoutedEarliness ?? 0) * 100) + "% early"
+      )
+      .join("\n");
+    return ctx.editMessageText("🧠 *Smart wallets* (" + list.length + ")\n\n" + body, {
+      parse_mode: "Markdown",
+      ...Markup.inlineKeyboard([
+        ...list.slice(0, 8).map((w) => [
+          Markup.button.callback("📊 " + mask(w.address), `smart:dossier:${w.address}`),
+          Markup.button.callback("🗑", `smart:drop:${w.address}`),
+        ]),
+        [Markup.button.callback("⬅ Back", "radar:menu")],
+      ]),
+    });
+  });
+
+  bot.action(/^smart:drop:(0x[0-9a-fA-F]{40})$/, async (ctx) => {
+    if (!owner(ctx)) return;
+    stores.for(ownerId).removeSmartWallet(ctx.match[1]);
+    await ctx.answerCbQuery("Removed.");
+    return undefined;
+  });
+
+  bot.action("radar:menu", async (ctx) => {
+    if (!owner(ctx)) return;
+    await ctx.answerCbQuery();
+    return ctx.editMessageText("📡 Radar:", menu());
+  });
+
+  bot.action(/^smart:dossier:(0x[0-9a-fA-F]{40})$/, async (ctx) => {
+    if (!owner(ctx)) return;
+    await ctx.answerCbQuery("Building…");
+    return sendDossier(ctx.chat!.id, ctx.match[1]);
+  });
+
+  bot.command("smart", async (ctx) => {
+    if (!owner(ctx)) return;
+    const arg = ctx.message.text.split(/\s+/)[1];
+    if (arg && /^0x[0-9a-fA-F]{40}$/.test(arg)) return sendDossier(ctx.chat.id, arg);
+    return ctx.reply("📡 Radar:", menu());
+  });
+
+  /**
+   * Everything known about one wallet: what it minted, what it paid, what it
+   * still holds, and what that is worth now.
+   */
+  async function sendDossier(chatId: number, address: string) {
+    const store = stores.for(ownerId);
+    const key = store.getSettings().chainKey;
+    const chain = resolveChain(key);
+    if (!chain) return;
+    const { urls } = resolveRpcsForChain(key);
+
+    const note = await bot.telegram.sendMessage(chatId, `Reading ${mask(address)}…`);
+    const edit = (t: string) =>
+      bot.telegram
+        .editMessageText(chatId, note.message_id, undefined, t, { parse_mode: "Markdown" })
+        .catch(() => {});
+
+    try {
+      const provider = createProvider(urls[0]);
+      const head = await provider.getBlockNumber();
+      // A day of history: far enough back to be a record rather than a
+      // snapshot, close enough that the scan stays minutes not hours.
+      const span = blocksForSeconds(key, 24 * 3600);
+      const from = Math.max(0, head - span);
+
+      await edit(`Scanning a day of ${chain.name}…`);
+      const records = await scanAllMints(urls[0], from, head, {
+        chunkBlocks: logChunkBlocksFor(key),
+        maxRecords: 60_000,
+      });
+
+      const dossier = await buildDossier({
+        address,
+        chainKey: key,
+        symbol: chain.nativeSymbol,
+        rpcUrl: urls[0],
+        records,
+        window: { from, to: head },
+        apiKey: process.env.OPENSEA_API_KEY,
+        onProgress: (done, total) => {
+          if (done % 5 === 0) void edit(`Pricing ${done}/${total} collections…`);
+        },
+      });
+
+      const saved = store.listSmartWallets().find((w) => w.address.toLowerCase() === address.toLowerCase());
+      await edit(describeDossier(dossier, saved?.label));
+
+      const top = dossier.positions.slice(0, 6);
+      if (top.length > 0) {
+        const lines = top
+          .map(
+            (p) =>
+              (p.name ?? mask(p.contract)) +
+              ` — ${p.minted} minted` +
+              (p.held !== undefined ? `, ${p.held} held` : "") +
+              (p.floorEth != null ? `, floor ${p.floorEth}` : "")
+          )
+          .join("\n");
+        await bot.telegram.sendMessage(chatId, "*What they minted*\n\n" + lines, { parse_mode: "Markdown" });
+      }
+
+      // The file, always: a dossier is the kind of thing worth keeping.
+      const csv = toCsv(dossierRows(dossier));
+      if (csv) {
+        await bot.telegram.sendDocument(chatId, {
+          source: Buffer.from(csv, "utf8"),
+          filename: `${address.slice(0, 10)}-positions.csv`,
+        });
+      }
+    } catch (err: any) {
+      await edit(`Could not build that dossier: ${err?.message ?? err}`);
+    }
+  }
+
+  bot.action("smart:export", async (ctx) => {
+    if (!owner(ctx)) return;
+    await ctx.answerCbQuery("Exporting…");
+    return exportAll(ctx.chat!.id);
+  });
+
+  bot.command("export", (ctx) => {
+    if (!owner(ctx)) return;
+    return exportAll(ctx.chat.id);
+  });
+
+  /** Every recorded wallet, one row each, as a file. */
+  async function exportAll(chatId: number) {
+    const store = stores.for(ownerId);
+    const list = store.listSmartWallets();
+    if (list.length === 0) {
+      return bot.telegram.sendMessage(chatId, "Nothing recorded yet. Run Scout and press Record.");
+    }
+    const key = store.getSettings().chainKey;
+    const chain = resolveChain(key)!;
+    const { urls } = resolveRpcsForChain(key);
+
+    const note = await bot.telegram.sendMessage(chatId, `Building a report on ${list.length} wallet(s)…`);
+    const edit = (t: string) =>
+      bot.telegram.editMessageText(chatId, note.message_id, undefined, t).catch(() => {});
+
+    try {
+      const provider = createProvider(urls[0]);
+      const head = await provider.getBlockNumber();
+      const span = blocksForSeconds(key, 24 * 3600);
+      const from = Math.max(0, head - span);
+      // Scanned ONCE and reused for every wallet. A per-wallet scan would
+      // re-read the same day of chain for every row in the report.
+      const records = await scanAllMints(urls[0], from, head, {
+        chunkBlocks: logChunkBlocksFor(key),
+        maxRecords: 60_000,
+      });
+
+      const summaries: Record<string, string | number>[] = [];
+      const positions: Record<string, string | number>[] = [];
+      for (const [i, w] of list.entries()) {
+        await edit(`Pricing wallet ${i + 1}/${list.length}…`);
+        const d = await buildDossier({
+          address: w.address,
+          chainKey: key,
+          symbol: chain.nativeSymbol,
+          rpcUrl: urls[0],
+          records,
+          window: { from, to: head },
+          apiKey: process.env.OPENSEA_API_KEY,
+        });
+        summaries.push(summaryRow(d, w));
+        positions.push(...dossierRows(d));
+      }
+
+      await edit(`Done — ${summaries.length} wallet(s), ${positions.length} position(s).`);
+      const stamp = new Date().toISOString().slice(0, 10);
+      await bot.telegram.sendDocument(chatId, {
+        source: Buffer.from(toCsv(summaries), "utf8"),
+        filename: `smart-wallets-${stamp}.csv`,
+      });
+      if (positions.length > 0) {
+        await bot.telegram.sendDocument(chatId, {
+          source: Buffer.from(toCsv(positions), "utf8"),
+          filename: `smart-wallet-positions-${stamp}.csv`,
+        });
+      }
+    } catch (err: any) {
+      await edit(`Export failed: ${err?.message ?? err}`);
+    }
+  }
 
   bot
     .launch(() => {
