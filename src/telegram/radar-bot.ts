@@ -21,6 +21,8 @@ import { resolveRpcsForChain } from "../rpc-resolver";
 import { RadarBoard, UpcomingDrop, Verdict, countdown, priceLabel, leadMs, isLive } from "../drop-radar";
 import { runDropRadar } from "../radar-watch";
 import { scanAllMints } from "../minter-scan";
+import { scanSales } from "../seaport-sales";
+import { profitScout, whyProfit } from "../profit-scout";
 import { scout, why, RankedMinter } from "../minter-scout";
 import { dossierRows, summaryRow, describeDossier } from "../smart-wallet";
 import { buildDossier } from "../smart-wallet-build";
@@ -158,6 +160,7 @@ export function startRadarBot(
     const on = [...watchers.keys()];
     return Markup.inlineKeyboard([
       [Markup.button.callback("📡 Board", "radar:board"), Markup.button.callback("🔭 Scout", "radar:scout")],
+      [Markup.button.callback("💰 Proven profit", "radar:profit")],
       [Markup.button.callback("🧠 Smart wallets", "smart:list"), Markup.button.callback("⬇ Export CSV", "smart:export")],
       [Markup.button.callback("🌐 Chains", "radar:chains")],
       [Markup.button.callback(on.length ? `⏸ Stop (${on.length})` : "▶️ Start watching", "radar:toggle")],
@@ -303,6 +306,114 @@ export function startRadarBot(
       { parse_mode: "Markdown", ...menu() }
     );
   });
+
+  bot.action("radar:profit", async (ctx) => {
+    if (!owner(ctx)) return;
+    await ctx.answerCbQuery("Scanning…");
+    return runProfitScout(ctx.chat!.id);
+  });
+
+  bot.action(/^profit:on:([a-z0-9-]+)$/, async (ctx) => {
+    if (!owner(ctx)) return;
+    await ctx.answerCbQuery("Scanning…");
+    return runProfitScout(ctx.chat!.id, ctx.match[1]);
+  });
+
+  bot.command("profit", (ctx) => {
+    if (!owner(ctx)) return;
+    return runProfitScout(ctx.chat.id);
+  });
+
+  /**
+   * Who has actually made money, settled on-chain.
+   *
+   * Scout ranks on earliness, which says a wallet behaves like it knows
+   * something. This ranks on whether it was right — mints matched to Seaport
+   * sales, cost against proceeds, both sides prices a transaction happened at.
+   */
+  async function runProfitScout(chatId: number, chainKey?: string) {
+    const store = stores.for(ownerId);
+    const key = chainKey ?? store.getSettings().chainKey;
+    const chain = resolveChain(key);
+    if (!chain) return;
+    const { urls } = resolveRpcsForChain(key);
+
+    const note = await bot.telegram.sendMessage(chatId, `💰 Reading ${chain.name} mints and sales…`);
+    const edit = (t: string) =>
+      bot.telegram
+        .editMessageText(chatId, note.message_id, undefined, t, { parse_mode: "Markdown" })
+        .catch(() => {});
+
+    try {
+      const provider = createProvider(urls[0]);
+      const head = await provider.getBlockNumber();
+      // Six hours. A win rate needs sales to count, and sales are rarer than
+      // mints — two hours of this chain yields too few to rank on.
+      const span = blocksForSeconds(key, 6 * 3600);
+      const from = Math.max(0, head - span);
+      const chunk = logChunkBlocksFor(key);
+
+      // Both streams at once: they are independent reads over the same range,
+      // and doing them in turn doubles the wait for no benefit.
+      const [mints, sales] = await Promise.all([
+        scanAllMints(urls[0], from, head, { chunkBlocks: chunk, maxRecords: 80_000 }),
+        scanSales(urls[0], from, head, { chunkBlocks: chunk, maxRecords: 80_000 }),
+      ]);
+
+      const mine = store.listWallets().map((w) => w.address);
+      const watched = store.listCopyTargets().map((t) => t.address);
+      const top = profitScout(mints, sales, { limit: 8, exclude: [...mine, ...watched] });
+
+      if (top.length === 0) {
+        return edit(
+          `No wallet on ${chain.name} has a provable profit in the last six hours.\n\n` +
+            `_${mints.length} mints and ${sales.length} sales read. A wallet needs to have both ` +
+            "minted AND sold here to have a cost basis at all._"
+        );
+      }
+
+      await edit(
+        `💰 *Proven profit — ${chain.name}*\n\n` +
+          `${mints.length.toLocaleString()} mints · ${sales.length.toLocaleString()} settled sales · last 6h\n\n` +
+          "Mints matched to Seaport sales. Both sides are prices a transaction actually happened at — " +
+          "not a floor, which is an ask, and not an offer, which is a bid."
+      );
+
+      for (const m of top) {
+        await bot.telegram.sendMessage(
+          chatId,
+          `\`${m.address}\`\n${whyProfit(m)}`,
+          {
+            parse_mode: "Markdown",
+            ...Markup.inlineKeyboard([
+              [
+                Markup.button.callback(
+                  "🧠 Record",
+                  `scout:save:${m.address}:${m.score.toFixed(2)}:${m.winRate.toFixed(3)}`
+                ),
+                Markup.button.callback("👀 Copy", `scout:watch:${m.address}`),
+              ],
+              [
+                Markup.button.callback("📊 Dossier", `smart:dossier:${m.address}`),
+                Markup.button.url("🔎 Explorer", `${chain.explorer}/address/${m.address}`),
+              ],
+            ]),
+          }
+        );
+      }
+
+      const others = radarChains(store).filter((k) => k !== key);
+      if (others.length > 0) {
+        await bot.telegram.sendMessage(chatId, "Check another chain:", {
+          ...Markup.inlineKeyboard(
+            others.map((k) => [Markup.button.callback(resolveChain(k)?.name ?? k, `profit:on:${k}`)])
+          ),
+        });
+      }
+    } catch (err: any) {
+      await edit(`Profit scan failed: ${err?.message ?? err}`);
+    }
+  }
 
   bot.action("radar:scout", async (ctx) => {
     if (!owner(ctx)) return;
@@ -515,7 +626,14 @@ export function startRadarBot(
         maxRecords: 60_000,
       });
 
+      await edit("Reading settled sales from Seaport…");
+      const sales = await scanSales(urls[0], from, head, {
+        chunkBlocks: logChunkBlocksFor(key),
+        maxRecords: 60_000,
+      });
+
       const dossier = await buildDossier({
+        sales,
         address,
         chainKey: key,
         symbol: chain.nativeSymbol,
@@ -595,12 +713,18 @@ export function startRadarBot(
         chunkBlocks: logChunkBlocksFor(key),
         maxRecords: 60_000,
       });
+      await edit("Reading settled sales from Seaport…");
+      const sales = await scanSales(urls[0], from, head, {
+        chunkBlocks: logChunkBlocksFor(key),
+        maxRecords: 60_000,
+      });
 
       const summaries: Record<string, string | number>[] = [];
       const positions: Record<string, string | number>[] = [];
       for (const [i, w] of list.entries()) {
         await edit(`Pricing wallet ${i + 1}/${list.length}…`);
         const d = await buildDossier({
+          sales,
           address: w.address,
           chainKey: key,
           symbol: chain.nativeSymbol,

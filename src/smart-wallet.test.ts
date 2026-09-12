@@ -155,13 +155,27 @@ describe("the export", () => {
 });
 
 describe("the written summary", () => {
-  it("says plainly that a flip is not a known sale price", () => {
+  it("distinguishes what is settled from what is only an ask", () => {
+    // The old caveat said a sale price is not on-chain. It is: Seaport
+    // settles on-chain and emits the whole order. What stays uncertain is
+    // only the part still unsold, valued at a floor, which is an ask.
     const text = describeDossier(
       summarise(W, "robinhood", "ETH",
         [{ contract: C1, minted: 10, spentWei: ETH, held: 2, floorEth: 0.3 }], { from: 0, to: 1 })
     );
-    expect(text).toContain("not what it sold for");
     expect(text).toContain("Unrealised +0.4000 ETH");
+    expect(text).toContain("ask rather than a sale");
+  });
+
+  it("leads with the settled number once something has sold", () => {
+    const text = describeDossier(
+      summarise(W, "robinhood", "ETH",
+        [{ contract: C1, minted: 10, spentWei: ETH, held: 2, floorEth: 0.3, sold: 4, proceedsWei: ETH, wins: 4 }],
+        { from: 0, to: 1 })
+    );
+    expect(text).toContain("Sold 4 on Seaport");
+    expect(text).toContain("Realised");
+    expect(text).toContain("100% of sales beat their mint cost");
   });
 
   it("names the chain's own currency", () => {

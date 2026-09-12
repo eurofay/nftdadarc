@@ -11,7 +11,8 @@ import { Contract } from "ethers";
 import { createProvider } from "./rpc-provider";
 import { Position, Dossier, summarise } from "./smart-wallet";
 import { MintRecord } from "./minter-scout";
-import { positionsFor } from "./smart-wallet";
+import { positionsFor, attachSales } from "./smart-wallet";
+import { SaleRecord } from "./seaport-sales";
 import { lookupContract, isLookupFailure } from "./slug-resolver";
 import { fetchStats, fetchBestCollectionOffer } from "./opensea-market";
 
@@ -23,6 +24,8 @@ export interface BuildOpts {
   symbol: string;
   rpcUrl: string;
   records: MintRecord[];
+  /** Seaport sales over the same window, for realised profit. */
+  sales?: SaleRecord[];
   window: { from: number; to: number };
   apiKey?: string;
   /** Skip the market calls — much faster, and enough for a spend-only view. */
@@ -95,6 +98,9 @@ export async function readMarket(
 
 export async function buildDossier(opts: BuildOpts): Promise<Dossier> {
   let positions = positionsFor(opts.address, opts.records);
+  // Sales first: it is pure matching, and a dossier with realised numbers and
+  // no floors is more use than the reverse.
+  if (opts.sales) positions = attachSales(opts.address, positions, opts.sales);
   positions = await readHoldings(opts.rpcUrl, opts.address, positions);
   if (opts.withMarket !== false) {
     positions = await readMarket(opts.chainKey, positions, opts.apiKey, opts.onProgress);

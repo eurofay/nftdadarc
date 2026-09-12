@@ -22,6 +22,7 @@
 
 import { computePnl, Pnl } from "./pnl";
 import { MintRecord } from "./minter-scout";
+import { SaleRecord, salesByCollection } from "./seaport-sales";
 
 export interface SmartWallet {
   address: string;
@@ -48,6 +49,12 @@ export interface Position {
   floorEth?: number | null;
   /** Best standing bid. */
   bestOfferEth?: number | null;
+  /** Sales this wallet actually made in this collection, from Seaport. */
+  sold?: number;
+  /** What those sales put in their pocket, after fees. */
+  proceedsWei?: bigint;
+  /** Sales that beat the per-item mint cost. */
+  wins?: number;
 }
 
 export interface Dossier {
@@ -77,6 +84,19 @@ export interface Dossier {
     heldFloorValueEth: number | null;
     /** Held value minus what the held items cost. Null when unknowable. */
     unrealisedEth: number | null;
+    /** Items actually sold on Seaport, from OrderFulfilled. */
+    sold: number;
+    /** Net proceeds of those sales. */
+    proceedsEth: number;
+    /**
+     * Proceeds minus what the sold items cost to mint.
+     *
+     * Unlike everything above it, this is settled: both sides are prices that
+     * a transaction actually happened at, not an ask and not a bid.
+     */
+    realisedEth: number | null;
+    /** Share of sales that beat their mint cost. Null with nothing sold. */
+    winRate: number | null;
   };
 }
 
@@ -97,6 +117,33 @@ export function positionsFor(address: string, records: MintRecord[]): Position[]
     }
   }
   return [...byContract.values()].sort((a, b) => b.minted - a.minted);
+}
+
+/**
+ * Attach this wallet's actual sales to the positions it minted.
+ *
+ * A sale is only counted against a position when the wallet also MINTED that
+ * collection in the window, because the cost basis comes from the mint. A sale
+ * of something they bought elsewhere is real money, but its profit is not
+ * knowable from here, and folding it in at a cost of zero would invent a
+ * profit equal to the whole sale price.
+ */
+export function attachSales(address: string, positions: Position[], sales: SaleRecord[]): Position[] {
+  const byCollection = salesByCollection(address, sales);
+  return positions.map((p) => {
+    const mine = byCollection.get(p.contract.toLowerCase());
+    if (!mine || mine.length === 0) return p;
+    const unitCostWei = p.minted > 0 ? p.spentWei / BigInt(p.minted) : 0n;
+    let proceeds = 0n;
+    let wins = 0;
+    for (const s of mine) {
+      proceeds += s.proceedsWei;
+      // A free mint that sold for anything at all is a win; the comparison
+      // still holds because unitCost is then zero.
+      if (s.proceedsWei > unitCostWei) wins++;
+    }
+    return { ...p, sold: mine.length, proceedsWei: proceeds, wins };
+  });
 }
 
 const WEI = 1e18;
@@ -128,10 +175,28 @@ export function summarise(
   let heldFloor = 0;
   let heldCost = 0;
   let valued = 0;
+  let sold = 0;
+  let proceedsWei = 0n;
+  let soldCostEth = 0;
+  let wins = 0;
+  let costedSales = 0;
 
   for (const p of positions) {
     mints += p.minted;
     spentWei += p.spentWei;
+
+    if (p.sold) {
+      sold += p.sold;
+      proceedsWei += p.proceedsWei ?? 0n;
+      wins += p.wins ?? 0;
+      // Only sales with a cost basis contribute to realised profit, and only
+      // those count toward the win rate.
+      if (p.minted > 0) {
+        costedSales += p.sold;
+        soldCostEth += (Number(p.spentWei) / WEI / p.minted) * p.sold;
+      }
+    }
+
     if (p.held === undefined) continue;
     heldItems += p.held;
     if (p.held > p.minted) {
@@ -166,6 +231,10 @@ export function summarise(
       partialHistory: partial,
       heldFloorValueEth,
       unrealisedEth: heldFloorValueEth === null ? null : heldFloorValueEth - heldCost,
+      sold,
+      proceedsEth: Number(proceedsWei) / WEI,
+      realisedEth: costedSales > 0 ? Number(proceedsWei) / WEI - soldCostEth : null,
+      winRate: costedSales > 0 ? wins / costedSales : null,
     },
   };
 }
@@ -208,6 +277,14 @@ export function dossierRows(d: Dossier): Record<string, string | number>[] {
       unit_cost_eth: n(p.minted > 0 ? Number(p.spentWei) / WEI / p.minted : null, 6),
       floor_eth: n(p.floorEth),
       best_offer_eth: n(p.bestOfferEth),
+      sold: p.sold ?? 0,
+      proceeds_eth: n(p.proceedsWei === undefined ? null : Number(p.proceedsWei) / WEI),
+      realised_eth: n(
+        p.sold && p.minted > 0
+          ? Number(p.proceedsWei ?? 0n) / WEI - (Number(p.spentWei) / WEI / p.minted) * p.sold
+          : null
+      ),
+      win_rate: p.sold && p.minted > 0 ? ((p.wins ?? 0) / p.sold).toFixed(2) : "",
       floor_value_eth: n(pnl.floorValueEth),
       profit_at_floor_eth: n(pnl.profitAtFloorEth),
       roi_percent: pnl.roiPercent === null ? "" : pnl.roiPercent.toFixed(1),
@@ -228,6 +305,10 @@ export function summaryRow(d: Dossier, w?: SmartWallet): Record<string, string |
     held: d.totals.heldItems,
     flipped: d.totals.flipped ?? "",
     spent_eth: n(d.totals.spentEth),
+    sold: d.totals.sold,
+    proceeds_eth: n(d.totals.proceedsEth),
+    realised_eth: n(d.totals.realisedEth),
+    win_rate: d.totals.winRate === null ? "" : d.totals.winRate.toFixed(2),
     held_floor_value_eth: n(d.totals.heldFloorValueEth),
     unrealised_eth: n(d.totals.unrealisedEth),
     recorded_at: w ? new Date(w.addedAt).toISOString() : "",
@@ -245,6 +326,18 @@ export function describeDossier(d: Dossier, label?: string): string {
       ? `Holds ${t.heldItems} — flips unknown, they were minting before this window`
       : `Holds ${t.heldItems} · flipped ${t.flipped}`,
   ];
+  if (t.sold > 0) {
+    const sign = (t.realisedEth ?? 0) >= 0 ? "+" : "";
+    lines.push(
+      "",
+      `Sold ${t.sold} on Seaport for ${t.proceedsEth.toFixed(4)} ${d.symbol} net`,
+      t.realisedEth === null
+        ? "Realised profit unknown — those sales have no mint cost in this window"
+        : `*Realised ${sign}${t.realisedEth.toFixed(4)} ${d.symbol}*` +
+          (t.winRate === null ? "" : ` · ${Math.round(t.winRate * 100)}% of sales beat their mint cost`)
+    );
+  }
+
   if (t.heldFloorValueEth !== null) {
     lines.push(`Still holding ≈ ${t.heldFloorValueEth.toFixed(4)} ${d.symbol} at floor`);
     if (t.unrealisedEth !== null) {
@@ -256,6 +349,13 @@ export function describeDossier(d: Dossier, label?: string): string {
   if (t.partialHistory && t.flipped !== null) {
     lines.push("", "_Some holdings predate this window, so the flip count covers only what it saw._");
   }
-  lines.push("", "_Flipped counts what left the wallet, not what it sold for — sale prices are not on-chain._");
+  // The old caveat is gone: Seaport settles on-chain, so a sale price IS
+  // knowable. What remains uncertain is only the part still unsold.
+  lines.push(
+    "",
+    t.heldFloorValueEth !== null
+      ? "_Realised is settled on-chain. Unrealised is at floor, which is an ask rather than a sale._"
+      : "_Realised figures are settled on-chain, from Seaport._"
+  );
   return lines.join("\n");
 }
