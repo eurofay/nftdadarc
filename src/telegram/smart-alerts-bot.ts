@@ -27,6 +27,7 @@ import {
   ActivityKind,
 } from "../wallet-activity";
 import { lookupContract, isLookupFailure } from "../slug-resolver";
+import { parseWalletList, describeParse } from "../wallet-csv";
 
 export interface SmartAlertsBot {
   telegram: Telegram;
@@ -73,6 +74,7 @@ export function startSmartAlertsBot(
     (Object.keys(KIND_DEFAULTS) as ActivityKind[]).filter((k) => KIND_DEFAULTS[k])
   );
   let seenTransfers = false;
+  let awaitingPaste = false;
 
   /** Cached, because a busy wallet hits the same collection repeatedly. */
   async function nameOf(chainKey: string, contract: string): Promise<string> {
@@ -91,7 +93,10 @@ export function startSmartAlertsBot(
         Markup.button.callback(watching ? "⏸ Stop" : "▶️ Start watching", "sa:toggle"),
         Markup.button.callback("🔔 What to alert", "sa:kinds"),
       ],
-      [Markup.button.callback("🧠 Who I'm watching", "sa:who")],
+      [
+        Markup.button.callback("➕ Add wallets", "sa:add"),
+        Markup.button.callback("🧠 Who I'm watching", "sa:who"),
+      ],
     ]);
   }
 
@@ -217,6 +222,25 @@ export function startSmartAlertsBot(
 
   bot.start((ctx) => {
     if (!owner(ctx)) return ctx.reply("This bot only serves its owner.");
+
+    // Arriving from the radar bot's "watch all of these" button. The payload
+    // is a handle, not the list: Telegram caps it at 64 characters, which is
+    // one and a half addresses.
+    const payload = ctx.startPayload ?? "";
+    if (payload.startsWith("add_")) {
+      const batch = stores.for(ownerId).peekWalletBatch(payload.slice("add_".length));
+      if (!batch) {
+        return ctx.reply("That link has expired -- run the search again and use the new one.", menu());
+      }
+      const { added, already } = importWallets(batch.addresses, batch.note ?? "scout");
+      return ctx.reply(
+        "👁 Added *" + added + "* wallet(s) from " + (batch.note ?? "the radar bot") + "." +
+          (already > 0 ? "\n\n_" + already + " were already on the list._" : "") +
+          "\n\nPress Start watching and they are live.",
+        { parse_mode: "Markdown", ...menu() }
+      );
+    }
+
     const n = stores.for(ownerId).listSmartWallets().length;
     return ctx.reply(
       "👁 *Smart wallet alerts*\n\n" +
@@ -287,6 +311,129 @@ export function startSmartAlertsBot(
               .join("\n"),
       { parse_mode: "Markdown", ...menu() }
     );
+  });
+
+  // ── getting wallets in ────────────────────────────────────────────────────
+  //
+  // Three doors onto one function, because the same list arrives three ways:
+  // pasted from somewhere, as a file, or as a link from the radar bot that
+  // already knows which wallets it just found.
+
+  /** Record a parsed list and say what actually happened to it. */
+  function importWallets(addresses: string[], source: string): { added: number; already: number } {
+    const store = stores.for(ownerId);
+    const existing = new Set(store.listSmartWallets().map((w) => w.address.toLowerCase()));
+    let added = 0;
+    let already = 0;
+    for (const address of addresses) {
+      if (existing.has(address.toLowerCase())) {
+        already++;
+        continue;
+      }
+      store.addSmartWallet({
+        address,
+        label: `${source}-${address.slice(-4)}`,
+        addedAt: Date.now(),
+        chainKey: store.getSettings().chainKey,
+      });
+      existing.add(address.toLowerCase());
+      added++;
+    }
+    return { added, already };
+  }
+
+  function importSummary(parsed: ReturnType<typeof parseWalletList>, added: number, already: number): string {
+    const lines = [`👁 Read ${describeParse(parsed)}.`, ""];
+    lines.push(`Now watching *${added}* new wallet(s).`);
+    // Said out loud rather than folded into the total: "I added 40" when 38
+    // were already there is a number that looks like progress and is not.
+    if (already > 0) lines.push(`_${already} were already on the list._`);
+    if (parsed.invalid.length > 0) {
+      lines.push("", `_Ignored ${parsed.invalid.length} entr${parsed.invalid.length === 1 ? "y" : "ies"} that were not addresses._`);
+    }
+    return lines.join("\n");
+  }
+
+  bot.action("sa:add", async (ctx) => {
+    if (!owner(ctx)) return;
+    await ctx.answerCbQuery();
+    awaitingPaste = true;
+    return ctx.editMessageText(
+      "Send addresses, or upload a CSV.\n\n" +
+        "Paste as many as you like — one per line, comma separated, or straight out of a " +
+        "spreadsheet. Addresses are found by shape, so a header row, extra columns and the " +
+        "exports from the radar bot all work without being told which column is which.",
+      Markup.inlineKeyboard([[Markup.button.callback("Cancel", "sa:menu")]])
+    );
+  });
+
+  bot.on("text", async (ctx, next) => {
+    if (!owner(ctx) || !awaitingPaste) return next();
+    awaitingPaste = false;
+    const parsed = parseWalletList(ctx.message.text);
+    if (parsed.addresses.length === 0) {
+      return ctx.reply("No addresses in that. Send a list, or upload a CSV.", menu());
+    }
+    const { added, already } = importWallets(parsed.addresses, "paste");
+    return ctx.reply(importSummary(parsed, added, already), { parse_mode: "Markdown", ...menu() });
+  });
+
+  /**
+   * A CSV, straight from the radar bot's export.
+   *
+   * Accepted whether or not the paste prompt was open: sending a file of
+   * wallets to a bot whose job is watching wallets has one obvious meaning,
+   * and making it depend on a prior tap would just be a rule to remember.
+   */
+  bot.on("document", async (ctx) => {
+    if (!owner(ctx)) return;
+    const doc = ctx.message.document;
+    // A quarter megabyte is tens of thousands of addresses; anything larger
+    // is not a wallet list and should not be pulled into memory to find out.
+    if ((doc.file_size ?? 0) > 256 * 1024) {
+      return ctx.reply("That file is too big to be a wallet list.");
+    }
+    awaitingPaste = false;
+    try {
+      const link = await ctx.telegram.getFileLink(doc.file_id);
+      const text = await (await fetch(link.toString())).text();
+      const parsed = parseWalletList(text);
+      if (parsed.addresses.length === 0) {
+        return ctx.reply(`No addresses found in ${doc.file_name ?? "that file"}.`, menu());
+      }
+      const { added, already } = importWallets(parsed.addresses, "csv");
+      return ctx.reply(importSummary(parsed, added, already), { parse_mode: "Markdown", ...menu() });
+    } catch (err: any) {
+      return ctx.reply(`Couldn't read that file: ${err?.message ?? err}`);
+    }
+  });
+
+  bot.action(/^sa:drop:(0x[0-9a-fA-F]{40})$/, async (ctx) => {
+    if (!owner(ctx)) return;
+    stores.for(ownerId).removeSmartWallet(ctx.match[1]);
+    await ctx.answerCbQuery("Removed.");
+    return undefined;
+  });
+
+  bot.action("sa:clear", async (ctx) => {
+    if (!owner(ctx)) return;
+    await ctx.answerCbQuery();
+    const n = stores.for(ownerId).listSmartWallets().length;
+    return ctx.editMessageText(
+      `Stop watching all ${n} wallet(s)?`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback("Yes, clear the list", "sa:clear:yes")],
+        [Markup.button.callback("Keep them", "sa:menu")],
+      ])
+    );
+  });
+
+  bot.action("sa:clear:yes", async (ctx) => {
+    if (!owner(ctx)) return;
+    const store = stores.for(ownerId);
+    for (const w of store.listSmartWallets()) store.removeSmartWallet(w.address);
+    await ctx.answerCbQuery("Cleared.");
+    return ctx.editMessageText("List cleared.", menu());
   });
 
   bot.command("watch", (ctx) => {

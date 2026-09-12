@@ -69,24 +69,30 @@ async function main(): Promise<void> {
   const hooks: { armScheduled?: (userId: number, id: string) => void } = {};
   const bot = createBot({ token, ownerId, stores, access, alerts, hooks });
 
-  // A third bot, for the traffic that arrives unasked: drops announcing
-  // themselves before they open, and the scout's read on who is worth
-  // copying. Its own chat means its own notification setting, which for the
-  // one feed that should interrupt you is the entire point.
+  // Two more chats, and the split is about attention rather than capability.
+  // The radar carries what is COMING -- drops announcing themselves before
+  // they open. The alerts bot carries what watched wallets just DID. Each is
+  // its own notification setting, which is the entire reason they are not one
+  // bot with two menus.
   //
-  // It links back here to arm, rather than arming itself. Spending stays
-  // behind one door.
-  const radar = startRadarBot(process.env.TELEGRAM_RADAR_BOT_TOKEN, ownerId, stores, () => mainUsername);
-
-  // A fifth chat, for the wallets you decided were worth watching. Separate
-  // from the radar for the same reason the radar is separate from the main
-  // bot: each bot is its own notification setting, and this is the one you
-  // let through at 3am.
+  // Smart is declared first so the radar can link into it; the username is
+  // read at click time, by which point both have introduced themselves.
+  //
+  // Neither can spend. Both link back here to arm, behind this bot's access
+  // control, because two front doors onto a key store is two to guard.
   const smart = startSmartAlertsBot(
     process.env.TELEGRAM_SMART_BOT_TOKEN,
     ownerId,
     stores,
     () => mainUsername
+  );
+
+  const radar = startRadarBot(
+    process.env.TELEGRAM_RADAR_BOT_TOKEN,
+    ownerId,
+    stores,
+    () => mainUsername,
+    () => smart?.username
   );
 
   // Optional web UI. Same store and engine as the bot -- the point of it is

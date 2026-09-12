@@ -254,6 +254,7 @@ interface StoreData {
   copyHistory: CopyMintAttempt[];
   gasHistory: GasEntry[];
   smartWallets: SmartWallet[];
+  walletBatches: { id: string; addresses: string[]; at: number; note?: string }[];
   settings: BotSettings;
 }
 
@@ -340,7 +341,7 @@ export class TelegramStore {
 
   private load(): StoreData {
     if (!fs.existsSync(this.filePath)) {
-      return { seeds: [], scheduled: [], wallets: [], copyTargets: [], mints: [], copyHistory: [], gasHistory: [], smartWallets: [], settings: { ...DEFAULT_SETTINGS } };
+      return { seeds: [], scheduled: [], wallets: [], copyTargets: [], mints: [], copyHistory: [], gasHistory: [], smartWallets: [], walletBatches: [], settings: { ...DEFAULT_SETTINGS } };
     }
     const raw = JSON.parse(fs.readFileSync(this.filePath, "utf8"));
     return {
@@ -350,6 +351,7 @@ export class TelegramStore {
       copyHistory: raw.copyHistory ?? [],
       gasHistory: raw.gasHistory ?? [],
       smartWallets: raw.smartWallets ?? [],
+      walletBatches: raw.walletBatches ?? [],
       seeds: raw.seeds ?? [],
       scheduled: raw.scheduled ?? [],
       settings: { ...DEFAULT_SETTINGS, ...(raw.settings ?? {}) },
@@ -585,6 +587,7 @@ export class TelegramStore {
       copyHistory: parsed.copyHistory ?? [],
       gasHistory: parsed.gasHistory ?? [],
       smartWallets: parsed.smartWallets ?? [],
+      walletBatches: parsed.walletBatches ?? [],
       settings: { ...DEFAULT_SETTINGS, ...(parsed.settings ?? {}) },
     };
     this.save();
@@ -732,6 +735,33 @@ export class TelegramStore {
    * are interesting. Conflating the two would make researching a wallet the
    * same act as betting on it.
    */
+  /**
+   * Park a list of addresses behind a short id.
+   *
+   * Telegram caps a deep-link payload at 64 characters, which is one and a
+   * half addresses -- so "watch all of these" cannot carry the list itself.
+   * It carries a handle, and the list waits here.
+   *
+   * Persisted rather than held in memory because the whole point is that the
+   * link survives being tapped ten minutes later, possibly after a redeploy.
+   */
+  stageWalletBatch(addresses: string[], note?: string): string {
+    const id = randomBytes(6).toString("hex");
+    this.data.walletBatches.push({ id, addresses, at: Date.now(), note });
+    // An hour is longer than anyone leaves a message unread and far short of
+    // letting these accumulate; the cap is the belt to that braces.
+    const cutoff = Date.now() - 60 * 60 * 1000;
+    this.data.walletBatches = this.data.walletBatches.filter((b) => b.at >= cutoff).slice(-25);
+    this.save();
+    return id;
+  }
+
+  /** Read a parked batch. Left in place, so a double tap is not a dead link. */
+  peekWalletBatch(id: string): { addresses: string[]; note?: string } | null {
+    const b = this.data.walletBatches.find((x) => x.id === id);
+    return b ? { addresses: b.addresses, note: b.note } : null;
+  }
+
   addSmartWallet(entry: SmartWallet): SmartWallet {
     const existing = this.data.smartWallets.findIndex(
       (w) => w.address.toLowerCase() === entry.address.toLowerCase()

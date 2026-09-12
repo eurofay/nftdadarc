@@ -83,7 +83,8 @@ export function startRadarBot(
   token: string | undefined,
   ownerId: number,
   stores: UserStores,
-  mainBotUsername?: () => string | undefined
+  mainBotUsername?: () => string | undefined,
+  smartBotUsername?: () => string | undefined
 ): RadarBot | null {
   const cleaned = cleanToken(token);
   if (!cleaned.token) return null;
@@ -165,6 +166,54 @@ export function startRadarBot(
       [Markup.button.callback("🌐 Chains", "radar:chains")],
       [Markup.button.callback(on.length ? `⏸ Stop (${on.length})` : "▶️ Start watching", "radar:toggle")],
     ]);
+  }
+
+  /**
+   * A CSV of results, and a one-tap link that starts watching all of them.
+   *
+   * The link carries a HANDLE rather than the addresses: Telegram caps a
+   * deep-link payload at 64 characters, which is one and a half addresses.
+   */
+  async function offerWatchAll(
+    chatId: number,
+    addresses: string[],
+    rows: Record<string, string | number>[],
+    note: string,
+    chainName: string
+  ) {
+    if (addresses.length === 0) return;
+
+    const csv = toCsv(rows);
+    if (csv) {
+      const stamp = new Date().toISOString().slice(0, 10);
+      const slug = chainName.toLowerCase().replace(/[^a-z0-9]+/g, "-");
+      await bot.telegram
+        .sendDocument(chatId, {
+          source: Buffer.from(csv, "utf8"),
+          filename: `${note}-${slug}-${stamp}.csv`,
+        })
+        .catch(() => {});
+    }
+
+    const smart = smartBotUsername?.();
+    const id = stores.for(ownerId).stageWalletBatch(addresses, note);
+
+    await bot.telegram
+      .sendMessage(
+        chatId,
+        smart
+          ? "☝️ Every wallet in that list, as a file. One tap to watch them all:"
+          : "☝️ Every wallet in that list, as a file.\n\n_Set TELEGRAM_SMART_BOT_TOKEN to get a one-tap watch button here._",
+        {
+          parse_mode: "Markdown",
+          ...Markup.inlineKeyboard(
+            smart
+              ? [[Markup.button.url(`👁 Watch all ${addresses.length}`, `https://t.me/${smart}?start=add_${id}`)]]
+              : []
+          ),
+        }
+      )
+      .catch(() => {});
   }
 
   /** Build and send one alert, art and all. */
@@ -402,6 +451,26 @@ export function startRadarBot(
         );
       }
 
+      await offerWatchAll(
+        chatId,
+        top.map((m) => m.address),
+        top.map((m) => ({
+          wallet: m.address,
+          chain: key,
+          win_rate: m.winRate.toFixed(2),
+          sold: m.sold,
+          realised_eth: m.realisedEth.toFixed(5),
+          per_sale_eth: m.perSaleEth.toFixed(6),
+          proceeds_eth: m.proceedsEth.toFixed(5),
+          cost_eth: m.costEth.toFixed(5),
+          collections: m.collections,
+          best_sale_eth: m.bestSaleEth.toFixed(5),
+          score: m.score.toFixed(2),
+        })),
+        "proven-profit",
+        chain.name
+      );
+
       const others = radarChains(store).filter((k) => k !== key);
       if (others.length > 0) {
         await bot.telegram.sendMessage(chatId, "Check another chain:", {
@@ -480,6 +549,22 @@ export function startRadarBot(
 
       // Scouting is per chain: minters on Ink are a different population from
       // minters on Ethereum, and averaging them would describe neither.
+      await offerWatchAll(
+        chatId,
+        top.map((m) => m.address),
+        top.map((m) => ({
+          wallet: m.address,
+          chain: key,
+          mints: m.mints,
+          collections: m.collections,
+          earliness_percent: Math.round(m.earliness * 100),
+          front_runs: m.frontRuns,
+          score: m.score.toFixed(2),
+        })),
+        "scout",
+        chain.name
+      );
+
       await bot.telegram.sendMessage(chatId, "Scout another chain:", {
         ...Markup.inlineKeyboard(
           radarChains(store)
