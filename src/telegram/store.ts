@@ -116,6 +116,15 @@ export interface BotSettings {
    * that rule lives in decideClusterMint and no setting reaches it.
    */
   clusterMint?: ClusterMintSettings;
+  /**
+   * Copy Mint follows the smart wallets too, without them being added twice.
+   *
+   * Recording a wallet in the radar bot and then adding it to Copy Mint by
+   * hand is the same decision entered twice, and the two lists drift the
+   * moment you forget. On, they are one list; off, Copy Mint keeps only what
+   * was added to it directly.
+   */
+  copyFollowsSmart?: boolean;
   copyMintEnabled: boolean;
   // Copy-mint isn't restricted to free drops, so this is the one guardrail
   // against blindly following a watched wallet into an expensive mint.
@@ -784,6 +793,27 @@ export class TelegramStore {
     }
     this.save();
     return this.data.smartWallets[existing >= 0 ? existing : this.data.smartWallets.length - 1];
+  }
+
+  /**
+   * Every wallet Copy Mint should follow.
+   *
+   * The union when copyFollowsSmart is on, de-duplicated, with the
+   * hand-added ones first so a label you chose wins over a generated one.
+   */
+  copyWatchList(): CopyTarget[] {
+    const out: CopyTarget[] = [...this.listCopyTargets()];
+    if (!this.getSettings().copyFollowsSmart) return out;
+    const seen = new Set(out.map((t) => t.address.toLowerCase()));
+    for (const w of this.listSmartWallets()) {
+      if (seen.has(w.address.toLowerCase())) continue;
+      seen.add(w.address.toLowerCase());
+      // addedAt carried over so the menu can order and date them like any
+      // other target -- a synthesised "now" would make every smart wallet
+      // look like it was added this second.
+      out.push({ address: w.address, label: w.label, addedAt: w.addedAt });
+    }
+    return out;
   }
 
   listSmartWallets(): SmartWallet[] {

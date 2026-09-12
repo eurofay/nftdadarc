@@ -122,6 +122,7 @@ export function startSmartAlertsBot(
         Markup.button.callback("🔔 What to alert", "sa:kinds"),
       ],
       [Markup.button.callback("⚡ Auto-mint on a cluster", "sa:auto")],
+      [Markup.button.callback("🔗 Feed Copy Mint", "sa:feed")],
       [
         Markup.button.callback("➕ Add wallets", "sa:add"),
         Markup.button.callback("🧠 Who I'm watching", "sa:who"),
@@ -718,6 +719,60 @@ export function startSmartAlertsBot(
       return undefined;
     });
   }
+
+  /**
+   * Hand the same list to Copy Mint, without adding anything twice.
+   *
+   * Copy Mint already follows wallets and copies what they mint; the only
+   * reason it did not follow these was that its watch list and this one were
+   * separate. They are the same decision, so this makes them the same list
+   * rather than asking you to enter it again.
+   *
+   * The difference between the two remains, and is the point of having both:
+   * Copy Mint acts on ONE wallet minting, every time. Auto-mint on a cluster
+   * waits for several to agree. One is a follower, the other is a quorum.
+   */
+  bot.action("sa:feed", async (ctx) => {
+    if (!owner(ctx)) return;
+    await ctx.answerCbQuery();
+    const store = stores.for(ownerId);
+    const on = store.getSettings().copyFollowsSmart === true;
+    const smart = store.listSmartWallets().length;
+    const direct = store.listCopyTargets().length;
+    const main = mainBotUsername?.();
+
+    const rows: any[][] = [
+      [Markup.button.callback(on ? "⏸ Stop following them" : "▶️ Follow them in Copy Mint", "sa:feed:toggle")],
+    ];
+    if (main) rows.push([Markup.button.url("⚙️ Open Copy Mint", `https://t.me/${main}?start=copy`)]);
+    rows.push([Markup.button.callback("⬅ Back", "sa:menu")]);
+
+    return ctx.editMessageText(
+      "🔗 *Feed Copy Mint*\n\n" +
+        `Copy Mint is currently watching *${direct}* wallet(s) added directly` +
+        (on ? ` plus all *${smart}* smart wallet(s).` : `, and none of your *${smart}* smart wallet(s).`) +
+        "\n\nTurn this on and the two become one list — record a wallet here and Copy Mint follows it, " +
+        "with nothing to import and no second list to keep in step.\n\n" +
+        "_Copy Mint acts when ONE watched wallet mints. Auto-mint on a cluster waits for several to " +
+        "agree. Running both means the first gets you in early and the second only fires on a crowd._",
+      { parse_mode: "Markdown", ...Markup.inlineKeyboard(rows) }
+    );
+  });
+
+  bot.action("sa:feed:toggle", async (ctx) => {
+    if (!owner(ctx)) return;
+    const store = stores.for(ownerId);
+    const on = store.getSettings().copyFollowsSmart === true;
+    store.updateSettings({ copyFollowsSmart: !on });
+    await ctx.answerCbQuery(!on ? "Copy Mint now follows them" : "No longer following");
+    // Restart is on the main bot, because that is where Copy Mint runs.
+    return ctx.editMessageText(
+      !on
+        ? "Copy Mint will follow your smart wallets.\n\n_Restart Copy Mint in the main bot for it to pick up the new list._"
+        : "Copy Mint is back to only the wallets added to it directly.",
+      { parse_mode: "Markdown", ...menu() }
+    );
+  });
 
   bot.command("watch", (ctx) => {
     if (!owner(ctx)) return;

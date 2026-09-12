@@ -682,6 +682,10 @@ export function createBot({ token, ownerId, stores, access, alerts, hooks }: Bot
     // and being asked to paste an address you were just shown would waste the
     // minutes the radar exists to buy.
     const payload = ctx.startPayload ?? "";
+    // Arriving from the alerts bot's "Open Copy Mint" button.
+    if (payload === "copy" && requireOwner(ctx)) {
+      return ctx.reply("Copy-mint watchlist:", copyMenu(runningCopy.has(ctx.from!.id), ctx.store.copyWatchList()));
+    }
     if (payload.startsWith("mint_") && requireOwner(ctx)) {
       const contract = payload.slice("mint_".length);
       if (isAddress(contract)) {
@@ -1950,9 +1954,16 @@ Send the new name.`,
   function startCopy(chatId: number): { ok: true } | { ok: false; reason: string } {
     const store = stores.for(chatId);
     if (runningCopy.has(chatId)) return { ok: true }; // already running
-    const targets = store.listCopyTargets();
+    // The union with the smart wallets when that is switched on, so a wallet
+    // recorded in the radar bot does not have to be added here as well.
+    const targets = store.copyWatchList();
     const wallets = store.listWalletsFor("copy");
-    if (targets.length === 0) return { ok: false, reason: "Add a wallet to watch first." };
+    if (targets.length === 0) {
+      return {
+        ok: false,
+        reason: "Add a wallet to watch first — or switch on Follow smart wallets in the alerts bot.",
+      };
+    }
     if (wallets.length === 0) {
       return { ok: false, reason: "No wallets enabled for Copy Mint — enable at least one in Wallets." };
     }
