@@ -28,11 +28,39 @@ import {
 } from "../wallet-activity";
 import { lookupContract, isLookupFailure } from "../slug-resolver";
 import { parseWalletList, describeParse } from "../wallet-csv";
+import { Wallet } from "ethers";
+import { resolveMint, planLookup } from "../mint-resolve";
+import { buildLocalMintPlan } from "../seadrop-public";
+import { localPublicSnipe } from "../local-mint";
+import { createLogger } from "../logger";
+import {
+  decideClusterMint,
+  describeAsk,
+  DEFAULT_CLUSTER_MINT,
+  ClusterMintSettings,
+  ASK_TTL_MS,
+} from "../cluster-mint";
 
 export interface SmartAlertsBot {
   telegram: Telegram;
   username?: string;
   stop: (reason?: string) => void;
+}
+
+/** Gwei to wei. Local rather than imported: the other copies are private. */
+const gweiToWei = (gwei: number): bigint => BigInt(Math.round(gwei * 1e9));
+
+/** First endpoint that answers, rather than the first that is listed. */
+async function firstAnswer<T>(urls: string[], fn: (url: string) => Promise<T | null>): Promise<T | null> {
+  for (const url of urls) {
+    try {
+      const out = await fn(url);
+      if (out !== null && out !== undefined) return out;
+    } catch {
+      /* try the next endpoint */
+    }
+  }
+  return null;
 }
 
 const mask = (a: string): string => `${a.slice(0, 6)}…${a.slice(-4)}`;
@@ -93,6 +121,7 @@ export function startSmartAlertsBot(
         Markup.button.callback(watching ? "⏸ Stop" : "▶️ Start watching", "sa:toggle"),
         Markup.button.callback("🔔 What to alert", "sa:kinds"),
       ],
+      [Markup.button.callback("⚡ Auto-mint on a cluster", "sa:auto")],
       [
         Markup.button.callback("➕ Add wallets", "sa:add"),
         Markup.button.callback("🧠 Who I'm watching", "sa:who"),
@@ -206,7 +235,9 @@ export function startSmartAlertsBot(
             // Clustering runs on everything that passed the filter, because
             // several wallets converging is the signal the individual events
             // only hint at.
-            await sendCluster(chatId, chainKey, clusters.note(a));
+            const cluster = clusters.note(a);
+            await sendCluster(chatId, chainKey, cluster);
+            if (cluster) await considerCluster(chatId, chainKey, cluster);
           }
           clusters.prune();
         }
@@ -435,6 +466,258 @@ export function startSmartAlertsBot(
     await ctx.answerCbQuery("Cleared.");
     return ctx.editMessageText("List cleared.", menu());
   });
+
+  // ── following a crowd into a mint ─────────────────────────────────────────
+
+  /** Confirmations waiting on a tap, by short id. Cleared when they expire. */
+  const pending = new Map<
+    string,
+    { contract: string; wallets: string[]; quantity: number; at: number; name: string }
+  >();
+
+  let firedToday = 0;
+  let firedDay = new Date().toDateString();
+
+  function countFire() {
+    const today = new Date().toDateString();
+    if (today !== firedDay) {
+      firedDay = today;
+      firedToday = 0;
+    }
+    firedToday++;
+  }
+
+  function clusterSettings(store: ReturnType<UserStores["for"]>): ClusterMintSettings {
+    return { ...DEFAULT_CLUSTER_MINT, ...(store.getSettings().clusterMint ?? {}) };
+  }
+
+  /**
+   * Actually send it.
+   *
+   * Signing happens here, from the encrypted store, exactly as the main bot
+   * does it — the keys never leave the process and this bot never sees one.
+   */
+  async function fireMint(chatId: number, contract: string, wallets: string[], quantity: number, why: string) {
+    const store = stores.for(ownerId);
+    const settings = store.getSettings();
+    const chainKey = settings.chainKey;
+    const chain = resolveChain(chainKey);
+    if (!chain) return;
+    const { urls } = resolveRpcsForChain(chainKey);
+    const logger = createLogger((text) => void bot.telegram.sendMessage(chatId, text).catch(() => {}), "headlines");
+
+    try {
+      const resolved = await resolveMint({
+        rpcUrls: urls,
+        chainKey,
+        chainId: chain.chainId,
+        contract,
+        wallets,
+        quantity,
+        signerFor: (address) => new Wallet(store.getDecryptedKey(address)),
+      });
+      if (!resolved || resolved.plans.length === 0) {
+        return bot.telegram.sendMessage(chatId, "Couldn't resolve a mintable stage for that after all — nothing sent.");
+      }
+
+      const planFor = planLookup(resolved);
+      const representative = resolved.plans[0].plan;
+      countFire();
+
+      const outcome = await localPublicSnipe({
+        nftContract: contract,
+        quantity: resolved.quantity,
+        walletKeys: resolved.plans.map((p) => store.getDecryptedKey(p.address)),
+        rpcUrls: urls,
+        maxFeePerGas: gweiToWei(settings.maxFeeGwei),
+        maxPriorityFee: gweiToWei(settings.priorityGwei),
+        gasLimit: settings.gasLimit,
+        earlyFireMs: settings.earlyFireMs,
+        targetStart: null,
+        plan: representative,
+        planFor,
+        onGas: (e) => store.recordGas(e),
+        gasLabel: "Cluster Mint",
+        logger,
+      });
+
+      await bot.telegram.sendMessage(
+        chatId,
+        outcome.minted.length > 0
+          ? `Minted from ${outcome.minted.length} wallet(s) — ${why}.`
+          : `Nothing confirmed. ${why}, but no wallet landed it.`
+      );
+    } catch (err: any) {
+      await bot.telegram.sendMessage(chatId, `Cluster mint failed: ${err?.message ?? err}`);
+    }
+  }
+
+  /**
+   * A crowd formed. Work out whether to follow it, and how.
+   *
+   * Every branch that could spend runs through decideClusterMint, which is a
+   * pure function with its own tests — the rule that a paid mint never fires
+   * unattended lives there rather than in the middle of this.
+   */
+  async function considerCluster(chatId: number, chainKey: string, c: NonNullable<ReturnType<ClusterTracker["note"]>>) {
+    const store = stores.for(ownerId);
+    const settings = clusterSettings(store);
+    if (!settings.enabled || c.kind !== "mint") return;
+
+    const chain = resolveChain(chainKey);
+    if (!chain) return;
+    const { urls } = resolveRpcsForChain(chainKey);
+    const mine = store.listWallets().map((w) => w.address);
+    if (mine.length === 0) return;
+
+    let priceEth: number | null = null;
+    let maxPerWallet = 0;
+    let alreadyHold = false;
+    try {
+      const plan = await firstAnswer(urls, (url: string) => buildLocalMintPlan(url, c.contract, 1));
+      if (plan) {
+        priceEth = Number(plan.drop.mintPrice) / 1e18;
+        maxPerWallet = plan.drop.maxTotalMintableByWallet;
+      }
+      // Holding it already means the crowd is late for you, not early.
+      const held = await createProvider(urls[0])
+        .call({
+          to: c.contract,
+          data: "0x70a08231" + mine[0].slice(2).toLowerCase().padStart(64, "0"),
+        })
+        .catch(() => "0x");
+      alreadyHold = held !== "0x" && BigInt(held) > 0n;
+    } catch {
+      /* priceEth stays null, which decideClusterMint treats as paid */
+    }
+
+    const decision = decideClusterMint({
+      settings,
+      clusterWallets: c.wallets.length,
+      kind: c.kind,
+      priceEth,
+      eligible: mine,
+      maxPerWallet,
+      firedToday,
+      alreadyHold,
+    });
+
+    const name = await nameOf(chainKey, c.contract);
+
+    if (decision.action === "skip") {
+      // Said quietly rather than silently: a rule that declines without
+      // explanation is indistinguishable from one that is broken.
+      await bot.telegram
+        .sendMessage(chatId, `_Not auto-minting ${name} — ${decision.why}._`, { parse_mode: "Markdown" })
+        .catch(() => {});
+      return;
+    }
+
+    if (decision.action === "fire") {
+      await bot.telegram.sendMessage(chatId, `⚡ Auto-minting *${name}* — ${decision.why}.`, {
+        parse_mode: "Markdown",
+      });
+      return fireMint(chatId, c.contract, decision.wallets, decision.quantity, decision.why);
+    }
+
+    // Paid: ask, and let it expire.
+    const id = Math.random().toString(36).slice(2, 10);
+    pending.set(id, {
+      contract: c.contract,
+      wallets: decision.wallets,
+      quantity: decision.quantity,
+      at: Date.now(),
+      name,
+    });
+    for (const [k, v] of pending) if (Date.now() - v.at > ASK_TTL_MS) pending.delete(k);
+
+    await bot.telegram.sendMessage(chatId, describeAsk(decision, name, chain.nativeSymbol, priceEth ?? 0), {
+      parse_mode: "Markdown",
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback(`✅ Mint it — ${decision.totalCostEth.toFixed(4)} ${chain.nativeSymbol}`, `cm:go:${id}`)],
+        [Markup.button.callback("✖ No", `cm:no:${id}`)],
+      ]),
+    });
+  }
+
+  bot.action(/^cm:go:(.+)$/, async (ctx) => {
+    if (!owner(ctx)) return;
+    const job = pending.get(ctx.match[1]);
+    pending.delete(ctx.match[1]);
+    if (!job) return ctx.answerCbQuery("That expired — the terms may have moved.", { show_alert: true });
+    if (Date.now() - job.at > ASK_TTL_MS) {
+      return ctx.answerCbQuery("That expired — the terms may have moved.", { show_alert: true });
+    }
+    await ctx.answerCbQuery("Minting…");
+    await ctx.editMessageReplyMarkup(undefined).catch(() => {});
+    countFire();
+    return fireMint(ctx.chat!.id, job.contract, job.wallets, job.quantity, "you confirmed it");
+  });
+
+  bot.action(/^cm:no:(.+)$/, async (ctx) => {
+    if (!owner(ctx)) return;
+    pending.delete(ctx.match[1]);
+    await ctx.answerCbQuery("Left it.");
+    return ctx.editMessageReplyMarkup(undefined).catch(() => {});
+  });
+
+  bot.action("sa:auto", async (ctx) => {
+    if (!owner(ctx)) return;
+    await ctx.answerCbQuery();
+    const store = stores.for(ownerId);
+    const s = clusterSettings(store);
+    return ctx.editMessageText(
+      "⚡ *Auto-mint on a cluster*\n\n" +
+        `Currently *${s.enabled ? "on" : "off"}*.\n\n` +
+        `Fires when *${s.minWallets}* watched wallets mint the same collection within ten minutes, ` +
+        `using up to *${s.maxWallets}* of your wallets, *${s.quantityPerWallet}* each, ` +
+        `at most *${s.maxPerDay}* times a day.\n\n` +
+        (s.maxPriceEth > 0
+          ? `Paid mints up to *${s.maxPriceEth}* each will ASK first.`
+          : "*Free mints only.* A paid one is skipped rather than offered.") +
+        "\n\n_A paid mint never fires without a tap, whatever these are set to._",
+      Markup.inlineKeyboard([
+        [Markup.button.callback(s.enabled ? "⏸ Turn off" : "▶️ Turn on", "sa:auto:toggle")],
+        [
+          Markup.button.callback(`Wallets needed: ${s.minWallets}`, "sa:auto:min"),
+          Markup.button.callback(`Use: ${s.maxWallets}`, "sa:auto:use"),
+        ],
+        [Markup.button.callback(`Paid ceiling: ${s.maxPriceEth || "off"}`, "sa:auto:price")],
+        [Markup.button.callback("⬅ Back", "sa:menu")],
+      ])
+    );
+  });
+
+  bot.action("sa:auto:toggle", async (ctx) => {
+    if (!owner(ctx)) return;
+    const store = stores.for(ownerId);
+    const s = clusterSettings(store);
+    store.updateSettings({ clusterMint: { ...s, enabled: !s.enabled } });
+    await ctx.answerCbQuery(!s.enabled ? "On" : "Off");
+    return (ctx as any).update.callback_query && bot.telegram
+      .editMessageText(ctx.chat!.id, (ctx.callbackQuery as any).message.message_id, undefined, "…")
+      .then(() => undefined)
+      .catch(() => undefined);
+  });
+
+  for (const [action, field, values] of [
+    ["sa:auto:min", "minWallets", [2, 3, 4, 5]],
+    ["sa:auto:use", "maxWallets", [1, 2, 3, 5, 10]],
+    ["sa:auto:price", "maxPriceEth", [0, 0.001, 0.005, 0.01, 0.05]],
+  ] as const) {
+    bot.action(action, async (ctx) => {
+      if (!owner(ctx)) return;
+      const store = stores.for(ownerId);
+      const s = clusterSettings(store);
+      const current = (s as any)[field] as number;
+      // Cycle rather than prompt: four taps beats a typed number that has to
+      // be validated, and every value here is one someone would actually pick.
+      const next = values[(values.indexOf(current as never) + 1) % values.length];
+      store.updateSettings({ clusterMint: { ...s, [field]: next } });
+      await ctx.answerCbQuery(`${field}: ${next}`);
+      return undefined;
+    });
+  }
 
   bot.command("watch", (ctx) => {
     if (!owner(ctx)) return;

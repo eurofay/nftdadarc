@@ -4,6 +4,7 @@
 
 import { GasEntry } from "../gas-ledger";
 import { SmartWallet } from "../smart-wallet";
+import { ClusterMintSettings } from "../cluster-mint";
 import fs from "fs";
 import path from "path";
 import { randomBytes } from "crypto";
@@ -108,6 +109,13 @@ export interface BotSettings {
    * fell back to the single current chain and looked like it only knew one.
    */
   radarChainKeys?: string[];
+  /**
+   * Following a crowd of watched wallets into a mint.
+   *
+   * Absent means off. Nothing here can make a PAID mint fire unattended --
+   * that rule lives in decideClusterMint and no setting reaches it.
+   */
+  clusterMint?: ClusterMintSettings;
   copyMintEnabled: boolean;
   // Copy-mint isn't restricted to free drops, so this is the one guardrail
   // against blindly following a watched wallet into an expensive mint.
