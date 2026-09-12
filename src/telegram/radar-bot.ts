@@ -333,10 +333,14 @@ export function startRadarBot(
   bot.action("radar:toggle", async (ctx) => {
     if (!owner(ctx)) return;
     await ctx.answerCbQuery();
+    const store = stores.for(ownerId);
     if (watchers.size > 0) {
       for (const s of watchers.values()) s.stopped = true;
-      return ctx.editMessageText("Radar off.", menu());
+      // Written down, so a deliberate stop is not undone by the next deploy.
+      store.updateSettings({ radarWatchOn: false });
+      return ctx.editMessageText("Radar off. It will stay off until you turn it back on.", menu());
     }
+    store.updateSettings({ radarWatchOn: true });
     const n = startWatching(ctx.chat!.id);
     return ctx.editMessageText(
       n > 0 ? `Radar on — watching ${n} chain(s).` : "No chains selected. Pick them in the main bot's settings.",
@@ -877,6 +881,24 @@ export function startRadarBot(
   bot
     .launch(() => {
       console.log(`Radar bot running — drop radar and scout, reporting to ${ownerId}.`);
+
+      // Watching is what this bot is FOR, so it does not wait to be asked.
+      // A feed that needs a tap after every deploy is one you discover is off
+      // by missing the thing it existed to catch.
+      //
+      // A Telegram private chat carries the same id as the user, so the owner
+      // id already addresses the right conversation -- provided they have
+      // pressed Start once, which Telegram requires before any bot may write.
+      if (stores.for(ownerId).getSettings().radarWatchOn !== false) {
+        try {
+          const started = startWatching(ownerId);
+          console.log(`Radar auto-started on ${started} chain(s).`);
+        } catch (err: any) {
+          console.error(`Radar could not auto-start: ${err?.message ?? err}`);
+        }
+      } else {
+        console.log("Radar is off — stopped deliberately, and it stays that way until turned back on.");
+      }
       bot.telegram
         .getMe()
         .then((me) => {

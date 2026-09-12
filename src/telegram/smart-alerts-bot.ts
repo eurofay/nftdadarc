@@ -218,14 +218,20 @@ export function startSmartAlertsBot(
     try {
       cursor = await provider.getBlockNumber();
     } catch (err: any) {
-      await bot.telegram.sendMessage(chatId, `Could not reach ${chain.name}: ${err?.message ?? err}`);
+      await bot.telegram
+        .sendMessage(chatId, `Could not reach ${chain.name}: ${err?.message ?? err}`)
+        .catch(() => {});
+      watching = null;
       return;
     }
 
-    await bot.telegram.sendMessage(
-      chatId,
-      `👁 Watching ${store.listSmartWallets().length} smart wallet(s) on ${chain.name}.`
-    );
+    // Best-effort. Telegram refuses to let a bot write to someone who has not
+    // pressed Start, and at boot that is entirely possible -- but the watcher
+    // should still run, so that the moment they do press Start the alerts are
+    // already flowing rather than waiting to be switched on.
+    await bot.telegram
+      .sendMessage(chatId, `👁 Watching ${store.listSmartWallets().length} smart wallet(s) on ${chain.name}.`)
+      .catch(() => {});
 
     while (!signal.stopped) {
       try {
@@ -304,32 +310,46 @@ export function startSmartAlertsBot(
     return ctx.editMessageText("👁 Smart alerts:", menu());
   });
 
+  /**
+   * Begin watching, reporting into `chatId`.
+   *
+   * Shared by the button and by launch so the two cannot drift -- the
+   * rejection guard in particular is easy to add in one place and forget in
+   * the other, and forgetting it kills the process rather than the watcher.
+   */
+  function beginWatching(chatId: number): void {
+    if (watching) return;
+    const signal = { stopped: false };
+    watching = signal;
+    void watch(chatId, signal).catch((err: any) => {
+      console.error(`Smart alerts watcher stopped: ${err?.message ?? err}`);
+      watching = null;
+      void bot.telegram.sendMessage(chatId, `Stopped watching — ${err?.message ?? err}`).catch(() => {});
+    });
+  }
+
   bot.action("sa:toggle", async (ctx) => {
     if (!owner(ctx)) return;
     await ctx.answerCbQuery();
+    const store = stores.for(ownerId);
     if (watching) {
       watching.stopped = true;
       watching = null;
-      return ctx.editMessageText("Stopped.", menu());
+      // Written down, so a deliberate stop survives the next deploy.
+      store.updateSettings({ smartWatchOn: false });
+      return ctx.editMessageText("Stopped. It will stay stopped until you start it again.", menu());
     }
-    if (stores.for(ownerId).listSmartWallets().length === 0) {
-      return ctx.editMessageText(
-        "No smart wallets recorded yet. Find some with Scout or Proven profit in the radar bot, then press Record.",
-        menu()
-      );
-    }
-    const signal = { stopped: false };
-    watching = signal;
-    // Same trap as the radar had: an un-caught rejection here does not stop
-    // the watcher, it stops the PROCESS.
-    void watch(ctx.chat!.id, signal).catch((err: any) => {
-      console.error(`Smart alerts watcher stopped: ${err?.message ?? err}`);
-      watching = null;
-      void bot.telegram
-        .sendMessage(ctx.chat!.id, `Stopped watching — ${err?.message ?? err}`)
-        .catch(() => {});
-    });
-    return ctx.editMessageText("Watching.", menu());
+    store.updateSettings({ smartWatchOn: true });
+    beginWatching(ctx.chat!.id);
+    // Started even with an empty list rather than refused: the loop re-reads
+    // the wallets every tick, so recording one later just works instead of
+    // needing this pressed again.
+    return ctx.editMessageText(
+      store.listSmartWallets().length === 0
+        ? "Watching. No smart wallets recorded yet — record some in bot 3 and they are picked up automatically."
+        : "Watching.",
+      menu()
+    );
   });
 
   bot.action("sa:kinds", async (ctx) => {
@@ -801,6 +821,21 @@ export function startSmartAlertsBot(
   bot
     .launch(() => {
       console.log(`Smart alerts bot running — watching recorded wallets for ${ownerId}.`);
+
+      // Starts on its own, for the same reason the radar does: an alert feed
+      // that waits to be switched on is one you find out was off by missing
+      // something. A private chat's id is the user's id, so ownerId already
+      // addresses the right conversation.
+      if (stores.for(ownerId).getSettings().smartWatchOn !== false) {
+        try {
+          beginWatching(ownerId);
+          console.log("Smart alerts auto-started.");
+        } catch (err: any) {
+          console.error(`Smart alerts could not auto-start: ${err?.message ?? err}`);
+        }
+      } else {
+        console.log("Smart alerts are off — stopped deliberately, and stay that way until turned back on.");
+      }
       bot.telegram
         .getMe()
         .then((me) => (handle.username = me.username))

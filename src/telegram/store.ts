@@ -125,6 +125,16 @@ export interface BotSettings {
    * was added to it directly.
    */
   copyFollowsSmart?: boolean;
+  /**
+   * Whether the radar and the smart-alert watcher run without being asked.
+   *
+   * Absent means ON: watching is what these two bots are FOR, and a feed that
+   * needs a tap after every deploy is a feed you find out is off by missing
+   * something. Stopping one writes false here, so a deliberate stop survives
+   * a redeploy -- otherwise the Stop button only means "until the next push".
+   */
+  radarWatchOn?: boolean;
+  smartWatchOn?: boolean;
   copyMintEnabled: boolean;
   // Copy-mint isn't restricted to free drops, so this is the one guardrail
   // against blindly following a watched wallet into an expensive mint.
