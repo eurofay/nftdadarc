@@ -647,8 +647,22 @@ export function startSmartAlertsBot(
     if (decision.action === "skip") {
       // Said quietly rather than silently: a rule that declines without
       // explanation is indistinguishable from one that is broken.
+      // The address goes with it. A decline that leaves you unable to act on
+      // the thing you were just told about is only half a message.
+      const main = mainBotUsername?.();
       await bot.telegram
-        .sendMessage(chatId, `_Not auto-minting ${name} — ${decision.why}._`, { parse_mode: "Markdown" })
+        .sendMessage(
+          chatId,
+          `_Not auto-minting ${name} — ${decision.why}._\n\n\`${c.contract}\``,
+          {
+            parse_mode: "Markdown",
+            ...(main
+              ? Markup.inlineKeyboard([
+                  [Markup.button.url("⚡ Mint it yourself", `https://t.me/${main}?start=mint_${c.contract}`)],
+                ])
+              : {}),
+          }
+        )
         .catch(() => {});
       return;
     }
@@ -713,7 +727,8 @@ export function startSmartAlertsBot(
         `using up to *${s.maxWallets}* of your wallets, *${s.quantityPerWallet}* each, ` +
         `at most *${s.maxPerDay}* times a day.\n\n` +
         (s.maxPriceEth > 0
-          ? `Paid mints up to *${s.maxPriceEth}* each will ASK first.`
+          ? `A paid mint up to *${s.maxPriceEth}* each ASKS first — it never fires on its own. ` +
+            "Above that it tells you and hands you the address, rather than putting a spend button on it."
           : "*Free mints only.* A paid one is skipped rather than offered.") +
         "\n\n_A paid mint never fires without a tap, whatever these are set to._",
       Markup.inlineKeyboard([

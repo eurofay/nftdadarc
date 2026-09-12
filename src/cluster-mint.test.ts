@@ -38,13 +38,20 @@ describe("the line between free and paid", () => {
     expect(d.action).toBe("ask");
   });
 
-  it("will not even ask when paid auto-mint was never enabled", () => {
-    // maxPriceEth 0 is the shipped default: turning the feature on does not
-    // by itself authorise spending anything.
-    expect(DEFAULT_CLUSTER_MINT.maxPriceEth).toBe(0);
-    const d = decideClusterMint(opts({ priceEth: 0.01 }));
+  it("asks about a paid mint out of the box, rather than ignoring it", () => {
+    // The shipped ceiling is generous against what this chain charges, so in
+    // practice a paid cluster reaches you as a question instead of being
+    // quietly dropped.
+    expect(DEFAULT_CLUSTER_MINT.maxPriceEth).toBeGreaterThan(0);
+    expect(decideClusterMint(opts({ priceEth: 0.01 })).action).toBe("ask");
+  });
+
+  it("still allows free-only, for anyone who sets the ceiling to zero", () => {
+    const d = decideClusterMint(
+      opts({ priceEth: 0.01, settings: { ...DEFAULT_CLUSTER_MINT, maxPriceEth: 0 } })
+    );
     expect(d.action).toBe("skip");
-    expect(d.why).toContain("not enabled");
+    expect(d.why).toContain("free mints only");
   });
 
   it("will not ask above the ceiling", () => {
@@ -52,7 +59,9 @@ describe("the line between free and paid", () => {
       opts({ priceEth: 0.2, settings: { ...DEFAULT_CLUSTER_MINT, enabled: true, maxPriceEth: 0.05 } })
     );
     expect(d.action).toBe("skip");
-    expect(d.why).toContain("over your 0.05 ceiling");
+    // Reads as "too big to ask about", not "blocked" — the address comes with
+    // it and minting by hand is one tap away.
+    expect(d.why).toContain("above the 0.05 you want to be asked about");
   });
 
   it("treats an unreadable price as paid, not as free", () => {
@@ -64,9 +73,21 @@ describe("the line between free and paid", () => {
 });
 
 describe("when it declines to act at all", () => {
-  it("is off until turned on", () => {
-    expect(DEFAULT_CLUSTER_MINT.enabled).toBe(false);
-    expect(decideClusterMint(opts({ settings: DEFAULT_CLUSTER_MINT })).action).toBe("skip");
+  it("is on out of the box, because watching a crowd form and doing nothing is the failure", () => {
+    expect(DEFAULT_CLUSTER_MINT.enabled).toBe(true);
+    expect(decideClusterMint(opts({ settings: DEFAULT_CLUSTER_MINT })).action).toBe("fire");
+  });
+
+  it("can still be turned off entirely", () => {
+    const d = decideClusterMint(opts({ settings: { ...DEFAULT_CLUSTER_MINT, enabled: false } }));
+    expect(d.action).toBe("skip");
+  });
+
+  it("being on by default never means a paid mint fires by default", () => {
+    // The reason on-by-default is reasonable rather than reckless: the only
+    // thing it authorises unattended is a free mint.
+    const d = decideClusterMint(opts({ settings: DEFAULT_CLUSTER_MINT, priceEth: 0.001 }));
+    expect(d.action).toBe("ask");
   });
 
   it("ignores a crowd that was selling", () => {

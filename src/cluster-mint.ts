@@ -39,15 +39,28 @@ export interface ClusterMintSettings {
 }
 
 export const DEFAULT_CLUSTER_MINT: ClusterMintSettings = {
-  enabled: false,
+  // On. Watching a crowd form and then doing nothing about it is the one
+  // outcome nobody wants from this, and the FREE case costs a fraction of a
+  // cent. The paid case is still gated behind a tap, which is what makes
+  // being on by default reasonable rather than reckless.
+  enabled: true,
   // Three, not two. Two wallets is the threshold for being TOLD about a
-  // cluster, and telling you is free; spending your money on it deserves a
-  // higher bar than raising an eyebrow does.
+  // cluster, and telling you is free; spending deserves a higher bar.
   minWallets: 3,
-  // Zero means "free mints only, never ask about a paid one". The safest
-  // setting is also the default, and turning the feature on does not by
-  // itself authorise any spending at all.
-  maxPriceEth: 0,
+  /**
+   * The most a single item may cost and still be worth ASKING about.
+   *
+   * Not an on/off switch -- a paid mint always asks, never fires. This is the
+   * point above which asking stops being useful: waking you at 3am to confirm
+   * something absurd is its own kind of failure, and a cluster on a 2 ETH
+   * mint is a decision to make awake, at a screen, not from a notification.
+   *
+   * 0.1 is generous against what this chain actually charges -- observed
+   * mints run from free to about 0.15 -- so in practice nearly everything
+   * asks. Above it, the bot still SAYS so and hands you the address; it just
+   * does not put a spend button next to it.
+   */
+  maxPriceEth: 0.1,
   maxWallets: 3,
   quantityPerWallet: 1,
   maxPerDay: 10,
@@ -108,12 +121,15 @@ export function decideClusterMint(opts: DecideOpts): ClusterDecision {
 
   // Paid from here down. It can only ever ask.
   if (s.maxPriceEth <= 0) {
-    return { action: "skip", why: `it costs ${opts.priceEth} each and paid auto-mint is not enabled` };
+    // Someone has deliberately set the ceiling to zero, which means free only.
+    return { action: "skip", why: `it costs ${opts.priceEth} each and you have set free mints only` };
   }
   if (opts.priceEth > s.maxPriceEth) {
     return {
       action: "skip",
-      why: `${opts.priceEth} each is over your ${s.maxPriceEth} ceiling`,
+      // Named as "too big to ask about" rather than "blocked", because the
+      // address comes with it and minting it by hand is one tap away.
+      why: `${opts.priceEth} each is above the ${s.maxPriceEth} you want to be asked about — mint it by hand if you want it`,
     };
   }
 
