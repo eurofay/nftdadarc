@@ -19,6 +19,7 @@ import { Telegraf, Telegram, Markup } from "telegraf";
 import { UserStores } from "./user-stores";
 import { registerWalletFilter, FILTER_INTRO } from "./wallet-filter-flow";
 import { cleanToken } from "./token";
+import { installGuards } from "./bot-guards";
 
 export interface AlertsBot {
   telegram: Telegram;
@@ -70,6 +71,10 @@ export function startAlertsBot(
   }
 
   const bot = new Telegraf(cleaned.token);
+  // Before any handler. Without these a single bad button press rejects the
+  // launch promise and the bot silently stops polling -- which is what took
+  // bot 3 down after every redeploy.
+  installGuards(bot, "Alerts (bot 2)");
   const filter = registerWalletFilter(bot, { ownerId, stores });
 
   const handle: AlertsBot = {

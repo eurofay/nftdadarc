@@ -13,6 +13,7 @@
 import { Telegraf, Telegram, Markup } from "telegraf";
 import { UserStores } from "./user-stores";
 import { cleanToken } from "./token";
+import { installGuards } from "./bot-guards";
 import { resolveChain, blocksForSeconds, logChunkBlocksFor } from "../chains";
 import { resolveRpcsForChain } from "../rpc-resolver";
 import { createProvider } from "../rpc-provider";
@@ -98,6 +99,10 @@ export function startSmartAlertsBot(
   }
 
   const bot = new Telegraf(cleaned.token);
+  // Before any handler. Without these a single bad button press rejects the
+  // launch promise and the bot silently stops polling -- which is what took
+  // bot 3 down after every redeploy.
+  installGuards(bot, "Smart alerts (bot 4)");
   const handle: SmartAlertsBot = { telegram: bot.telegram, stop: (reason) => bot.stop(reason) };
   const owner = (ctx: any): boolean => ctx.from?.id === ownerId;
 
@@ -315,7 +320,15 @@ export function startSmartAlertsBot(
     }
     const signal = { stopped: false };
     watching = signal;
-    void watch(ctx.chat!.id, signal);
+    // Same trap as the radar had: an un-caught rejection here does not stop
+    // the watcher, it stops the PROCESS.
+    void watch(ctx.chat!.id, signal).catch((err: any) => {
+      console.error(`Smart alerts watcher stopped: ${err?.message ?? err}`);
+      watching = null;
+      void bot.telegram
+        .sendMessage(ctx.chat!.id, `Stopped watching — ${err?.message ?? err}`)
+        .catch(() => {});
+    });
     return ctx.editMessageText("Watching.", menu());
   });
 

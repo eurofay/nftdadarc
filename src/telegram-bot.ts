@@ -124,6 +124,26 @@ async function main(): Promise<void> {
     onScheduled: (id) => hooks.armScheduled?.(ownerId, id),
   });
 
+  // A background watcher must not be able to kill four bots and the web UI.
+  //
+  // Node terminates on an unhandled rejection by default since v15, and this
+  // process is mostly long-lived loops started with `void`. One of them
+  // throwing used to take everything down -- which read, from the chat, as
+  // "bot 3 stopped responding", because a redeploy brought it back, flushed
+  // the backlog, and then it died again the moment the watcher restarted.
+  //
+  // Logged loudly rather than swallowed: the goal is to survive it, not to
+  // stop hearing about it.
+  process.on("unhandledRejection", (reason: any) => {
+    console.error(
+      `Unhandled rejection — the process is staying up. ${reason?.stack ?? reason?.message ?? reason}`
+    );
+  });
+
+  process.on("uncaughtException", (err: any) => {
+    console.error(`Uncaught exception — the process is staying up. ${err?.stack ?? err?.message ?? err}`);
+  });
+
   process.once("SIGINT", () => {
     bot.stop("SIGINT");
     alerts?.stop("SIGINT");

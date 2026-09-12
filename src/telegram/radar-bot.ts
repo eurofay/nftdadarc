@@ -16,6 +16,7 @@ import { Telegraf, Telegram, Markup } from "telegraf";
 import { formatEther } from "ethers";
 import { UserStores } from "./user-stores";
 import { cleanToken } from "./token";
+import { installGuards } from "./bot-guards";
 import { CHAINS, ChainProfile, resolveChain, logChunkBlocksFor, blocksForSeconds } from "../chains";
 import { resolveRpcsForChain } from "../rpc-resolver";
 import { RadarBoard, UpcomingDrop, Verdict, countdown, priceLabel, leadMs, isLive } from "../drop-radar";
@@ -101,6 +102,10 @@ export function startRadarBot(
   }
 
   const bot = new Telegraf(cleaned.token);
+  // Before any handler. Without these a single bad button press rejects the
+  // launch promise and the bot silently stops polling -- which is what took
+  // bot 3 down after every redeploy.
+  installGuards(bot, "Radar (bot 3)");
   const handle: RadarBot = { telegram: bot.telegram, stop: (reason) => bot.stop(reason) };
   const boards = new Map<string, RadarBoard>();
   const watchers = new Map<string, { stopped: boolean }>();
@@ -292,7 +297,20 @@ export function startRadarBot(
         stopSignal: signal,
         logger: createLogger((text) => void bot.telegram.sendMessage(chatId, text).catch(() => {}), "headlines"),
         onAlert: (drop, verdict) => sendAlert(chatId, chain, drop, verdict),
-      }).finally(() => watchers.delete(key));
+      })
+        // .finally() does NOT handle a rejection -- it re-raises it. Without
+        // this catch, a watcher throwing became an unhandled rejection, and
+        // Node's default since v15 is to KILL THE PROCESS. The symptom was
+        // that a redeploy fixed the bot, it flushed its backlog, and then it
+        // stopped: the watcher was dying and taking all four bots with it.
+        .catch((err: any) => {
+          const name = resolveChain(key)?.name ?? key;
+          console.error(`Radar watcher for ${name} stopped: ${err?.message ?? err}`);
+          void bot.telegram
+            .sendMessage(chatId, `Radar stopped watching ${name} — ${err?.message ?? err}`)
+            .catch(() => {});
+        })
+        .finally(() => watchers.delete(key));
     }
     return started;
   }
