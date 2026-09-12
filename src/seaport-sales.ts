@@ -26,7 +26,8 @@
 // Reading only the first shape would silently miss every sale made by
 // accepting an offer, which on a chain with thin liquidity is a lot of them.
 
-import { Interface } from "ethers";
+import { Interface, getAddress, zeroPadValue } from "ethers";
+import { chunksOf, runChunks } from "./chunk-scan";
 import { createProvider } from "./rpc-provider";
 
 /** Seaport 1.6, the canonical CREATE2 address. Verified deployed on Robinhood. */
@@ -139,6 +140,19 @@ export function decodeSale(log: {
 
 export interface ScanSalesOpts {
   chunkBlocks?: number;
+  /**
+   * Restrict to orders these addresses OFFERED, via the indexed topic.
+   *
+   * A narrower query by far, and incomplete in one specific way: `offerer` is
+   * the seller on a listing but the BUYER on an accepted bid, where the seller
+   * is `recipient` and not indexed. So this finds every sale a wallet listed
+   * and none it made by accepting an offer -- fine for widening history
+   * cheaply, wrong as the only source.
+   */
+  offerers?: string[];
+  concurrency?: number;
+  /** Called when chunks were lost even after retries. */
+  onFailedChunks?: (count: number) => void;
   maxRecords?: number;
   onProgress?: (scanned: number, found: number) => void;
   shouldStop?: () => boolean;
@@ -159,39 +173,56 @@ export async function scanSales(
 ): Promise<SaleRecord[]> {
   if (fromBlock > toBlock) return [];
   const provider = createProvider(rpcUrl);
-  const chunk = Math.max(1, opts.chunkBlocks ?? 2_000);
-  const cap = opts.maxRecords ?? 20_000;
-  const out: SaleRecord[] = [];
 
-  for (let to = toBlock; to >= fromBlock; to -= chunk) {
-    if (opts.shouldStop?.()) break;
-    const from = Math.max(fromBlock, to - chunk + 1);
+  const offererTopics =
+    opts.offerers && opts.offerers.length > 0
+      ? opts.offerers.map((a) => zeroPadValue(getAddress(a), 32))
+      : null;
+  const topics: (string | string[] | null)[] = offererTopics
+    ? [ORDER_FULFILLED_TOPIC, offererTopics]
+    : [ORDER_FULFILLED_TOPIC];
 
-    let logs;
-    try {
-      logs = await provider.getLogs({
+  // Narrow enough for the node to answer from an index, so chunking it would
+  // only add round trips.
+  const chunk = offererTopics
+    ? Math.max(1, toBlock - fromBlock + 1)
+    : Math.max(1, opts.chunkBlocks ?? 2_000);
+
+  const { results: logs, failed } = await runChunks(
+    chunksOf(fromBlock, toBlock, chunk),
+    async (range) =>
+      provider.getLogs({
         address: SEAPORT_ADDRESS,
-        topics: [ORDER_FULFILLED_TOPIC],
-        fromBlock: from,
-        toBlock: to,
-      });
-    } catch {
-      // Usually the node's result cap. Reported rather than hidden, because a
-      // skipped chunk biases the sample, but one gap must not end the scan.
-      opts.onProgress?.(toBlock - from, out.length);
-      continue;
+        topics,
+        fromBlock: range.from,
+        toBlock: range.to,
+      }),
+    {
+      concurrency: opts.concurrency,
+      maxResults: opts.maxRecords ?? 20_000,
+      shouldStop: opts.shouldStop,
+      onProgress: (done, total, found) => opts.onProgress?.(done, found),
     }
+  );
+  // Surfaced rather than swallowed: a scan missing chunks is a scan whose
+  // totals are wrong, and the caller has to be able to say so.
+  if (failed > 0) opts.onFailedChunks?.(failed);
 
-    for (const lg of logs) {
-      const sale = decodeSale(lg as any);
-      if (sale) out.push(sale);
-    }
-
-    opts.onProgress?.(toBlock - from, out.length);
-    if (out.length >= cap) break;
+  const out: SaleRecord[] = [];
+  for (const lg of logs) {
+    const sale = decodeSale(lg as any);
+    if (sale) out.push(sale);
   }
-
   return out;
+}
+
+/** Drop duplicates when two scans overlap, keyed by the log they came from. */
+export function mergeSales(...lists: SaleRecord[][]): SaleRecord[] {
+  const seen = new Map<string, SaleRecord>();
+  for (const list of lists) {
+    for (const s of list) seen.set(`${s.txHash}:${s.contract}:${s.tokenId}`, s);
+  }
+  return [...seen.values()];
 }
 
 /** Just this wallet's sales, keyed by the collection they were in. */

@@ -21,7 +21,7 @@ import { resolveRpcsForChain } from "../rpc-resolver";
 import { RadarBoard, UpcomingDrop, Verdict, countdown, priceLabel, leadMs, isLive } from "../drop-radar";
 import { runDropRadar } from "../radar-watch";
 import { scanAllMints } from "../minter-scan";
-import { scanSales } from "../seaport-sales";
+import { scanSales, mergeSales } from "../seaport-sales";
 import { profitScout, whyProfit } from "../profit-scout";
 import { scout, why, RankedMinter } from "../minter-scout";
 import { dossierRows, summaryRow, describeDossier } from "../smart-wallet";
@@ -620,17 +620,28 @@ export function startRadarBot(
       const span = blocksForSeconds(key, 24 * 3600);
       const from = Math.max(0, head - span);
 
-      await edit(`Scanning a day of ${chain.name}…`);
-      const records = await scanAllMints(urls[0], from, head, {
-        chunkBlocks: logChunkBlocksFor(key),
-        maxRecords: 60_000,
-      });
+      // One wallet, so both queries can use the event's own indexed topic and
+      // the node answers from an index. Measured: 2,000,000 blocks in ONE call
+      // in 300ms, where the unfiltered version needed the range chunked and
+      // capped to a day. That is why the window below is a WEEK rather than a
+      // day -- it is both faster and covers far more history, which also
+      // retires most of the "holdings predate this window" answer.
+      const wide = Math.max(0, head - blocksForSeconds(key, 7 * 24 * 3600));
 
-      await edit("Reading settled sales from Seaport…");
-      const sales = await scanSales(urls[0], from, head, {
-        chunkBlocks: logChunkBlocksFor(key),
-        maxRecords: 60_000,
-      });
+      await edit(`Reading ${mask(address)} across a week of ${chain.name}…`);
+      const [records, listed, broad] = await Promise.all([
+        scanAllMints(urls[0], wide, head, { minters: [address], maxRecords: 60_000 }),
+        // Catches everything this wallet LISTED, over the whole week.
+        scanSales(urls[0], wide, head, { offerers: [address], maxRecords: 60_000 }),
+        // And a broad recent sweep, because a sale made by ACCEPTING an offer
+        // names the seller in a field Seaport does not index, so the filtered
+        // query above cannot see it.
+        scanSales(urls[0], from, head, {
+          chunkBlocks: logChunkBlocksFor(key),
+          maxRecords: 60_000,
+        }),
+      ]);
+      const sales = mergeSales(listed, broad);
 
       const dossier = await buildDossier({
         sales,
