@@ -95,6 +95,19 @@ async function main(): Promise<void> {
     () => smart?.username
   );
 
+  // One line naming every bot and whether it is up, because "which of the
+  // four is not answering" should be readable from the deploy log rather than
+  // deduced from silence in a chat.
+  console.log(
+    "Bots: " +
+      [
+        "1 main: on",
+        `2 alerts: ${alerts ? "on" : "off"}`,
+        `3 radar: ${radar ? "on" : "off"}`,
+        `4 smart alerts: ${smart ? "on" : "off"}`,
+      ].join(" | ")
+  );
+
   // Optional web UI. Same store and engine as the bot -- the point of it is
   // that a browser has no 90-second handler timeout, so a scan that takes
   // minutes can just stream its progress instead of racing a clock.

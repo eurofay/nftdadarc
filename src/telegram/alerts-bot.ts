@@ -50,7 +50,13 @@ export function startAlertsBot(
   stores: UserStores
 ): AlertsBot | null {
   const cleaned = cleanToken(token);
-  if (!cleaned.token) return null;
+  if (!cleaned.token) {
+    // Said out loud. Returning null in silence makes "not configured"
+    // indistinguishable from "not responding", and the second is what it
+    // looks like from the chat -- you press Start and nothing ever answers.
+    console.log(`Alerts (bot 2): off — TELEGRAM_ALERTS_BOT_TOKEN is not set. Effect: activity alerts and the wallet filter stay on the main bot.`);
+    return null;
+  }
 
   // Said out loud, because the only other symptom is a bare 401 that gives
   // no hint the value itself was mangled on the way in.
@@ -119,6 +125,16 @@ export function startAlertsBot(
     .catch((err: any) => {
       // Logged, not thrown: see above.
       console.error(`Companion bot could not start: ${err?.description || err?.message || err}`);
+      if (err?.response?.error_code === 409) {
+        // Telegram allows exactly ONE long-poller per token. A second one --
+        // an old deployment still alive, a local run, the same token pasted
+        // into two variables -- gets this, and the bot simply never receives
+        // an update while looking perfectly healthy.
+        console.error(
+          "TELEGRAM_ALERTS_BOT_TOKEN: another instance is already polling this token. " +
+            "Stop the old deployment, or give this bot its own token from @BotFather."
+        );
+      }
       if (err?.response?.error_code === 401) {
         console.error("TELEGRAM_ALERTS_BOT_TOKEN is not a valid bot token.");
       }

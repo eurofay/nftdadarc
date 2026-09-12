@@ -87,7 +87,13 @@ export function startRadarBot(
   smartBotUsername?: () => string | undefined
 ): RadarBot | null {
   const cleaned = cleanToken(token);
-  if (!cleaned.token) return null;
+  if (!cleaned.token) {
+    // Said out loud. Returning null in silence makes "not configured"
+    // indistinguishable from "not responding", and the second is what it
+    // looks like from the chat -- you press Start and nothing ever answers.
+    console.log(`Radar (bot 3): off — TELEGRAM_RADAR_BOT_TOKEN is not set. Effect: no drop radar, no scout, no proven profit.`);
+    return null;
+  }
   for (const note of cleaned.notes) console.warn(`TELEGRAM_RADAR_BOT_TOKEN: ${note}.`);
   if (!cleaned.looksValid) {
     console.error("TELEGRAM_RADAR_BOT_TOKEN is not shaped like a bot token. The radar stays off.");
@@ -863,6 +869,16 @@ export function startRadarBot(
     })
     .catch((err: any) => {
       console.error(`Radar bot could not start: ${err?.description || err?.message || err}`);
+      if (err?.response?.error_code === 409) {
+        // Telegram allows exactly ONE long-poller per token. A second one --
+        // an old deployment still alive, a local run, the same token pasted
+        // into two variables -- gets this, and the bot simply never receives
+        // an update while looking perfectly healthy.
+        console.error(
+          "TELEGRAM_RADAR_BOT_TOKEN: another instance is already polling this token. " +
+            "Stop the old deployment, or give this bot its own token from @BotFather."
+        );
+      }
     });
 
   return handle;

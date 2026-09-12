@@ -84,7 +84,13 @@ export function startSmartAlertsBot(
   mainBotUsername?: () => string | undefined
 ): SmartAlertsBot | null {
   const cleaned = cleanToken(token);
-  if (!cleaned.token) return null;
+  if (!cleaned.token) {
+    // Said out loud. Returning null in silence makes "not configured"
+    // indistinguishable from "not responding", and the second is what it
+    // looks like from the chat -- you press Start and nothing ever answers.
+    console.log(`Smart alerts (bot 4): off — TELEGRAM_SMART_BOT_TOKEN is not set. Effect: no smart-wallet activity, no cluster auto-mint.`);
+    return null;
+  }
   for (const note of cleaned.notes) console.warn(`TELEGRAM_SMART_BOT_TOKEN: ${note}.`);
   if (!cleaned.looksValid) {
     console.error("TELEGRAM_SMART_BOT_TOKEN is not shaped like a bot token. Smart alerts stay off.");
@@ -789,6 +795,16 @@ export function startSmartAlertsBot(
     })
     .catch((err: any) => {
       console.error(`Smart alerts bot could not start: ${err?.description || err?.message || err}`);
+      if (err?.response?.error_code === 409) {
+        // Telegram allows exactly ONE long-poller per token. A second one --
+        // an old deployment still alive, a local run, the same token pasted
+        // into two variables -- gets this, and the bot simply never receives
+        // an update while looking perfectly healthy.
+        console.error(
+          "TELEGRAM_SMART_BOT_TOKEN: another instance is already polling this token. " +
+            "Stop the old deployment, or give this bot its own token from @BotFather."
+        );
+      }
     });
 
   void seenTransfers;
