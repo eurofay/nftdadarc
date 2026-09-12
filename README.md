@@ -263,6 +263,63 @@ instead, which never puts a key through Telegram at all.
 
 ---
 
+## Step 7 — Web UI: the same bot, in a browser
+
+Set `WEB_ACCESS_TOKEN` and the bot process also serves a web UI on `PORT`
+(default 8080). Same store, same mint engine, same wallets — it is the bot,
+with a browser in front of it instead of a chat.
+
+```
+WEB_ACCESS_TOKEN=$(openssl rand -hex 32)
+WEB_PUBLIC_URL=https://your-app.up.railway.app
+```
+
+It exists for one reason: **Telegram gives a bot 90 seconds to answer, and
+some jobs take minutes.** Walking every wallet you own to find who holds a
+collection, or pricing a P&L across them, was racing that clock and losing.
+A browser has no such limit, so those jobs stream their progress instead —
+`Find NFT`, `P&L`, wallet scans and the CSV filter all run as live streams.
+
+Ten screens: **Overview**, **Wallets**, **Mint**, **Copy Mint**, **Wallet
+Filter**, **Consolidate**, **Find NFT**, **P&L** and **Settings**. Minting
+from the browser reads the drop's live stage, lets you pick wallets, and
+either fires now or arms it for the stage's own start time — armed mints are
+handed straight to the running bot, so they fire without waiting for a
+restart. **🧪 Preflight** simulates the transaction against the chain before
+you spend any gas on it.
+
+| Variable | What it does |
+|---|---|
+| `WEB_ACCESS_TOKEN` | The password. **Unset = no web UI at all**, and the bot starts normally. |
+| `PORT` | Port to listen on. Default 8080. Your host usually sets this for you. |
+| `WEB_PUBLIC_URL` | Your public URL. An `https://` value turns on `Secure` cookies. Set it in production. |
+
+### Read this before you expose it
+
+Telegram gates the bot behind a numeric account id nobody can forge. A URL is
+reachable by anyone who finds it. **On a hosted deployment the web door is the
+weakest point in the whole system**, so it's built to be the strongest:
+
+- **No route ever returns a private key or a seed phrase.** Not behind
+  re-auth, not behind a confirmation. Those stay Telegram-only, so a stolen
+  web session cannot become stolen funds.
+- **Nothing runs without a session.** There's no read-only tier — wallet
+  addresses and balances are worth protecting too.
+- Tokens are compared in constant time, so a guess can't be recovered one
+  character at a time.
+- Five failed attempts locks that address out for 15 minutes.
+- Sessions last 12 hours and are signed with a key derived at boot, so a
+  restart invalidates every outstanding session.
+- A weak token **refuses to open the door at all** rather than failing later:
+  under 24 characters, all digits, or anything starting `changeme`/`password`/
+  `secret`/`token`/`admin` and the web UI won't start. Generate it with
+  `openssl rand -hex 32` and don't reuse it anywhere.
+
+Generate a real token or leave `WEB_ACCESS_TOKEN` unset. There is no third
+option, and that's deliberate.
+
+---
+
 ## Understanding gas
 
 Three different numbers, and mixing them up is the most common way to lose a mint:
@@ -333,6 +390,11 @@ code changes needed.
   Encrypted at rest with `WALLET_ENCRYPTION_KEY` once stored, but in transit
   it's only as safe as your Telegram account and the bot's server. Wallet
   dedicated to the bot only, non-negotiably.
+  **Exception: the web UI** ([Step 7](#step-7--web-ui-the-same-bot-in-a-browser))
+  puts a login page in front of that same key store, on a URL anyone can
+  reach. It never serves a key or seed phrase back over HTTP by design, but
+  the token protecting it is the only thing between the internet and your
+  wallets — treat it as the most sensitive secret in your deployment.
 - `.env`, `wallets/`, `*.key` and the bot's `data/` store are all git-ignored.
 - Use dedicated hot wallets funded with only what you intend to spend.
 - Read [`src/local-mint.ts`](src/local-mint.ts) if you want to verify exactly what
