@@ -9,6 +9,7 @@ import { createBot } from "./telegram/bot";
 import { startAlertsBot } from "./telegram/alerts-bot";
 import { startWebServer } from "./web/server";
 import { startRadarBot } from "./telegram/radar-bot";
+import { startSmartAlertsBot } from "./telegram/smart-alerts-bot";
 import { cleanToken } from "./telegram/token";
 import { UserStores } from "./telegram/user-stores";
 import { AccessControl } from "./telegram/access-control";
@@ -77,6 +78,17 @@ async function main(): Promise<void> {
   // behind one door.
   const radar = startRadarBot(process.env.TELEGRAM_RADAR_BOT_TOKEN, ownerId, stores, () => mainUsername);
 
+  // A fifth chat, for the wallets you decided were worth watching. Separate
+  // from the radar for the same reason the radar is separate from the main
+  // bot: each bot is its own notification setting, and this is the one you
+  // let through at 3am.
+  const smart = startSmartAlertsBot(
+    process.env.TELEGRAM_SMART_BOT_TOKEN,
+    ownerId,
+    stores,
+    () => mainUsername
+  );
+
   // Optional web UI. Same store and engine as the bot -- the point of it is
   // that a browser has no 90-second handler timeout, so a scan that takes
   // minutes can just stream its progress instead of racing a clock.
@@ -97,11 +109,13 @@ async function main(): Promise<void> {
     bot.stop("SIGINT");
     alerts?.stop("SIGINT");
     radar?.stop("SIGINT");
+    smart?.stop("SIGINT");
   });
   process.once("SIGTERM", () => {
     bot.stop("SIGTERM");
     alerts?.stop("SIGTERM");
     radar?.stop("SIGTERM");
+    smart?.stop("SIGTERM");
   });
 
   // launch()'s own promise only resolves after stop() is called — it never
