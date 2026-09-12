@@ -37,7 +37,10 @@ export interface PnlCardData {
  * not tell.
  */
 export function accent(pnl: Pnl): string {
-  const decisive = pnl.profitAtOfferEth ?? pnl.profitAtFloorEth;
+  // Settled first: it is the only one of the three that is a price somebody
+  // actually paid. A card tinted green off a stale floor is a lie with a
+  // colour attached.
+  const decisive = pnl.profitAtSettledEth ?? pnl.profitAtOfferEth ?? pnl.profitAtFloorEth;
   if (decisive === null) return PALETTE.flame;
   if (decisive > 0) return PALETTE.mint;
   if (decisive < 0) return PALETTE.ember;
@@ -46,6 +49,12 @@ export function accent(pnl: Pnl): string {
 
 /** The single figure the card leads with, and what it means. */
 export function headline(pnl: Pnl): { value: string; unit: string } {
+  if (pnl.profitAtSettledEth !== null) {
+    return {
+      value: `${pnl.profitAtSettledEth > 0 ? "+" : ""}${formatEth(pnl.profitAtSettledEth)}`,
+      unit: "ETH AT LAST SALE",
+    };
+  }
   if (pnl.profitAtOfferEth !== null) {
     return {
       value: `${pnl.profitAtOfferEth > 0 ? "+" : ""}${formatEth(pnl.profitAtOfferEth)}`,

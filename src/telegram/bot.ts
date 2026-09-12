@@ -6,6 +6,7 @@
 // chat only; every other update is silently ignored.
 
 import { waitForReceipt } from "../rpc-blast";
+import { readOnchainMarket, marketFromSales, describeMarket } from "../onchain-market";
 import { renderGasReport, windows } from "../gas-report";
 import { Telegraf, Markup, Context, Telegram } from "telegraf";
 import { message } from "telegraf/filters";
@@ -335,6 +336,22 @@ async function buildCard(
     record.slug ? fetchBestCollectionOffer(record.slug, key) : Promise.resolve(null),
   ]);
 
+  // Best-effort and never fatal: the card is a trophy, and a missing price
+  // should cost it a line rather than the whole image.
+  let settled: number | null = null;
+  try {
+    const { urls } = resolveRpcsForChain(record.chainKey);
+    const head = await createProvider(urls[0]).getBlockNumber();
+    const market = await readOnchainMarket(urls[0], record.nftContract, {
+      fromBlock: Math.max(0, head - blocksForSeconds(record.chainKey, 12 * 3600)),
+      toBlock: head,
+      chunkBlocks: logChunkBlocksFor(record.chainKey),
+    });
+    settled = market.sales >= 2 ? market.medianSaleEth : market.lastSaleEth;
+  } catch {
+    /* no settled price; the ask below still stands */
+  }
+
   return {
     collection: info?.name || record.name || maskAddress(record.nftContract),
     contract: record.nftContract,
@@ -345,7 +362,10 @@ async function buildCard(
     // The store doesn't track spend per collection; these are overwhelmingly
     // free mints, and gas isn't part of the token's cost basis.
     pricePaidEth: 0,
-    floorEth: stats?.floorPrice ?? null,
+    // A settled sale where the chain has one, the ask where it does not. The
+    // card is the first thing seen after a mint and a stale floor there reads
+    // as fact.
+    floorEth: settled ?? stats?.floorPrice ?? null,
     bestOfferEth: offer?.priceEth ?? null,
     mintedAt: record.firstMintedAt,
     artHref: info?.imageUrl ?? null,
@@ -4604,10 +4624,25 @@ Send the new name.`,
           const lookup = await lookupContract(settings.chainKey, contract, process.env.OPENSEA_API_KEY);
           const slug = isLookupFailure(lookup) ? null : lookup.slug;
           const key = process.env.OPENSEA_API_KEY;
-          const [info, stats, offer] = await Promise.all([
+          const findRpcs = resolveRpcsForChain(settings.chainKey).urls;
+          const findChain = resolveChain(settings.chainKey);
+          const findHead = await raceReadOrNull(findRpcs, async (url) =>
+            createProvider(url).getBlockNumber()
+          ).catch(() => null);
+
+          const [info, stats, offer, onchain] = await Promise.all([
             slug ? fetchCollection(slug, key).catch(() => null) : Promise.resolve(null),
             slug ? fetchStats(slug, key).catch(() => null) : Promise.resolve(null),
             slug ? fetchBestCollectionOffer(slug, key).catch(() => null) : Promise.resolve(null),
+            // Needs no slug and no API key, so it answers for collections
+            // OpenSea has never indexed -- which is most of them here.
+            findHead === null
+              ? Promise.resolve(null)
+              : readOnchainMarket(findRpcs[0], contract, {
+                  fromBlock: Math.max(0, findHead - blocksForSeconds(settings.chainKey, 24 * 3600)),
+                  toBlock: findHead,
+                  chunkBlocks: logChunkBlocksFor(settings.chainKey),
+                }).catch(() => null),
           ]);
 
           const name = info?.name || (isLookupFailure(lookup) ? maskAddress(contract) : lookup.name);
@@ -4622,6 +4657,12 @@ Send the new name.`,
               : "Floor: — (nothing listed)",
             offer ? `Best offer: *${offer.priceEth} ETH*` : "Best offer: — (no standing bid)",
           ];
+
+          // The settled line goes ABOVE the caveat about OpenSea, because it
+          // is the one number that does not depend on OpenSea at all.
+          if (onchain && onchain.sales > 0) {
+            lines.push(`On-chain: *${describeMarket(onchain, findChain?.nativeSymbol ?? "ETH")}*`);
+          }
 
           // Say why the market half is blank rather than leaving it looking
           // like the collection simply has no activity. They are different
@@ -4709,11 +4750,27 @@ Send the new name.`,
           const slug = isLookupFailure(lookup) ? null : lookup.slug;
           const apiKey = process.env.OPENSEA_API_KEY;
 
-          const [stages, info, stats, offer] = await Promise.all([
+          // The on-chain read sits alongside the OpenSea one rather than
+          // replacing it: a settled sale is the better number where it
+          // exists, and a collection with no trades still has a floor.
+          const marketHead = await raceReadOrNull(urls, async (url) =>
+            createProvider(url).getBlockNumber()
+          ).catch(() => null);
+
+          const [stages, info, stats, offer, onchain] = await Promise.all([
             raceReadOrNull(urls, (url) => readStages(url, contract)).catch(() => null),
             slug ? fetchCollection(slug, apiKey).catch(() => null) : Promise.resolve(null),
             slug ? fetchStats(slug, apiKey).catch(() => null) : Promise.resolve(null),
             slug ? fetchBestCollectionOffer(slug, apiKey).catch(() => null) : Promise.resolve(null),
+            marketHead === null
+              ? Promise.resolve(null)
+              : readOnchainMarket(urls[0], contract, {
+                  // A day: long enough that a quiet collection still has a
+                  // trade to show, short enough to stay current.
+                  fromBlock: Math.max(0, marketHead - blocksForSeconds(settings.chainKey, 24 * 3600)),
+                  toBlock: marketHead,
+                  chunkBlocks: logChunkBlocksFor(settings.chainKey),
+                }).catch(() => null),
           ]);
 
           const publicStage = (stages ?? []).find((s) => s.kind === "public");
@@ -4745,6 +4802,14 @@ Send the new name.`,
             gasEth,
             floorEth: stats?.floorPrice ?? null,
             bestOfferEth: offer?.priceEth ?? null,
+            // Median where there is a run of trades, last sale where there is
+            // only one — a single sale is an anecdote but still beats an ask.
+            settledEth: onchain
+              ? onchain.sales >= 2
+                ? onchain.medianSaleEth
+                : onchain.lastSaleEth
+              : null,
+            settledSales: onchain?.sales ?? 0,
             priceSource: mintPriceEth === null ? "unknown" : "stage",
             breakdown: found.map((h) => ({
               address: h.address,

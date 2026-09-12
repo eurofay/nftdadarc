@@ -26,6 +26,16 @@ export interface PnlInputs {
   floorEth: number | null;
   /** Highest standing bid for any item in the collection. */
   bestOfferEth: number | null;
+  /**
+   * What one actually sold for, settled on-chain.
+   *
+   * Preferred over both of the above where it exists. A floor is an ask and
+   * an offer is a bid; this is a price two people agreed on, and on a thin
+   * market it is often the only one of the three that is current.
+   */
+  settledEth?: number | null;
+  /** How many settled sales that figure rests on. */
+  settledSales?: number;
 }
 
 export interface Pnl {
@@ -41,6 +51,9 @@ export interface Pnl {
   profitAtFloorEth: number | null;
   /** Offer value minus cost — the number you can act on. */
   profitAtOfferEth: number | null;
+  /** Quantity x the settled price, and profit against it. */
+  settledValueEth: number | null;
+  profitAtSettledEth: number | null;
   /** Return on the total cost, at floor. Null when the mint was free. */
   roiPercent: number | null;
   /** Floor at which the haul breaks even. Null when there was no cost. */
@@ -63,11 +76,14 @@ export function computePnl(input: PnlInputs): Pnl {
 
   const floorValueEth = usable(input.floorEth) ? input.floorEth * quantity : null;
   const offerValueEth = usable(input.bestOfferEth) ? input.bestOfferEth * quantity : null;
+  const settledValueEth = usable(input.settledEth) ? input.settledEth! * quantity : null;
 
   const profitAtFloorEth =
     floorValueEth === null || totalCostEth === null ? null : floorValueEth - totalCostEth;
   const profitAtOfferEth =
     offerValueEth === null || totalCostEth === null ? null : offerValueEth - totalCostEth;
+  const profitAtSettledEth =
+    settledValueEth === null || totalCostEth === null ? null : settledValueEth - totalCostEth;
 
   // ROI against a zero cost basis is not infinity, it is meaningless — a free
   // mint has no denominator to return against.
@@ -86,6 +102,8 @@ export function computePnl(input: PnlInputs): Pnl {
     offerValueEth,
     profitAtFloorEth,
     profitAtOfferEth,
+    settledValueEth,
+    profitAtSettledEth,
     roiPercent,
     breakEvenFloorEth,
   };
@@ -147,6 +165,13 @@ export function renderPnl(report: PnlReport, pnl: Pnl): string {
 
   lines.push("");
   lines.push("*Value*");
+  if (usable(report.settledEth)) {
+    const n = report.settledSales ?? 0;
+    lines.push(
+      `  Sold   ${eth(report.settledEth)} each → ${eth(pnl.settledValueEth)}` +
+        `  _(${n} settled sale${n === 1 ? "" : "s"})_`
+    );
+  }
   lines.push(
     report.floorEth === null
       ? "  Floor  — (nothing listed)"
