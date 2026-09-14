@@ -73,6 +73,13 @@ export interface ResolveOpts {
   /** Fetch a published allow list. Injectable for tests. */
   fetchList?: (uri: string) => Promise<string>;
   /**
+   * OpenSea's collection slug, when it is already known.
+   *
+   * Lets the eligibility read share the login the calldata request needs, so
+   * "not eligible" arrives as a sentence instead of an empty refusal.
+   */
+  slug?: string;
+  /**
    * "auto" picks the stage these wallets can actually mint, gated first.
    * "public" forces the public stage even when a gated one would work.
    */
@@ -215,56 +222,112 @@ async function tryAllowList(opts: ResolveOpts): Promise<ResolvedMint | null> {
 }
 
 /**
+ * How many wallets to authorise at once.
+ *
+ * Each wallet is an independent SIWE login and an independent calldata
+ * request, so running them one after another made wallet nine wait for the
+ * eight before it -- on a nine-wallet list that is nine round trips of
+ * nothing happening. Four at a time because OpenSea rate-limits, and being
+ * throttled into retries is slower than the serial version it replaced.
+ */
+export const OPENSEA_CONCURRENCY = 4;
+
+/**
  * Ask OpenSea for the exact transaction each wallet should send.
  *
  * The last resort, and the only route to a signed stage: the signature is
- * issued by the project's key to a wallet OpenSea has decided is eligible, and
- * arrives already inside the calldata. Nothing here derives or forges a
- * credential — it asks, as the owner, for something the owner is entitled to.
+ * issued by the project's key to a wallet OpenSea has decided is eligible,
+ * and arrives already inside the calldata. Nothing here derives or forges a
+ * credential -- it asks, as the owner, for something the owner is entitled to.
  *
- * One login per wallet, because the answer is per wallet.
+ * ONE SESSION PER WALLET, REUSED. Sign-in and the calldata request used to be
+ * separate acts with a separate login each: the eligibility check logged in,
+ * read the answer, threw the session away, and then firing logged in again.
+ * That is two round trips where one does, and the second landed at the worst
+ * possible moment.
  */
 async function tryOpenSea(opts: ResolveOpts): Promise<ResolvedMint | null> {
   if (!opts.signerFor) return null;
 
+  const results: { plan?: WalletPlan; skip?: SkippedWallet }[] = new Array(opts.wallets.length);
+  let next = 0;
+
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const i = next++;
+      if (i >= opts.wallets.length) return;
+      const address = opts.wallets[i];
+      try {
+        const wallet = await opts.signerFor!(address);
+        const client = (opts.makeClient ?? (() => new OpenSeaMintClient()))();
+        await client.login(wallet, opts.chainId);
+
+        // Eligibility first when a slug is known, on the SAME session. It
+        // costs one extra read and turns "OpenSea returned no transaction"
+        // into a reason a person can act on.
+        if (opts.slug) {
+          try {
+            const stages = await client.eligibility(opts.slug, wallet.address);
+            const usable = stages.find((st) => st.isEligible);
+            if (stages.length > 0 && !usable) {
+              results[i] = {
+                skip: { address, reason: "OpenSea says this wallet is not eligible for any stage" },
+              };
+              continue;
+            }
+          } catch {
+            // An eligibility read that fails is not a refusal to mint; fall
+            // through and let the calldata request give the real answer.
+          }
+        }
+
+        const calldata = await client.mintCalldata({
+          address: wallet.address,
+          contractAddress: opts.contract,
+          chainIdentifier: opts.chainKey,
+          tokenId: "0",
+          quantity: opts.quantity,
+        });
+
+        results[i] = {
+          plan: {
+            address,
+            plan: {
+              to: calldata.to,
+              data: calldata.data,
+              value: calldata.value,
+              // OpenSea handed over a whole transaction, so there is no drop
+              // struct to read; the engine only needs somewhere to send bytes.
+              feeRecipient: calldata.to,
+              drop: {
+                mintPrice: opts.quantity > 0 ? calldata.value / BigInt(opts.quantity) : 0n,
+                startTime: 0,
+                endTime: 0,
+                maxTotalMintableByWallet: opts.quantity,
+                feeBps: 0,
+                restrictFeeRecipients: false,
+              },
+            },
+          },
+        };
+      } catch (err: any) {
+        const kind = err instanceof OpenSeaMintError ? err.kind : "error";
+        results[i] = { skip: { address, reason: `${err?.message ?? err} (${kind})` } };
+      }
+    }
+  };
+
+  await Promise.all(
+    Array.from({ length: Math.min(OPENSEA_CONCURRENCY, opts.wallets.length) }, worker)
+  );
+
+  // Rebuilt in wallet order, not completion order, so the same list always
+  // produces the same plan ordering.
   const plans: WalletPlan[] = [];
   const skipped: SkippedWallet[] = [];
-
-  for (const address of opts.wallets) {
-    try {
-      const wallet = await opts.signerFor(address);
-      const client = (opts.makeClient ?? (() => new OpenSeaMintClient()))();
-      await client.login(wallet, opts.chainId);
-      const calldata = await client.mintCalldata({
-        address: wallet.address,
-        contractAddress: opts.contract,
-        chainIdentifier: opts.chainKey,
-        tokenId: "0",
-        quantity: opts.quantity,
-      });
-      plans.push({
-        address,
-        plan: {
-          to: calldata.to,
-          data: calldata.data,
-          value: calldata.value,
-          // OpenSea handed over a whole transaction, so there is no drop
-          // struct to read; the engine only needs somewhere to send bytes.
-          feeRecipient: calldata.to,
-          drop: {
-            mintPrice: opts.quantity > 0 ? calldata.value / BigInt(opts.quantity) : 0n,
-            startTime: 0,
-            endTime: 0,
-            maxTotalMintableByWallet: opts.quantity,
-            feeBps: 0,
-            restrictFeeRecipients: false,
-          },
-        },
-      });
-    } catch (err: any) {
-      const kind = err instanceof OpenSeaMintError ? err.kind : "error";
-      skipped.push({ address, reason: `${err?.message ?? err} (${kind})` });
-    }
+  for (const r of results) {
+    if (r?.plan) plans.push(r.plan);
+    else if (r?.skip) skipped.push(r.skip);
   }
 
   if (plans.length === 0 && skipped.length === 0) return null;

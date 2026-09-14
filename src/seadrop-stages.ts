@@ -30,6 +30,11 @@ const IFACE = new Interface([
   "function getAllowListMerkleRoot(address) view returns (bytes32)",
   "function getSigners(address) view returns (address[])",
   "function getTokenGatedAllowedTokens(address) view returns (address[])",
+  // The bounds a signed stage is validated against. Verified present on the
+  // deployed singleton (selector 0x81bf9af3): the signer cannot authorise a
+  // mint outside these, so they say what a signature could legally contain
+  // BEFORE one has been issued.
+  "function getSignedMintValidationParams(address,address) view returns (tuple(uint80 minMintPrice,uint24 maxMaxTotalMintableByWallet,uint40 minStartTime,uint40 maxEndTime,uint40 maxMaxTokenSupplyForStage,uint16 minFeeBps,uint16 maxFeeBps))",
 ]);
 
 export type StageKind = "public" | "allowlist" | "signed" | "token-gated";
@@ -46,6 +51,51 @@ export interface Stage {
   endTime?: number;
   priceWei?: bigint;
   maxPerWallet?: number;
+  /**
+   * For a signed stage: who may authorise it, and within what limits.
+   *
+   * SeaDrop checks every signed mint against these, so they bound what any
+   * signature could legally say before one exists. That makes it possible to
+   * sanity-check calldata fetched in advance rather than trusting it, and to
+   * tell a signed stage that has not opened yet from one nobody is eligible
+   * for -- which look identical from a refusal.
+   */
+  signers?: string[];
+  signedLimits?: SignedLimits;
+}
+
+export interface SignedLimits {
+  signer: string;
+  minMintPriceWei: bigint;
+  maxMaxTotalMintableByWallet: number;
+  minStartTime: number;
+  maxEndTime: number;
+  maxMaxTokenSupplyForStage: number;
+  minFeeBps: number;
+  maxFeeBps: number;
+}
+
+/** Whether a mint's terms could legally be signed under these limits. */
+export function withinSignedLimits(
+  limits: SignedLimits,
+  terms: { mintPriceWei: bigint; maxTotalMintableByWallet: number; startTime: number; endTime: number; feeBps: number }
+): { ok: boolean; reason?: string } {
+  if (terms.mintPriceWei < limits.minMintPriceWei) {
+    return { ok: false, reason: `price below the signer's minimum of ${limits.minMintPriceWei}` };
+  }
+  if (limits.maxMaxTotalMintableByWallet > 0 && terms.maxTotalMintableByWallet > limits.maxMaxTotalMintableByWallet) {
+    return { ok: false, reason: `per-wallet allowance above the signer's cap of ${limits.maxMaxTotalMintableByWallet}` };
+  }
+  if (limits.minStartTime > 0 && terms.startTime < limits.minStartTime) {
+    return { ok: false, reason: "stage starts before the signer allows" };
+  }
+  if (limits.maxEndTime > 0 && terms.endTime > limits.maxEndTime) {
+    return { ok: false, reason: "stage ends after the signer allows" };
+  }
+  if (terms.feeBps < limits.minFeeBps || (limits.maxFeeBps > 0 && terms.feeBps > limits.maxFeeBps)) {
+    return { ok: false, reason: `fee ${terms.feeBps}bps outside the signer's ${limits.minFeeBps}-${limits.maxFeeBps}` };
+  }
+  return { ok: true };
 }
 
 const TOKEN_IFACE = new Interface([
@@ -102,13 +152,22 @@ export async function readStages(rpcUrl: string, nftContract: string): Promise<S
   });
 
   const hasSigned = Array.isArray(signers) && signers.length > 0;
+  // The limits are per signer, so read them for the first one -- a collection
+  // with several signers configures them alike in practice, and reading every
+  // one would be a call each for a detail that only bounds a sanity check.
+  const signedLimits = hasSigned ? await readSignedLimits(rpcUrl, nftContract, signers![0]) : null;
   stages.push({
     kind: "signed",
     present: hasSigned,
     mintable: false,
     detail: hasSigned
-      ? `needs a signature from ${signers![0]}, issued by the project's server — not derivable on-chain`
+      ? `needs a signature from ${signers![0]}, issued by the project's server — not derivable on-chain` +
+        (signedLimits
+          ? `. Limits: min price ${signedLimits.minMintPriceWei}, max ${signedLimits.maxMaxTotalMintableByWallet}/wallet, fee ${signedLimits.minFeeBps}-${signedLimits.maxFeeBps}bps`
+          : "")
       : "not configured",
+    signers: hasSigned ? signers! : undefined,
+    signedLimits: signedLimits ?? undefined,
   });
 
   const hasGated = Array.isArray(gated) && gated.length > 0;
@@ -125,6 +184,40 @@ export async function readStages(rpcUrl: string, nftContract: string): Promise<S
 }
 
 /** What to tell someone who pasted a contract with no public stage. */
+/**
+ * The bounds a signer may authorise within, or null when unreadable.
+ *
+ * Never throws: a collection whose params cannot be read is still worth
+ * reporting as having a signed stage, and losing that to a failed call would
+ * turn a readable gate into an invisible one.
+ */
+export async function readSignedLimits(
+  rpcUrl: string,
+  nftContract: string,
+  signer: string
+): Promise<SignedLimits | null> {
+  try {
+    const provider = createProvider(rpcUrl);
+    const res = await provider.call({
+      to: SEADROP_ADDRESS,
+      data: IFACE.encodeFunctionData("getSignedMintValidationParams", [nftContract, signer]),
+    });
+    const p = IFACE.decodeFunctionResult("getSignedMintValidationParams", res)[0] as any;
+    return {
+      signer,
+      minMintPriceWei: BigInt(p.minMintPrice ?? p[0]),
+      maxMaxTotalMintableByWallet: Number(p.maxMaxTotalMintableByWallet ?? p[1]),
+      minStartTime: Number(p.minStartTime ?? p[2]),
+      maxEndTime: Number(p.maxEndTime ?? p[3]),
+      maxMaxTokenSupplyForStage: Number(p.maxMaxTokenSupplyForStage ?? p[4]),
+      minFeeBps: Number(p.minFeeBps ?? p[5]),
+      maxFeeBps: Number(p.maxFeeBps ?? p[6]),
+    };
+  } catch {
+    return null;
+  }
+}
+
 export function describeStages(stages: Stage[]): string {
   const present = stages.filter((s) => s.present);
   if (present.length === 0) {

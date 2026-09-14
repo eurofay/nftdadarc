@@ -66,6 +66,17 @@ export interface LocalSnipeOpts {
   onGas?: (entry: GasEntry) => void;
   /** Labels the spend, so a report can say where the money went. */
   gasLabel?: string;
+  /**
+   * Called in the pre-roll, ~5s out, to replace armed calldata with fresh.
+   *
+   * Only for mints whose calldata was obtained in advance from an API -- a
+   * signed stage. The window it runs in already exists for the round-trip
+   * measurement, so a refresh here costs nothing that was not already being
+   * spent, and it means stored calldata never has to be trusted blindly at
+   * T-0. Returning null keeps what was armed, which is the right answer when
+   * the refresh fails: armed-and-possibly-stale beats nothing at all.
+   */
+  refreshPlans?: () => Promise<((address: string) => LocalMintPlan | null) | null>;
   logger?: Logger; // defaults to printing locally — the Telegram bot passes one that also forwards to a chat
 }
 
@@ -245,6 +256,41 @@ export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<SnipeOutco
       const roundTrip = earlyFireMs === 0 ? null : await measureRoundTripMs(rpcUrls[0]);
       const lead = resolveEarlyFire(earlyFireMs, roundTrip);
       if (earlyFireMs !== 0) log.info(`  ${describeEarlyFire(earlyFireMs, roundTrip, lead)}`);
+
+      // Refresh and re-sign HERE, not at T-0. Signing is local and was
+      // measured at a fraction of a millisecond for the whole set, so the
+      // only cost is the fetch -- and it happens seconds before the stage
+      // rather than during it.
+      if (opts.refreshPlans) {
+        try {
+          const fresh = await opts.refreshPlans();
+          if (fresh) {
+            const before = prepared.length;
+            prepared.length = 0;
+            for (let i = 0; i < wallets.length; i++) {
+              const p = fresh(wallets[i].address);
+              if (!p) continue;
+              const raw = await wallets[i].signTransaction({
+                to: p.to,
+                data: p.data,
+                value: p.value,
+                nonce: nonces[i],
+                maxFeePerGas: ceiling,
+                maxPriorityFeePerGas: priority,
+                gasLimit: effectiveGasLimit,
+                type: 2,
+                chainId,
+              });
+              prepared.push({ idx: i, address: wallets[i].address, blast: prepareBlast(raw) });
+            }
+            log.info(`  Calldata refreshed in the pre-roll — ${prepared.length} of ${before} re-signed.`);
+          }
+        } catch (err: any) {
+          // Keeping what was armed is strictly better than firing nothing.
+          log.warn(`  Could not refresh calldata (${err?.message ?? err}) — using what was armed.`);
+        }
+      }
+
       await waitForMintTime(targetStart, lead);
     } else {
       log.warn("\n  🚀 Firing immediately...");
