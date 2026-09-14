@@ -114,6 +114,21 @@ export interface ValidateOpts {
   expectedContract: string;
   /** Now, in seconds. Injected so the check is testable. */
   nowSec?: number;
+  /**
+   * Where this mint is legitimately addressed, when it is NOT SeaDrop's.
+   *
+   * A project's own contract is minted by calling the collection directly, so
+   * "to" is the collection rather than the singleton, and the calldata is a
+   * function this file has no decoder for. Without this, every such mint would
+   * be rejected as "not a SeaDrop mint this bot can read" -- correct about the
+   * decoding, wrong about the conclusion.
+   *
+   * The check it enables is the one that actually matters: armed bytes must go
+   * where the operator armed them, so value cannot be sent to an address that
+   * arrived from somewhere else. Supplying it does not weaken the SeaDrop
+   * checks below -- those still run whenever the calldata decodes as SeaDrop.
+   */
+  expectedTo?: string;
 }
 
 /**
@@ -129,6 +144,22 @@ export async function validateArmed(
   opts: ValidateOpts
 ): Promise<ValidationResult> {
   const decoded = decodeMint(armed.data);
+
+  // A mint on a project's own contract, armed against a known destination.
+  // There is no decoder for an arbitrary contract's mint function, so the
+  // check is the one that can be made and does matter: it must be addressed
+  // where it was armed. Only reachable when the caller passed expectedTo,
+  // which the SeaDrop paths never do.
+  if (decoded.kind === "unknown" && opts.expectedTo) {
+    const addressedRight = armed.to.toLowerCase() === opts.expectedTo.toLowerCase();
+    return addressedRight
+      ? { ok: true, detail: `addressed to ${armed.to}, as armed`, decoded }
+      : {
+          ok: false,
+          detail: `it is addressed to ${armed.to}, not the ${opts.expectedTo} it was armed for`,
+          decoded,
+        };
+  }
 
   if (decoded.kind === "unknown") {
     return { ok: false, detail: "this calldata is not a SeaDrop mint this bot can read", decoded };

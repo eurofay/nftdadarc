@@ -22,7 +22,27 @@ NFT Public Mint Sniper
 Usage
   npm start              run the interactive wizard
   npm start -- --auto    run the autonomous free-mint watcher
+  npm start -- --dry-run --contract 0x… --wallets 0x…,0x… [options]
   npm start -- --help    show this message
+
+Dry run options
+  --contract 0x…         the NFT contract to mint (required)
+  --wallets 0x…,0x…      addresses to check (required; keys are never read)
+  --quantity N           how many per wallet (default 1)
+  --chain <key>          ethereum | base | robinhood | … (default CHAIN in .env)
+  --mint-fn "sig"        the mint function, when it isn't auto-detected
+  --mint-args a,b,c      what each argument means: quantity, minter, proof,
+                         signature, allowance, price, currency, nonce, tokenId,
+                         empty, operator
+  --list <uri>           the project's published allow list, for a Merkle stage
+  --auth-api <url>       the project's authorisation endpoint, for a signed
+                         stage; {address} is replaced per wallet
+  --price <wei>          price per token, where the contract exposes none
+
+A dry run does everything except sign: it reads the contract, resolves the
+stage, obtains each wallet's proof or signature, builds that wallet's calldata
+and simulates it. It never signs and never broadcasts — only addresses are
+needed, so no private key is read at all.
 
 Wizard mode asks for everything interactively: keys, chain, quantity, NFT
 link, RPC, gas and timing. Optional defaults can be set in .env.
@@ -104,6 +124,60 @@ async function runAuto(): Promise<void> {
   await Promise.all(chainKeys.map((key) => runAutoForChain(key, walletKeys)));
 }
 
+/** `--flag value`, or undefined. Kept tiny so the CLI needs no arg parser. */
+function flag(args: string[], name: string): string | undefined {
+  const i = args.indexOf(`--${name}`);
+  if (i === -1 || i + 1 >= args.length) return undefined;
+  const value = args[i + 1];
+  return value.startsWith("--") ? undefined : value;
+}
+
+/**
+ * Resolve and simulate a mint without signing anything.
+ *
+ * Deliberately takes ADDRESSES, not keys. There is no code path from here to a
+ * signature, which is a stronger guarantee than a flag that says so.
+ */
+async function runDryRun(args: string[]): Promise<void> {
+  const { dryRun } = await import("./dry-run");
+
+  const contract = flag(args, "contract");
+  const wallets = (flag(args, "wallets") ?? "")
+    .split(",")
+    .map((w) => w.trim())
+    .filter(Boolean);
+
+  if (!contract || wallets.length === 0) {
+    console.error(chalk.red("\n--dry-run needs --contract 0x… and --wallets 0x…,0x…\n"));
+    console.log(HELP);
+    process.exitCode = 1;
+    return;
+  }
+
+  const mintArgs = flag(args, "mint-args");
+  const authApi = flag(args, "auth-api");
+  const price = flag(args, "price");
+
+  const result = await dryRun({
+    chainKey: flag(args, "chain") ?? process.env.CHAIN ?? "ethereum",
+    contract,
+    wallets,
+    quantity: Number(flag(args, "quantity") ?? 1) || 1,
+    generic: {
+      signature: flag(args, "mint-fn"),
+      args: mintArgs ? (mintArgs.split(",").map((a) => a.trim()) as never) : undefined,
+      listUri: flag(args, "list"),
+      authApi: authApi ? { kind: "api", urlTemplate: authApi } : undefined,
+      priceWei: price === undefined ? undefined : BigInt(price),
+    },
+  });
+
+  console.log(result.lines.join("\n"));
+  // A non-zero exit when nothing would send, so this is usable in a script
+  // that should stop rather than proceed to a real mint.
+  process.exitCode = result.ready > 0 ? 0 : 1;
+}
+
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   if (args.includes("--help") || args.includes("-h")) {
@@ -112,13 +186,18 @@ async function main(): Promise<void> {
   }
 
   try {
-    if (args.includes("--auto")) {
+    if (args.includes("--dry-run")) {
+      await runDryRun(args);
+    } else if (args.includes("--auto")) {
       await runAuto();
     } else {
       await runWizard();
     }
     closePrompts();
-    process.exit(0);
+    // A dry run that found nothing sendable sets a non-zero code, so it can
+    // gate a script rather than being read by a human every time. Exiting a
+    // flat 0 here would throw that away.
+    process.exit(process.exitCode ? Number(process.exitCode) : 0);
   } catch (err: any) {
     closePrompts();
     console.error(chalk.red(`\n❌ ${err.message}\n`));

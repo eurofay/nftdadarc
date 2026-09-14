@@ -105,11 +105,28 @@ export interface PreparedMint {
   decoded?: DecodedMint;
   /** This wallet's own nonce, read at preparation. Never shared. */
   nonce?: number;
+  /**
+   * The gas limit this wallet was prepared with.
+   *
+   * Recorded per wallet because it can be MEASURED per wallet: where the node
+   * will estimate, that beats the fitted model in gas.ts. It lives here rather
+   * than being written back into the shared options, which would leak one
+   * wallet's estimate into every other wallet on the same controller.
+   */
+  gasLimit?: number;
   /** Pre-signed bytes, when signing happened ahead of the open. */
   raw?: string;
   txHash?: string;
   failure?: { code: FailureCode; detail: string };
   timings: Timings;
+  /**
+   * One line saying what this wallet is actually about to send.
+   *
+   * Set by the generic path (generic-mint.ts), where the calldata was built
+   * from a contract nobody has a decoder for -- `decoded` above only speaks
+   * SeaDrop. Optional so the SeaDrop path is unaffected.
+   */
+  summary?: string;
 }
 
 export const newPrepared = (address: string, quantity: number): PreparedMint => ({
@@ -366,6 +383,49 @@ export const DEFAULT_RETRIES = 2;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /**
+ * Prepare many wallets a few at a time, retrying only what can change.
+ *
+ * Shared by both mint routes -- SeaDrop/OpenSea below, and the generic
+ * contract path in generic-mint.ts -- because the concurrency and retry
+ * policy is a property of preparing WALLETS, not of where the calldata came
+ * from. The `prepare` callback is the only difference between them.
+ *
+ * Results come back in the order the addresses were given, not the order they
+ * finished, so the same wallet list always produces the same report.
+ */
+export async function prepareMany(
+  addresses: readonly string[],
+  concurrency: number | undefined,
+  retries: number | undefined,
+  prepare: (address: string) => Promise<PreparedMint>
+): Promise<PreparedMint[]> {
+  const limit = Math.max(1, concurrency ?? DEFAULT_PREPARE_CONCURRENCY);
+  const attempts = Math.max(1, retries ?? DEFAULT_RETRIES);
+  const out = new Array<PreparedMint>(addresses.length);
+
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const i = next++;
+      if (i >= addresses.length) return;
+      let p = await prepare(addresses[i]);
+      for (let attempt = 1; attempt < attempts; attempt++) {
+        // A deterministic refusal is not retried at all: "not eligible"
+        // cannot succeed however many times it runs, and the attempt spends
+        // a rate-limit budget the transient failures need.
+        if (p.state === "READY" || !p.failure || !RETRYABLE.has(p.failure.code)) break;
+        await sleep(400 * attempt * attempt);
+        p = await prepare(addresses[i]);
+      }
+      out[i] = p;
+    }
+  };
+
+  await Promise.all(Array.from({ length: Math.min(limit, addresses.length) }, worker));
+  return out;
+}
+
+/**
  * Prepares many independently eligible wallets, then fires them.
  *
  * Each wallet is its own minter, its own authorisation, its own nonce and its
@@ -380,30 +440,11 @@ export class MultiWalletController {
 
   /** Prepare every wallet, a few at a time. Returns once all have settled. */
   async prepareAll(addresses: string[]): Promise<PreparedMint[]> {
-    const limit = Math.max(1, this.opts.concurrency ?? DEFAULT_PREPARE_CONCURRENCY);
-    const attempts = Math.max(1, this.opts.retries ?? DEFAULT_RETRIES);
     for (const a of addresses) this.wallets.set(a.toLowerCase(), newPrepared(a, this.opts.quantity));
-
-    let next = 0;
-    const worker = async (): Promise<void> => {
-      for (;;) {
-        const i = next++;
-        if (i >= addresses.length) return;
-        const address = addresses[i];
-
-        let p = await prepareOpenSeaMint(address, this.opts);
-        for (let attempt = 1; attempt < attempts; attempt++) {
-          if (p.state === "READY" || !p.failure || !RETRYABLE.has(p.failure.code)) break;
-          // Backoff only for causes that can change. A deterministic refusal
-          // is not retried at all.
-          await sleep(400 * attempt * attempt);
-          p = await prepareOpenSeaMint(address, this.opts);
-        }
-        this.wallets.set(address.toLowerCase(), p);
-      }
-    };
-
-    await Promise.all(Array.from({ length: Math.min(limit, addresses.length) }, worker));
+    const out = await prepareMany(addresses, this.opts.concurrency, this.opts.retries, (address) =>
+      prepareOpenSeaMint(address, this.opts)
+    );
+    for (const p of out) this.wallets.set(p.address.toLowerCase(), p);
     return addresses.map((a) => this.wallets.get(a.toLowerCase())!);
   }
 

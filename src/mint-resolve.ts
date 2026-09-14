@@ -29,8 +29,59 @@ import { findAllowListUri, fetchAllowList, parseAllowList, deriveProof, normaliz
 import { OpenSeaMintClient, OpenSeaMintError } from "./opensea-mint";
 import { buildDropMintTransaction, DropsError } from "./opensea-drops";
 import { readStages, Stage } from "./seadrop-stages";
+import { probeContract, ContractProfile } from "./contract-probe";
+import { KNOWN_MINTS, MintArgKind, MintSignature, selectorOf } from "./mint-signatures";
+import { MintSpec, WalletAuthorization, buildMintCalldata, MintSpecError, specFromSignature } from "./mint-spec";
+import { parseGenericAllowList, solveAllowList } from "./generic-merkle";
+import { AuthSource, AuthorizationError, fetchApiAuthorization, describeSource } from "./mint-authorization";
 
-export type MintSource = "public" | "allowlist" | "opensea";
+export type MintSource = "public" | "allowlist" | "opensea" | "generic";
+
+/**
+ * Everything a mint on a project's OWN contract needs that the chain cannot
+ * supply.
+ *
+ * SeaDrop puts a pointer to its allow list on-chain (AllowListUpdated), so
+ * allowlist-fetch.ts can follow it from nothing but an address. A project's
+ * own contract holds the ROOT and nothing else -- there is no standard event,
+ * no standard URI field, and no way to discover where the list was published.
+ * Same for a signed stage: the contract names the signer, never the endpoint
+ * that issues signatures.
+ *
+ * So those two things are supplied by the operator, and asking for them is not
+ * a gap in the implementation -- it is the honest shape of the problem. What
+ * IS automatic: detecting the mint function, reading price, supply, per-wallet
+ * caps and opening time from the contract, deriving each wallet's proof from
+ * the list once its location is known, and simulating everything before a
+ * single byte is signed.
+ */
+export interface GenericMintConfig {
+  /**
+   * The exact function to call, overriding detection.
+   *
+   * Needed when the contract's mint is not one of the shapes in
+   * mint-signatures.ts. Must come with `args` -- a signature alone says what
+   * the types are, never what they MEAN, and filling a uint256 that turns out
+   * to be a phase index with a quantity is a revert.
+   */
+  signature?: string;
+  /** What each argument of `signature` is for, in order. */
+  args?: MintArgKind[];
+  /** Where the project published its allow list. http(s), ipfs, or data. */
+  listUri?: string;
+  /** The list itself, when it was pasted rather than hosted. */
+  listJson?: string;
+  /** The project's own authorisation endpoint, for a signed stage. */
+  authApi?: Extract<AuthSource, { kind: "api" }>;
+  /** Values for arguments nothing can derive -- an instance id, a phase. */
+  operatorArgs?: readonly unknown[];
+  /** Price per token, where the contract exposes none. */
+  priceWei?: bigint;
+  /** Flat value for the whole call, where it is not price x quantity. */
+  valueOverrideWei?: bigint;
+  /** On by default. */
+  simulate?: boolean;
+}
 
 export interface WalletPlan {
   address: string;
@@ -87,6 +138,22 @@ export interface ResolveOpts {
   prefer?: "auto" | "public";
   /** For the documented Drops API. Without a working one it falls back. */
   apiKey?: string;
+  /**
+   * For a contract that is not SeaDrop's and not on OpenSea.
+   *
+   * Purely additive: the SeaDrop and OpenSea routes are tried first and behave
+   * exactly as before. This is what happens when all of them find nothing,
+   * which until now was where the bot simply gave up.
+   */
+  generic?: GenericMintConfig;
+  /**
+   * The spec the generic route settled on, handed back to the caller.
+   *
+   * An out-parameter rather than a field on ResolvedMint because ResolvedMint
+   * is persisted to the Telegram store, and a bigint inside it would not
+   * survive that JSON round trip.
+   */
+  onGenericSpec?: (spec: MintSpec, profile: ContractProfile) => void;
 }
 
 /** First endpoint that answers, rather than the first that is listed. */
@@ -378,6 +445,261 @@ async function tryOpenSea(opts: ResolveOpts): Promise<ResolvedMint | null> {
   };
 }
 
+/**
+ * Mint a contract that is not SeaDrop's, using its own mint function.
+ *
+ * Runs LAST, and only when every SeaDrop and OpenSea route has come back with
+ * nothing -- so no existing behaviour changes. This is purely the case that
+ * used to end in "no public drop found on this contract".
+ *
+ * THE SHAPE OF WHAT IT CAN DO ALONE. A public mint is fully automatic: the
+ * function is detected from the bytecode, the price and caps are read from the
+ * contract's own getters, the calldata is built and simulated per wallet, and
+ * nothing needs supplying. A GATED mint is automatic once the operator has
+ * said WHERE the list or the authorisation endpoint is, because the chain does
+ * not record that and nothing can discover it. Where that is missing, this
+ * returns an explanation naming exactly what is needed rather than a mint that
+ * would revert.
+ */
+async function tryGeneric(opts: ResolveOpts): Promise<ResolvedMint | null> {
+  const cfg = opts.generic ?? {};
+
+  // Probe once, on the first endpoint that answers. Every later read reuses
+  // this endpoint so the simulation and the state it was judged against come
+  // from the same node.
+  const probed = await firstAnswer(opts.rpcUrls, async (url) => {
+    const profile = await probeContract(url, opts.contract);
+    return profile.isContract ? { profile, url } : null;
+  });
+  if (!probed) return null;
+  const { profile, url: rpcUrl } = probed;
+
+  const chosen = chooseMintSignature(profile, cfg);
+  if (!chosen) {
+    return explain(opts, profile, [
+      profile.mints.length === 0
+        ? "This contract's mint function isn't one this bot recognises, and nothing can infer it " +
+          "from the address. Supply the signature and what each argument means."
+        : "The mint function found needs an argument only the project knows, so it can't be " +
+          "called automatically.",
+      ...profile.notes,
+    ]);
+  }
+
+  // Terms from the contract itself, never from a drop page. A countdown on a
+  // website and a startTime in storage can disagree, and only one of them
+  // rejects transactions.
+  const priceWei = cfg.priceWei ?? profile.state.priceWei ?? 0n;
+  const perWallet = Math.max(
+    1,
+    Math.min(
+      opts.quantity,
+      profile.state.maxPerTransaction || opts.quantity,
+      profile.state.maxPerWallet || opts.quantity
+    )
+  );
+
+  const spec = specFromSignature(chosen, {
+    chainId: opts.chainId,
+    contract: opts.contract,
+    quantity: perWallet,
+    priceWei,
+    operatorArgs: cfg.operatorArgs,
+    valueOverrideWei: cfg.valueOverrideWei,
+  });
+
+  // ── Authorisation, per wallet, from whatever legitimate source applies ──
+  let authorize: (address: string) => Promise<WalletAuthorization | null>;
+  const notes: string[] = [];
+
+  if (chosen.kind === "merkle") {
+    const root = profile.state.merkleRoot;
+    const listJson = await loadList(cfg);
+    if (!listJson) {
+      return explain(opts, profile, [
+        "This is a Merkle-gated stage: the contract holds the root" +
+          (root ? ` (${root.slice(0, 10)}…)` : "") +
+          ", and the proof is computed from the list the project published. " +
+          "Point the bot at that list and every wallet's proof is derived and checked against " +
+          "the on-chain root before anything is sent.",
+      ]);
+    }
+    if (!root) {
+      return explain(opts, profile, [
+        "A list was supplied but this contract exposes no Merkle root to check it against, so a " +
+          "proof built from it could not be verified before sending. Supply the mint signature " +
+          "directly if the root lives somewhere non-standard.",
+      ]);
+    }
+
+    const solved = solveAllowList(parseGenericAllowList(listJson), root);
+    if (!solved) {
+      return explain(opts, profile, [
+        "That list does not reproduce this contract's on-chain Merkle root under any leaf " +
+          "encoding this bot knows. Either it is a list for a different stage, it has been " +
+          "replaced since publication, or the project hashed its leaves in an unusual way. " +
+          "Nothing was sent -- a proof built from it would have reverted and still cost gas.",
+      ]);
+    }
+    notes.push(
+      `Allow list matched the on-chain root under ${solved.encoding.name} — ${solved.entries} entries.`
+    );
+    authorize = async (address) => {
+      const proof = solved.proofs.get(address.toLowerCase());
+      if (!proof) return null;
+      return {
+        address,
+        proof,
+        allowance: solved.allowances.get(address.toLowerCase()),
+        source: "the project's published allow list",
+      };
+    };
+  } else if (chosen.kind === "signed") {
+    if (!cfg.authApi) {
+      return explain(opts, profile, [
+        "This stage is authorised by a signature" +
+          (profile.state.signer ? ` from ${profile.state.signer}` : "") +
+          ". Only the project's own server can issue one — it cannot be derived, and this bot " +
+          "will not fabricate it. Point the bot at the endpoint the project's mint page calls " +
+          "and each wallet's signature is requested for that wallet alone.",
+      ]);
+    }
+    notes.push(`Authorisations requested from ${describeSource(cfg.authApi)}.`);
+    authorize = async (address) =>
+      fetchApiAuthorization(cfg.authApi!, address, {
+        quantity: perWallet,
+        chainId: opts.chainId,
+      });
+  } else {
+    // Public or a shape that carries its own terms. thirdweb's claim() takes
+    // an empty proof for an open phase, which buildMintCalldata handles.
+    authorize = async (address) => ({ address });
+  }
+
+  // ── Build per wallet, and say plainly why a wallet was left out ─────────
+  const plans: WalletPlan[] = [];
+  const skipped: SkippedWallet[] = [];
+  for (const address of opts.wallets) {
+    try {
+      const auth = await authorize(address);
+      if (!auth) {
+        skipped.push({ address, reason: "not on the project's allow list" });
+        continue;
+      }
+      const built = buildMintCalldata(spec, auth);
+      plans.push({
+        address,
+        plan: {
+          to: built.to,
+          data: built.data,
+          value: built.value,
+          feeRecipient: built.to,
+          drop: {
+            mintPrice: priceWei,
+            startTime: profile.state.startTime ?? 0,
+            endTime: profile.state.endTime ?? 0,
+            maxTotalMintableByWallet: perWallet,
+            feeBps: 0,
+            restrictFeeRecipients: false,
+          },
+        },
+      });
+    } catch (err) {
+      const reason =
+        err instanceof AuthorizationError || err instanceof MintSpecError
+          ? err.message
+          : ((err as Error)?.message ?? String(err));
+      skipped.push({ address, reason });
+    }
+  }
+
+  opts.onGenericSpec?.(spec, profile);
+
+  return {
+    source: "generic",
+    contract: opts.contract,
+    startTimeMs: profile.state.startTime ? profile.state.startTime * 1000 : null,
+    quantity: perWallet,
+    plans,
+    skipped,
+    notes: [
+      `Minting this project's own contract via ${chosen.signature}` +
+        (chosen.family !== "common" ? ` (${chosen.family})` : "") +
+        ".",
+      ...notes,
+      ...profile.notes,
+    ],
+  };
+}
+
+/**
+ * Which function to call: the operator's if they said, otherwise the best
+ * detected one.
+ *
+ * A supplied signature with no argument map is refused rather than guessed at.
+ * Types are not meanings: `mint(uint256,uint256)` could be (quantity, tokenId)
+ * or (tokenId, quantity), and the two produce completely different mints.
+ */
+function chooseMintSignature(
+  profile: ContractProfile,
+  cfg: GenericMintConfig
+): MintSignature | null {
+  if (cfg.signature) {
+    const known = KNOWN_MINTS.find((m) => m.signature === cfg.signature);
+    if (known && !cfg.args) return known;
+    if (!cfg.args) return null;
+    return {
+      signature: cfg.signature,
+      selector: selectorOf(cfg.signature),
+      kind: cfg.args.includes("signature") ? "signed" : cfg.args.includes("proof") ? "merkle" : "public",
+      args: cfg.args,
+      autofillable: !cfg.args.includes("operator") || (cfg.operatorArgs?.length ?? 0) > 0,
+      family: "supplied by the operator",
+      payable: true,
+    };
+  }
+  // Gated first, matching resolveMint's own ordering: a contract with both a
+  // gated and a public entry point almost always has the gated stage as the
+  // reason for being there.
+  const fillable = profile.mints.filter(
+    (m) => m.autofillable || (cfg.operatorArgs?.length ?? 0) > 0
+  );
+  return fillable[0] ?? null;
+}
+
+/** Read the allow list from wherever it was supplied. */
+async function loadList(cfg: GenericMintConfig): Promise<string | null> {
+  if (cfg.listJson) return cfg.listJson;
+  if (!cfg.listUri) return null;
+  try {
+    return await fetchAllowList(cfg.listUri);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * A result that mints nothing but says exactly what is missing.
+ *
+ * Deliberately shaped like a normal result rather than a null: "I found the
+ * stage and here is the one thing I need" is the most useful answer this can
+ * give, and returning null would collapse it into "nothing found".
+ */
+function explain(opts: ResolveOpts, profile: ContractProfile, notes: string[]): ResolvedMint {
+  return {
+    source: "generic",
+    contract: opts.contract,
+    startTimeMs: profile.state.startTime ? profile.state.startTime * 1000 : null,
+    quantity: opts.quantity,
+    plans: [],
+    skipped: opts.wallets.map((address) => ({
+      address,
+      reason: "the mint could not be built — see the notes above",
+    })),
+    notes,
+  };
+}
+
 /** Both transports return a whole transaction, so both become a plan the same way. */
 function asPlan(to: string, data: string, value: bigint, quantity: number): LocalMintPlan {
   return {
@@ -420,8 +742,16 @@ export async function resolveMint(opts: ResolveOpts): Promise<ResolvedMint | nul
   //
   // So when the contract has any gated stage configured, the gated routes are
   // tried first, and public is what is left when none of them fit.
+  //
+  // tryGeneric is LAST in both orders, deliberately. It handles contracts that
+  // are not SeaDrop's at all, and a SeaDrop collection must keep resolving
+  // through the SeaDrop routes exactly as it did before -- this is an extra
+  // answer for the case that used to have none, not a replacement for the ones
+  // that already worked.
   const gatedFirst = gatedPresent && opts.prefer !== "public";
-  const attempts = gatedFirst ? [tryAllowList, tryOpenSea, tryPublic] : [tryPublic, tryAllowList, tryOpenSea];
+  const attempts = gatedFirst
+    ? [tryAllowList, tryOpenSea, tryPublic, tryGeneric]
+    : [tryPublic, tryAllowList, tryOpenSea, tryGeneric];
 
   // A source answering "this stage exists and none of your wallets qualify"
   // is worth keeping -- it is the explanation if nothing else works -- but it
@@ -469,6 +799,7 @@ export function describeResolved(resolved: ResolvedMint, mask: (a: string) => st
     public: "Public stage",
     allowlist: "Allow-list stage",
     opensea: "Signed stage (via OpenSea)",
+    generic: "Project's own contract",
   };
   const lines = [label[resolved.source], ...resolved.notes, ""];
   for (const p of resolved.plans) lines.push(`  ✅ ${mask(p.address)} — ready`);

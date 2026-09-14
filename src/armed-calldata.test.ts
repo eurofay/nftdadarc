@@ -105,3 +105,63 @@ describe("describing an armed mint", () => {
     expect(describeArmed(decodeMint(signed(NFT, { price: 0n })), "ETH")).toContain("free");
   });
 });
+
+// A project's own contract is minted by calling the collection directly, so
+// "to" is the collection rather than the singleton and the calldata is a
+// function this file has no decoder for. Without expectedTo, every such mint
+// was rejected -- correct about the decoding, wrong about the conclusion.
+describe("arming a mint on a contract that is not SeaDrop's", () => {
+  const PROJECT = "0x4444444444444444444444444444444444444444";
+  // allowlistMint(uint256,bytes32[]) -- a real mint, not a shape this decodes.
+  const GENERIC = new Interface(["function allowlistMint(uint256,bytes32[])"]).encodeFunctionData(
+    "allowlistMint",
+    [2, ["0x" + "aa".repeat(32)]]
+  );
+
+  it("accepts calldata addressed where it was armed", async () => {
+    const r = await validateArmed(
+      { to: PROJECT, data: GENERIC },
+      { rpcUrl: "http://unused", expectedContract: PROJECT, expectedTo: PROJECT, nowSec: NOW }
+    );
+    expect(r.ok).toBe(true);
+    expect(r.decoded.kind).toBe("unknown");
+  });
+
+  it("refuses calldata addressed somewhere else entirely", async () => {
+    // The check that actually matters here: armed bytes must go where the
+    // operator armed them, so value cannot be sent to an address that
+    // arrived from somewhere else.
+    const r = await validateArmed(
+      { to: OTHER, data: GENERIC },
+      { rpcUrl: "http://unused", expectedContract: PROJECT, expectedTo: PROJECT, nowSec: NOW }
+    );
+    expect(r.ok).toBe(false);
+    expect(r.detail).toContain(OTHER);
+  });
+
+  it("still refuses undecodable bytes when no destination was armed", async () => {
+    // Supplying expectedTo must not weaken the SeaDrop path: without it,
+    // nothing changes.
+    const r = await validateArmed(
+      { to: SEADROP_ADDRESS, data: GENERIC },
+      { rpcUrl: "http://unused", expectedContract: PROJECT, nowSec: NOW }
+    );
+    expect(r.ok).toBe(false);
+  });
+
+  it("keeps checking SeaDrop calldata as SeaDrop, even with expectedTo set", async () => {
+    // A SeaDrop mint that decodes must go through the SeaDrop checks, not be
+    // waved through by a matching destination.
+    const r = await validateArmed(
+      { to: SEADROP_ADDRESS, data: signed(OTHER) },
+      {
+        rpcUrl: "http://unused",
+        expectedContract: NFT,
+        expectedTo: SEADROP_ADDRESS,
+        nowSec: NOW,
+      }
+    );
+    expect(r.ok).toBe(false);
+    expect(r.detail).toContain("different collection");
+  });
+});
