@@ -7,6 +7,7 @@
 
 import { waitForReceipt } from "../rpc-blast";
 import { readOnchainMarket, marketFromSales, describeMarket } from "../onchain-market";
+import { validateArmed, describeArmed } from "../armed-calldata";
 import { renderGasReport, windows } from "../gas-report";
 import { Telegraf, Markup, Context, Telegram } from "telegraf";
 import { message } from "telegraf/filters";
@@ -2933,8 +2934,41 @@ Send the new name.`,
     const info = await openseaContractInfo(settings.chainKey, ready.contract, process.env.OPENSEA_API_KEY).catch(
       () => null
     );
+    // Read what is being armed rather than storing opaque bytes and finding
+    // out at T-0. A wallet whose calldata does not check out is left out of
+    // the record instead of arming a transaction nobody has looked at.
+    const NL = String.fromCharCode(10);
+    const armRpcs = resolveRpcsForChain(settings.chainKey).urls;
+    const armChain = resolveChain(settings.chainKey);
     const perWallet: Record<string, { to: string; data: string; value: string }> = {};
-    for (const pl of ready.plans) perWallet[pl.address.toLowerCase()] = { to: pl.to, data: pl.data, value: pl.value };
+    const armRejected: string[] = [];
+    let armSummary = "";
+    for (const pl of ready.plans) {
+      const check = await validateArmed(
+        { to: pl.to, data: pl.data },
+        { rpcUrl: armRpcs[0], expectedContract: ready.contract }
+      ).catch(() => null);
+      if (check && !check.ok) {
+        armRejected.push(maskAddress(pl.address) + " - " + check.detail);
+        continue;
+      }
+      if (!armSummary && check) {
+        armSummary = describeArmed(check.decoded, armChain?.nativeSymbol ?? "ETH");
+      }
+      perWallet[pl.address.toLowerCase()] = { to: pl.to, data: pl.data, value: pl.value };
+    }
+
+    const armedAddresses = ready.plans
+      .map((pl) => pl.address)
+      .filter((a) => perWallet[a.toLowerCase()] !== undefined);
+
+    if (armedAddresses.length === 0) {
+      return ctx.editMessageText(
+        "Nothing could be armed - every wallet's calldata failed its check:" +
+          NL + NL + armRejected.join(NL),
+        fcfsMenu(ctx.store.listPendingScheduled())
+      );
+    }
 
     const record = ctx.store.addScheduled({
       chainKey: settings.chainKey,
@@ -2942,7 +2976,7 @@ Send the new name.`,
       name: info?.name,
       slug: info?.slug,
       quantity: ready.quantity,
-      wallets: ready.plans.map((pl) => pl.address),
+      wallets: armedAddresses,
       // A stage already open is armed for now: waiting for a moment that has
       // passed is a fire with extra steps.
       targetStartMs: ready.startTimeMs && ready.startTimeMs > Date.now() ? ready.startTimeMs : Date.now(),
@@ -2954,7 +2988,14 @@ Send the new name.`,
     return ctx.editMessageText(
       `Armed: ${record.name || record.nftContract}\n\n` +
         `${record.wallets.length} wallet(s), ${record.quantity} each, from the ${ready.source} stage.\n` +
-        "Pre-signed and sockets held warm through the wait. Survives a restart.",
+        (armSummary ? armSummary + NL : "") +
+        (armRejected.length > 0
+          ? NL + armRejected.length + " wallet(s) left out:" + NL + armRejected.join(NL) + NL
+          : "") +
+        "Pre-signed and sockets held warm through the wait. Survives a restart." +
+        (ready.source === "opensea"
+          ? NL + "Calldata is refreshed seconds before the stage, not during it."
+          : ""),
       fcfsMenu(ctx.store.listPendingScheduled())
     );
   });
@@ -3798,6 +3839,31 @@ Send the new name.`,
         targetStart,
         plan,
         planFor: built?.planFor,
+        // Only a record whose calldata came from an API can be refreshed --
+        // an allow-list proof is re-derived from the chain and a public mint
+        // is built from it, so neither has anything to re-ask for. This runs
+        // ~5s out, in the window that already exists for the round-trip
+        // measurement, so it costs nothing that was not already being spent.
+        refreshPlans:
+          record.prepared?.source === "opensea"
+            ? async () => {
+                const fresh = await resolveMint({
+                  rpcUrls: urls,
+                  chainKey: record.chainKey,
+                  chainId: resolveChain(record.chainKey)?.chainId ?? 1,
+                  contract: record.nftContract,
+                  wallets: record.wallets,
+                  quantity: record.quantity,
+                  slug: record.slug,
+                  apiKey: process.env.OPENSEA_API_KEY,
+                  signerFor: (address) => new Wallet(store.getDecryptedKey(address)),
+                });
+                // Null keeps what was armed. A refusal to reissue is not a
+                // reason to fire nothing.
+                if (!fresh || fresh.plans.length === 0) return null;
+                return planLookup(fresh);
+              }
+            : undefined,
         logger,
         onGas: (e) => store.recordGas(e),
       });
