@@ -11,17 +11,27 @@
 // no compatibility promise and can change without notice. This is the
 // published, supported route, and it is the one to prefer.
 //
-// WHAT IS MEASURED, because it decides which transport actually runs. With a
-// valid key -- /chains and /collections/{slug} both answer 200 on it -- every
-// /drops/* path answers:
+// ABOUT THE KEY, because the obvious reading of a 401 here is wrong.
 //
-//   401 {"errors":["Invalid API key"]}
+// Measured against the live API, with and without the key:
 //
-// A key that works everywhere else and fails only here is not malformed; the
-// Drops API is entitled separately. So this module is written as the primary
-// transport and degrades to the internal one until that entitlement exists,
-// rather than being the only path and failing shut.
+//   /chains                         200 with key, 200 WITHOUT
+//   /collections/{slug}             200 with key, 200 WITHOUT
+//   /collections?limit=1            200 with key, 200 WITHOUT
+//   /chain/{c}/account/{a}/nfts     401 with key, 401 without
+//   /drops/{slug}                   401 with key, 401 without
 //
+// Every endpoint that answers 200 answers it with no key at all -- those are
+// public and never look at one. Every endpoint that genuinely requires a key
+// rejects ours. So a 401 on /drops is not the Drops API being entitled
+// separately; the key is simply not valid, and it is not valid anywhere.
+//
+// This matters because the two diagnoses lead opposite ways: one sends you to
+// request special access that does not exist, the other to issue a new key at
+// opensea.io/account/developer. An earlier version of this comment asserted
+// the first, on the strength of 200s from endpoints that had not checked
+// anything.
+
 // Stage selection is OpenSea's, deliberately. The endpoint picks the first
 // eligible active stage for the given minter, which means allow-list and
 // signed stages resolve server-side with the proof or signature already
@@ -43,7 +53,7 @@ export const DEFAULT_USER_AGENT =
   "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
 export type DropsErrorCode =
-  | "NOT_ENTITLED"
+  | "INVALID_KEY"
   | "NOT_ELIGIBLE"
   | "STAGE_NOT_ACTIVE"
   | "DROP_NOT_STARTED"
@@ -78,12 +88,17 @@ export function classifyDropsError(status: number, body: string): DropsError {
   const t = body.toLowerCase();
 
   if (status === 401 || status === 403) {
-    // The specific shape seen in practice: a key that answers 200 on
-    // /chains and /collections and 401 on every /drops path.
+    // Named for what it is. Every OpenSea endpoint that actually checks a key
+    // rejects an invalid one the same way, so this is not specific to Drops
+    // and telling someone to request Drops access would send them nowhere.
+    const missing = t.includes("missing an api key");
     return new DropsError(
-      "OpenSea refused the key for the Drops API. It is entitled separately from the rest of v2 — " +
-        "request Drops access for this key, or the internal transport stays in use.",
-      "NOT_ENTITLED",
+      missing
+        ? "No OpenSea API key is set. The Drops API requires one — set OPENSEA_API_KEY."
+        : "OpenSea rejected the API key. It is rejected on every endpoint that checks one, not just " +
+          "Drops, so the key itself is invalid rather than lacking access. Issue a new one at " +
+          "opensea.io/account/developer.",
+      "INVALID_KEY",
       false,
       status
     );
@@ -252,15 +267,20 @@ export async function checkDropEligibility(
   }
 }
 
-/** Whether this key can use the Drops API at all. One call, cached by caller. */
-export async function hasDropsAccess(slug: string, opts: DropsOpts = {}): Promise<boolean> {
+/**
+ * Whether the configured key actually works. One call, cached by the caller.
+ *
+ * Deliberately probes an endpoint that CHECKS a key. Probing /collections
+ * would answer 200 for a key that is completely invalid, which is exactly the
+ * mistake this function exists to stop anyone repeating.
+ */
+export async function hasWorkingKey(slug: string, opts: DropsOpts = {}): Promise<boolean> {
   try {
     await request(`/drops/${encodeURIComponent(slug)}`, { method: "GET" }, opts);
     return true;
   } catch (err: any) {
-    if (err instanceof DropsError && err.code === "NOT_ENTITLED") return false;
-    // Anything else means the endpoint answered us; entitlement is not the
-    // problem even if this particular drop is.
+    if (err instanceof DropsError && err.code === "INVALID_KEY") return false;
+    // Any other answer means the key got through and the drop is the problem.
     return true;
   }
 }

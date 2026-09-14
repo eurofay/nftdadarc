@@ -4114,6 +4114,7 @@ Send the new name.`,
           quantity: 1,
           // Only ever used to sign OpenSea's SIWE login, which proves the
           // address is ours and authorises no spend.
+          apiKey: process.env.OPENSEA_API_KEY,
           signerFor: (address) => new Wallet(ctx.store.getDecryptedKey(address)),
         });
       } catch (err: any) {

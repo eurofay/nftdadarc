@@ -27,6 +27,7 @@ import { LocalMintPlan, buildLocalMintPlan, resolveFeeRecipient } from "./seadro
 import { fetchAllowListRoot, encodeMintAllowList, MintParams } from "./seadrop-allowlist";
 import { findAllowListUri, fetchAllowList, parseAllowList, deriveProof, normalizeUri } from "./allowlist-fetch";
 import { OpenSeaMintClient, OpenSeaMintError } from "./opensea-mint";
+import { buildDropMintTransaction, DropsError } from "./opensea-drops";
 import { readStages, Stage } from "./seadrop-stages";
 
 export type MintSource = "public" | "allowlist" | "opensea";
@@ -84,6 +85,8 @@ export interface ResolveOpts {
    * "public" forces the public stage even when a gated one would work.
    */
   prefer?: "auto" | "public";
+  /** For the documented Drops API. Without a working one it falls back. */
+  apiKey?: string;
 }
 
 /** First endpoint that answers, rather than the first that is listed. */
@@ -235,36 +238,73 @@ export const OPENSEA_CONCURRENCY = 4;
 /**
  * Ask OpenSea for the exact transaction each wallet should send.
  *
- * The last resort, and the only route to a signed stage: the signature is
- * issued by the project's key to a wallet OpenSea has decided is eligible,
- * and arrives already inside the calldata. Nothing here derives or forges a
- * credential -- it asks, as the owner, for something the owner is entitled to.
+ * TWO TRANSPORTS, DOCUMENTED FIRST. The published Drops API
+ * (POST /api/v2/drops/{slug}/mint) is the supported route and the one to
+ * prefer: OpenSea selects the stage, so allow-list proofs and signed
+ * authorisations both resolve server-side and arrive inside the calldata.
+ * opensea-mint.ts talks to gql.opensea.io behind a SIWE login instead --
+ * OpenSea's own web app's internal endpoints, which carry no compatibility
+ * promise and can change without notice.
  *
- * ONE SESSION PER WALLET, REUSED. Sign-in and the calldata request used to be
- * separate acts with a separate login each: the eligibility check logged in,
- * read the answer, threw the session away, and then firing logged in again.
- * That is two round trips where one does, and the second landed at the worst
- * possible moment.
+ * The documented route needs a working API key, and a key that is rejected
+ * takes every wallet with it, so the fallback stays rather than failing the
+ * whole resolve shut. Which one ran is reported, because "it worked" over the
+ * internal endpoints is a different fact from "it worked" over the documented
+ * one and only the second is something to rely on.
+ *
+ * ONE SESSION PER WALLET, REUSED, on the fallback path. Sign-in and the
+ * calldata request used to be separate acts with a separate login each: the
+ * eligibility check logged in, read the answer, threw the session away, and
+ * then firing logged in again. That is two round trips where one does, and
+ * the second landed at the worst possible moment.
+ *
+ * NO WALLET USES ANOTHER'S AUTHORISATION. The minter is named in the request
+ * and the signature is issued to it; the same wallet signs and submits.
  */
 async function tryOpenSea(opts: ResolveOpts): Promise<ResolvedMint | null> {
   if (!opts.signerFor) return null;
 
   const results: { plan?: WalletPlan; skip?: SkippedWallet }[] = new Array(opts.wallets.length);
+  const usedDocumented: boolean[] = new Array(opts.wallets.length).fill(false);
   let next = 0;
+  // Probed once. Re-learning it per wallet would be one wasted round trip per
+  // wallet for an answer that cannot differ between them.
+  let documentedWorks: boolean | null = opts.slug ? null : false;
 
   const worker = async (): Promise<void> => {
     for (;;) {
       const i = next++;
       if (i >= opts.wallets.length) return;
       const address = opts.wallets[i];
+
+      // 1. The documented route, when there is a slug and the key works.
+      if (opts.slug && documentedWorks !== false) {
+        try {
+          const tx = await buildDropMintTransaction(opts.slug, address, opts.quantity, {
+            apiKey: opts.apiKey,
+          });
+          documentedWorks = true;
+          usedDocumented[i] = true;
+          results[i] = { plan: { address, plan: asPlan(tx.to, tx.data, tx.value, opts.quantity) } };
+          continue;
+        } catch (err: any) {
+          if (err instanceof DropsError && err.code === "INVALID_KEY") {
+            // Nothing wallet-specific about a rejected key, so stop asking.
+            documentedWorks = false;
+          } else if (err instanceof DropsError && !err.retryable) {
+            // A real answer about this wallet: not eligible, sold out, ended.
+            results[i] = { skip: { address, reason: `${err.message} (${err.code})` } };
+            continue;
+          }
+        }
+      }
+
+      // 2. The internal route, one login, reused for eligibility and calldata.
       try {
         const wallet = await opts.signerFor!(address);
         const client = (opts.makeClient ?? (() => new OpenSeaMintClient()))();
         await client.login(wallet, opts.chainId);
 
-        // Eligibility first when a slug is known, on the SAME session. It
-        // costs one extra read and turns "OpenSea returned no transaction"
-        // into a reason a person can act on.
         if (opts.slug) {
           try {
             const stages = await client.eligibility(opts.slug, wallet.address);
@@ -276,8 +316,8 @@ async function tryOpenSea(opts: ResolveOpts): Promise<ResolvedMint | null> {
               continue;
             }
           } catch {
-            // An eligibility read that fails is not a refusal to mint; fall
-            // through and let the calldata request give the real answer.
+            // A failed eligibility read is not a refusal to mint; let the
+            // calldata request give the real answer.
           }
         }
 
@@ -288,27 +328,8 @@ async function tryOpenSea(opts: ResolveOpts): Promise<ResolvedMint | null> {
           tokenId: "0",
           quantity: opts.quantity,
         });
-
         results[i] = {
-          plan: {
-            address,
-            plan: {
-              to: calldata.to,
-              data: calldata.data,
-              value: calldata.value,
-              // OpenSea handed over a whole transaction, so there is no drop
-              // struct to read; the engine only needs somewhere to send bytes.
-              feeRecipient: calldata.to,
-              drop: {
-                mintPrice: opts.quantity > 0 ? calldata.value / BigInt(opts.quantity) : 0n,
-                startTime: 0,
-                endTime: 0,
-                maxTotalMintableByWallet: opts.quantity,
-                feeBps: 0,
-                restrictFeeRecipients: false,
-              },
-            },
-          },
+          plan: { address, plan: asPlan(calldata.to, calldata.data, calldata.value, opts.quantity) },
         };
       } catch (err: any) {
         const kind = err instanceof OpenSeaMintError ? err.kind : "error";
@@ -331,6 +352,21 @@ async function tryOpenSea(opts: ResolveOpts): Promise<ResolvedMint | null> {
   }
 
   if (plans.length === 0 && skipped.length === 0) return null;
+
+  const viaDocumented = usedDocumented.filter(Boolean).length;
+  const notes = [`OpenSea issued calldata for ${plans.length} of ${opts.wallets.length} wallet(s).`];
+  if (plans.length > 0) {
+    notes.push(
+      viaDocumented === plans.length
+        ? "Via the documented Drops API."
+        : viaDocumented > 0
+          ? `${viaDocumented} via the documented Drops API, the rest via the internal endpoints.`
+          : documentedWorks === false
+            ? "Via OpenSea's internal endpoints — the documented Drops API needs a working OPENSEA_API_KEY."
+            : "Via OpenSea's internal endpoints."
+    );
+  }
+
   return {
     source: "opensea",
     contract: opts.contract,
@@ -338,7 +374,27 @@ async function tryOpenSea(opts: ResolveOpts): Promise<ResolvedMint | null> {
     quantity: opts.quantity,
     plans,
     skipped,
-    notes: [`OpenSea issued calldata for ${plans.length} of ${opts.wallets.length} wallet(s).`],
+    notes,
+  };
+}
+
+/** Both transports return a whole transaction, so both become a plan the same way. */
+function asPlan(to: string, data: string, value: bigint, quantity: number): LocalMintPlan {
+  return {
+    to,
+    data,
+    value,
+    // OpenSea handed over a whole transaction, so there is no drop struct to
+    // read; the engine only needs somewhere to send bytes.
+    feeRecipient: to,
+    drop: {
+      mintPrice: quantity > 0 ? value / BigInt(quantity) : 0n,
+      startTime: 0,
+      endTime: 0,
+      maxTotalMintableByWallet: quantity,
+      feeBps: 0,
+      restrictFeeRecipients: false,
+    },
   };
 }
 

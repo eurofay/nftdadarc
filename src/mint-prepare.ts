@@ -123,7 +123,7 @@ export const newPrepared = (address: string, quantity: number): PreparedMint => 
 export function fromDropsError(err: unknown): { code: FailureCode; detail: string } {
   if (err instanceof DropsError) {
     const map: Record<string, FailureCode> = {
-      NOT_ENTITLED: "API_ERROR",
+      INVALID_KEY: "API_ERROR",
       NOT_ELIGIBLE: "NOT_ELIGIBLE",
       STAGE_NOT_ACTIVE: "STAGE_NOT_ACTIVE",
       DROP_NOT_STARTED: "DROP_NOT_STARTED",

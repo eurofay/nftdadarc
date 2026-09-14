@@ -154,13 +154,21 @@ describe("retry policy", () => {
     expect(fromDropsError(new Error("insufficient funds for gas")).code).toBe("INSUFFICIENT_BALANCE");
   });
 
-  it("reads a 401 on /drops as missing entitlement, not a bad key", () => {
-    // Measured: the same key answers 200 on /chains and /collections and 401
-    // on every /drops path. That is separate entitlement, not a bad key.
+  it("reads a 401 as an invalid key, not as Drops needing special access", () => {
+    // Measured with and without the key: every endpoint that answers 200 does
+    // so with NO key at all, and every endpoint that checks one rejects this
+    // key -- /chain/{c}/account/{a}/nfts as well as /drops. So the key is
+    // invalid everywhere, and pointing someone at "request Drops access"
+    // would send them somewhere that does not exist.
     const e = classifyDropsError(401, '{"errors":["Invalid API key"]}');
-    expect(e.code).toBe("NOT_ENTITLED");
+    expect(e.code).toBe("INVALID_KEY");
     expect(e.retryable).toBe(false);
-    expect(e.message).toContain("entitled separately");
+    expect(e.message).toContain("every endpoint that checks one");
+  });
+
+  it("distinguishes no key at all from a rejected one", () => {
+    const e = classifyDropsError(401, '{"errors":["Missing an API Key, which is required"]}');
+    expect(e.message).toContain("No OpenSea API key is set");
   });
 
   it("treats 429 and 5xx as worth another go", () => {

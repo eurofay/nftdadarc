@@ -554,6 +554,7 @@ export function startSmartAlertsBot(
         contract,
         wallets,
         quantity,
+        apiKey: process.env.OPENSEA_API_KEY,
         signerFor: (address) => new Wallet(store.getDecryptedKey(address)),
       });
       if (!resolved || resolved.plans.length === 0) {
