@@ -32,7 +32,7 @@ import { installGuards } from "./bot-guards";
 import { resolveChain } from "../chains";
 import { resolveRpcsForChain } from "../rpc-resolver";
 import { DexConfig, dexFor } from "../dex-registry";
-import { LaunchSighting, watchLaunches, tokenSideOf } from "../launch-watch";
+import { LaunchSighting, watchLaunches, findPoolForToken } from "../launch-watch";
 import {
   SafetyReport,
   checkSellable,
@@ -288,24 +288,63 @@ export function startMemecoinBot(
     const rpcUrl = resolveRpcsForChain(chainKey).urls[0];
     await ctx.reply("Checking…");
     try {
-      const info = await readTokenInfo(rpcUrl, raw);
-      // The caller pasted a token, not a pool, so the pool has to be found
-      // before a sell can be simulated against it.
-      const side = await tokenSideOf(rpcUrl, raw, dex.wrappedNative);
-      const pool = side ? raw : null;
-      const safety = pool
-        ? await checkSellable(rpcUrl, raw, pool)
-        : ({ verdict: "UNKNOWN", detail: "no pool for this token was found to test a sell against" } as SafetyReport);
-      const ownership = await readOwnership(rpcUrl, raw);
-      return ctx.reply(
-        [
-          `${info.symbol ?? "?"} — ${info.name ?? "unnamed"}`,
-          getAddress(raw),
+      // The caller pasted a TOKEN, not a pool, so the pool has to be looked
+      // up before a sell can be simulated against it. Passing the token
+      // address where a pool was expected -- which is what this did before --
+      // made every check come back unknown.
+      const [info, found, ownership] = await Promise.all([
+        readTokenInfo(rpcUrl, raw),
+        findPoolForToken(rpcUrl, dex, raw),
+        readOwnership(rpcUrl, raw),
+      ]);
+
+      const safety: SafetyReport = found
+        ? await checkSellable(rpcUrl, raw, found.pool)
+        : { verdict: "UNKNOWN", detail: "no pool was found for this token, so a sell could not be tested" };
+
+      const liquidity = found ? await readLiquidity(rpcUrl, found.pool, dex.wrappedNative) : null;
+      const NL = String.fromCharCode(10);
+
+      const lines = [
+        `${info.symbol ?? "?"} — ${info.name ?? "unnamed"}`,
+        getAddress(raw),
+        "",
+        describeSafety(safety),
+      ];
+      if (liquidity?.quoteReserve !== undefined) {
+        lines.push(
+          `💧 ${Number(formatUnits(liquidity.quoteReserve, dex.quoteDecimals)).toLocaleString(undefined, {
+            maximumFractionDigits: 0,
+          })} ${dex.quoteSymbol} in the pool`
+        );
+      }
+      if (info.totalSupply !== undefined) {
+        lines.push(
+          `🪙 supply ${Number(formatUnits(info.totalSupply, info.decimals)).toLocaleString(undefined, {
+            maximumFractionDigits: 0,
+          })}`
+        );
+      }
+      lines.push(ownership.renounced ? "🔓 ownership renounced" : "🔑 owner is still live");
+      if (found) {
+        lines.push(
           "",
-          describeSafety(safety),
-          ownership.renounced ? "🔓 ownership renounced" : "🔑 owner is still live",
-        ].join(String.fromCharCode(10))
-      );
+          `pool ${mask(found.pool)} · ${found.venue.toUpperCase()}${
+            found.feeTier ? ` · ${found.feeTier / 10_000}% tier` : ""
+          }`
+        );
+      }
+
+      return ctx.reply(lines.join(NL), {
+        ...Markup.inlineKeyboard([
+          [
+            Markup.button.url(
+              "🔎 Explorer",
+              `${resolveChain(chainKey)?.explorer}/address/${getAddress(raw)}`
+            ),
+          ],
+        ]),
+      });
     } catch (err) {
       return ctx.reply(`Could not check that: ${(err as Error)?.message ?? err}`);
     }

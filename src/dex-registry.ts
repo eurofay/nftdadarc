@@ -46,10 +46,22 @@ export const DEXES: readonly DexConfig[] = Object.freeze([
     // quotes against.
     wrappedNative: "0x3600000000000000000000000000000000000000",
     quoteSymbol: "USDC",
-    // 18, matching the native token, NOT the 6 that USDC uses as an ERC20 on
-    // every other chain. Getting this wrong misprices every position by a
-    // factor of a trillion, in the direction that looks like a win.
-    quoteDecimals: 18,
+    // 6, and this is NOT the same as the chain's native decimals.
+    //
+    // Arc splits them, which is the nastiest detail on this chain. The NATIVE
+    // gas token is USDC at 18 decimals -- chains.ts is right about that, and
+    // every wei computation and formatEther call depends on it. The WRAPPED
+    // ERC20 at this address reports decimals() == 6, the ordinary USDC
+    // convention.
+    //
+    // Measured on a live pool, which is the only reason this is right: the
+    // pool's native balance read 415,667.714023 at 18 decimals while
+    // balanceOf on the wrapped token returned 415667714023 -- the same
+    // number, six places over. Taking the native figure for both prints a
+    // pool holding 0.0000004 USDC when it holds 415,667, and the error runs
+    // in the direction that makes a real pool look empty and a dust pool look
+    // enormous.
+    quoteDecimals: 6,
     // Measured: 138 PoolCreated in 5,000 blocks (~42 minutes), every one
     // pairing a new token against wrapped USDC. That is roughly one launch
     // every eighteen seconds.

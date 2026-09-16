@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import { AbiCoder, getAddress, id, zeroPadValue } from "ethers";
 import { POOL_CREATED_TOPIC, PAIR_CREATED_TOPIC, decodeLaunch } from "./launch-watch";
 import { dexFor, hasDex, DEXES } from "./dex-registry";
+import { resolveChain } from "./chains";
 import { describeSafety, SafetyReport } from "./token-safety";
 
 const CODER = AbiCoder.defaultAbiCoder();
@@ -81,12 +82,20 @@ describe("the Arc trading venue, as measured", () => {
     expect(ARC.v3Factories.map((f) => f.toLowerCase())).not.toContain(canonical);
   });
 
-  it("quotes against wrapped USDC at 18 decimals", () => {
-    // Arc's gas token is USDC. As an ERC20 everywhere else USDC is 6
-    // decimals, and using that here misprices every position by a factor of
-    // a trillion -- in the direction that looks like a win.
-    expect(ARC.quoteDecimals).toBe(18);
+  it("quotes against wrapped USDC at 6 decimals, NOT the native 18", () => {
+    // The nastiest detail on this chain, and one I got wrong first time.
+    // Arc's NATIVE gas token is USDC at 18 decimals (chains.ts, and every
+    // formatEther in the repo depends on it). The WRAPPED ERC20 that pools
+    // quote against reports decimals() == 6.
+    //
+    // Measured on a live pool: its native balance read 415,667.714023 at 18
+    // decimals while balanceOf on the wrapped token returned 415667714023 --
+    // the same number, six places over. Using 18 for both prints a pool
+    // holding 0.0000004 USDC when it holds 415,667.
+    expect(ARC.quoteDecimals).toBe(6);
     expect(ARC.quoteSymbol).toBe("USDC");
+    // Pinned together so the two can never be quietly collapsed into one.
+    expect(resolveChain("arc")!.nativeSymbol).toBe("USDC");
   });
 
   it("only claims chains that were actually measured", () => {

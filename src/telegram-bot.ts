@@ -9,6 +9,7 @@ import { createBot } from "./telegram/bot";
 import { startAlertsBot } from "./telegram/alerts-bot";
 import { startWebServer } from "./web/server";
 import { startRadarBot } from "./telegram/radar-bot";
+import { startMemecoinBot } from "./telegram/memecoin-bot";
 import { startSmartAlertsBot } from "./telegram/smart-alerts-bot";
 import { cleanToken } from "./telegram/token";
 import { UserStores } from "./telegram/user-stores";
@@ -95,6 +96,15 @@ async function main(): Promise<void> {
     () => smart?.username
   );
 
+  // Bot 5 watches Arc for new token pools. Alert-only and owner-gated, like
+  // 2-4: it cannot spend, sign or reveal a key.
+  const memecoin = startMemecoinBot(
+    process.env.TELEGRAM_MEMECOIN_BOT_TOKEN,
+    ownerId,
+    stores,
+    () => mainUsername
+  );
+
   // One line naming every bot and whether it is up, because "which of the
   // four is not answering" should be readable from the deploy log rather than
   // deduced from silence in a chat.
@@ -105,6 +115,7 @@ async function main(): Promise<void> {
         `2 alerts: ${alerts ? "on" : "off"}`,
         `3 radar: ${radar ? "on" : "off"}`,
         `4 smart alerts: ${smart ? "on" : "off"}`,
+        `5 memecoin: ${memecoin ? "on" : "off"}`,
       ].join(" | ")
   );
 
@@ -149,12 +160,14 @@ async function main(): Promise<void> {
     alerts?.stop("SIGINT");
     radar?.stop("SIGINT");
     smart?.stop("SIGINT");
+    memecoin?.stop("SIGINT");
   });
   process.once("SIGTERM", () => {
     bot.stop("SIGTERM");
     alerts?.stop("SIGTERM");
     radar?.stop("SIGTERM");
     smart?.stop("SIGTERM");
+    memecoin?.stop("SIGTERM");
   });
 
   // launch()'s own promise only resolves after stop() is called — it never

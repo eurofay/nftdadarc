@@ -231,3 +231,69 @@ export async function tokenSideOf(
     return null;
   }
 }
+
+const FACTORY = new Interface([
+  "function getPool(address,address,uint24) view returns (address)",
+  "function getPair(address,address) view returns (address)",
+]);
+
+const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
+
+export interface FoundPool {
+  pool: string;
+  feeTier?: number;
+  venue: "v3" | "v2";
+}
+
+/**
+ * The pool a pasted TOKEN trades in.
+ *
+ * Needed because a person pastes a contract address, not a pool address, and
+ * the sell test has to have somewhere to simulate selling TO. Asks each
+ * configured factory for that token paired against the quote asset, across
+ * the fee tiers in the order most likely to hold the liquidity.
+ *
+ * Returns the first pool that EXISTS, which is not necessarily the deepest --
+ * a token can have pools at several tiers with the real money in one of them.
+ * That is enough for a sell test, which only needs a legitimate destination;
+ * depth is read separately and reported on its own.
+ */
+export async function findPoolForToken(
+  rpcUrl: string,
+  dex: DexConfig,
+  token: string
+): Promise<FoundPool | null> {
+  const provider = createProvider(rpcUrl);
+  const a = getAddress(token);
+  const b = getAddress(dex.wrappedNative);
+
+  for (const factory of dex.v3Factories) {
+    for (const fee of dex.feeTiers) {
+      try {
+        const res = await provider.call({
+          to: getAddress(factory),
+          data: FACTORY.encodeFunctionData("getPool", [a, b, fee]),
+        });
+        const pool = getAddress(String(FACTORY.decodeFunctionResult("getPool", res)[0]));
+        if (pool !== ZERO_ADDRESS) return { pool, feeTier: fee, venue: "v3" };
+      } catch {
+        // This tier does not exist on this factory, which is the normal case
+        // for most tiers on most tokens.
+      }
+    }
+  }
+
+  for (const factory of dex.v2Factories) {
+    try {
+      const res = await provider.call({
+        to: getAddress(factory),
+        data: FACTORY.encodeFunctionData("getPair", [a, b]),
+      });
+      const pool = getAddress(String(FACTORY.decodeFunctionResult("getPair", res)[0]));
+      if (pool !== ZERO_ADDRESS) return { pool, venue: "v2" };
+    } catch {
+      /* no pair here */
+    }
+  }
+  return null;
+}
