@@ -330,11 +330,21 @@ const DEFAULT_SETTINGS: BotSettings = {
   //                     the measured 33-mint model never ran.
   //
   // Zero means measure it: fee follows the chain, limit follows the quantity.
-  // The four with measured SeaDrop traffic. Avalanche is deliberately absent:
-  // SeaDrop is deployed there and nothing is using it -- 0 drops and 0 mints
-  // across a 5.9 hour sample -- so watching it is a poll loop that can never
-  // fire. Add it from the picker if that changes.
-  radarChainKeys: ["robinhood", "ethereum", "ink", "base"],
+  // The chains with measured SeaDrop traffic. Avalanche is deliberately
+  // absent: SeaDrop is deployed there and nothing is using it -- 0 drops and
+  // 0 mints across a 5.9 hour sample -- so watching it is a poll loop that
+  // can never fire. Add it from the picker if that changes.
+  //
+  // Arc leads the list because it is, by a wide margin, the busiest of them.
+  // Sampled at the head on 16 Sep 2026, its launch day: 13,763 SeaDropMint
+  // events and 81 PublicDropUpdated across 5,000 blocks -- about 42 minutes
+  // -- over 37 distinct collections. For comparison that is more mints in
+  // three-quarters of an hour than Avalanche produced in six.
+  //
+  // Only new installs pick this up: load() merges these UNDER whatever is
+  // already stored, so an existing radar selection is left exactly as its
+  // owner set it and Arc is ticked from the picker.
+  radarChainKeys: ["arc", "robinhood", "ethereum", "ink", "base"],
   maxFeeGwei: 0,
   priorityGwei: 0,
   gasLimit: 0,

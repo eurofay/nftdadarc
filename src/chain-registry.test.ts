@@ -48,10 +48,32 @@ describe("the chains that were asked for are present", () => {
   });
 
   it("prices Avalanche in AVAX, not ETH", () => {
-    // The only chain here not denominated in ETH. Getting it wrong mislabels
-    // every balance, mint price and gas figure the bot prints.
+    // Getting this wrong mislabels every balance, mint price and gas figure
+    // the bot prints.
     expect(resolveChain("avalanche")?.nativeSymbol).toBe("AVAX");
-    expect(CHAINS.filter((c) => c.nativeSymbol !== "ETH").map((c) => c.key)).toEqual(["avalanche"]);
+    expect(CHAINS.filter((c) => c.nativeSymbol !== "ETH").map((c) => c.key).sort()).toEqual([
+      "arc",
+      "avalanche",
+    ]);
+  });
+
+  it("is chain 5042 on Arc, which is what the chain itself answers", () => {
+    // Pinned because the published sources disagreed on launch day:
+    // ChainList said 1243 and Circle's own docs printed the hex as 0x13AA
+    // (5034). eth_chainId on rpc.mainnet.arc.io and arc.drpc.org both answer
+    // 0x13b2. A wrong chainId does not fail loudly -- it signs for a
+    // different network, so every transaction is simply rejected.
+    expect(resolveChain("arc")?.chainId).toBe(5042);
+    expect(resolveChain(5042)?.key).toBe("arc");
+  });
+
+  it("prices Arc in USDC, which is its actual gas token", () => {
+    // Arc's gas is USDC rather than ether, at 18 decimals -- which is the
+    // only reason the rest of the repo works here unchanged, since every wei
+    // computation and formatEther call is 18-decimal. USDC as an ERC20
+    // everywhere else is 6 decimals, and that would have mis-scaled every
+    // balance and fee by a factor of a trillion.
+    expect(resolveChain("arc")?.nativeSymbol).toBe("USDC");
   });
 });
 
@@ -81,11 +103,15 @@ describe("log windows are big enough to keep up", () => {
 
 describe("where a tip buys nothing", () => {
   it("is set only on the single-sequencer chains, measured", () => {
-    // eth_maxPriorityFeePerGas answers 0 on both: one sequencer, no mempool,
-    // ordering by arrival. Everywhere else there is a real auction and
-    // zeroing the tip would lose position.
+    // eth_maxPriorityFeePerGas answers ~0 on all three: one sequencer, no
+    // mempool, ordering by arrival. Everywhere else there is a real auction
+    // and zeroing the tip would lose position.
+    //
+    // Arc measured at 0x1 -- one wei -- against a 20 gwei base fee, so a tip
+    // sized for Ethereum would be a large surcharge buying no position at all.
     expect(CHAINS.filter((c) => c.noPriorityFee).map((c) => c.key).sort()).toEqual([
       "arbitrum",
+      "arc",
       "robinhood",
     ]);
   });

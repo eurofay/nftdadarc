@@ -195,6 +195,45 @@ export const CHAINS: ChainProfile[] = [
         "https://ink.drpc.org",
       ],
     },
+  },
+  {
+    key: "arc",
+    // Measured, not looked up. eth_chainId answers 0x13b2 on both
+    // rpc.mainnet.arc.io and arc.drpc.org. Worth saying because the published
+    // sources disagreed: ChainList listed 1243 and Circle's own docs page
+    // printed the hex as 0x13AA (which is 5034, not 5042). A wrong chainId
+    // does not fail loudly -- it produces a signature for a different network,
+    // so every transaction is simply rejected.
+    chainId: 5042,
+    name: "Arc",
+    explorer: "https://explorer.arc.io",
+    // THE UNUSUAL PART. Arc's gas token is USDC, not ether. It is 18 decimals
+    // at the protocol level, which is the only reason the rest of this repo
+    // works here unchanged: formatEther and every wei computation in gas.ts,
+    // gas-fit.ts and the ledger are all 18-decimal, so the arithmetic is
+    // right and only the label differs. A 6-decimal native token -- which is
+    // what USDC is as an ERC20 everywhere else -- would have silently
+    // mis-scaled every balance and fee by a factor of a trillion.
+    nativeSymbol: "USDC",
+    // 506 seconds across 1,000 blocks, sampled at the head on 16 Sep 2026.
+    blockSeconds: 0.506,
+    // eth_maxPriorityFeePerGas answers 0x1 -- one wei. As on Robinhood, there
+    // is no auction to bid into, so a tip is money given away. Base fee sits
+    // at 20 gwei, so a tip sized for Ethereum would be a large surcharge for
+    // no position at all.
+    noPriorityFee: true,
+    rpc: {
+      // Measured against the official endpoint: 5,000 blocks answered, 10,000
+      // returned "requested range too large". drpc refuses over 10,000 on the
+      // free plan, so 5,000 is safe on both. At ~0.5s blocks that is still
+      // ~42 minutes of chain per call.
+      //
+      // Separately, the node caps RESULTS at 2,000: a broad topic-only filter
+      // is refused after ~11 blocks however small the range. Everything here
+      // filters by address as well, which is what keeps it under the cap.
+      logChunkBlocks: 5_000,
+      public: ["https://rpc.mainnet.arc.io", "https://arc.drpc.org"],
+    },
   }
 ];
 
