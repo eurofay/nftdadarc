@@ -39,7 +39,10 @@ import {
   buildV4Swap,
   findV4Pools,
   pickTradeablePool,
+  poolIdFor,
 } from "../v4-swap";
+import { Position } from "../position";
+import { watchPosition, describePosition } from "../position-watch";
 import { UserStores } from "./user-stores";
 import { cleanToken } from "./token";
 import { installGuards } from "./bot-guards";
@@ -48,6 +51,7 @@ import { resolveRpcsForChain } from "../rpc-resolver";
 import { DexConfig, dexFor } from "../dex-registry";
 import { LaunchSighting, watchLaunches, findPoolForToken } from "../launch-watch";
 import {
+  ERC20 as ERC20_IFACE,
   SafetyReport,
   checkSellable,
   describeSafety,
@@ -195,6 +199,9 @@ export function startMemecoinBot(
     return next();
   });
 
+  // Stoppers for every open position watcher, so shutdown does not leave
+  // loops running against a dead Telegram connection.
+  const watchers: (() => void)[] = [];
   let stopWatch: (() => void) | null = null;
   let chainKey = "arc";
   let alertCount = 0;
@@ -389,14 +396,106 @@ export function startMemecoinBot(
         // can be sold again.
         amountOutMinimum: 0n,
       });
+      // Measured either side of the swap rather than parsed out of the logs:
+      // a token with a transfer tax delivers less than the swap reports, and
+      // the ladder has to be sized on what actually arrived.
+      const balanceOf = async (): Promise<bigint> => {
+        const res = await provider.call({
+          to: p.token,
+          data: ERC20_IFACE.encodeFunctionData("balanceOf", [p.wallet]),
+        });
+        return BigInt(ERC20_IFACE.decodeFunctionResult("balanceOf", res)[0]);
+      };
+      const before = await balanceOf().catch(() => 0n);
+
       const tx = await signer.sendTransaction({ to: call.to, data: call.data, value: call.value });
       const receipt = await tx.wait();
       sent.push(`swap: ${tx.hash}`);
 
+      if (receipt?.status !== 1) {
+        return ctx.reply(["⚠️ Sent, but the swap reverted.", ...sent].join(NL));
+      }
+
+      const received = (await balanceOf().catch(() => 0n)) - before;
+      if (received <= 0n) {
+        return ctx.reply(
+          ["✅ Swap landed, but no tokens arrived — not opening a position.", ...sent].join(NL)
+        );
+      }
+
+      const position: Position = {
+        token: p.token,
+        poolId: poolIdFor(p.pool.key),
+        wallet: p.wallet,
+        costQuote: p.amountIn,
+        tokensHeld: received,
+        tokensAtEntry: received,
+        openedAt: Date.now(),
+        realisedQuote: 0n,
+        firedRungs: [],
+        peakQuote: p.amountIn,
+      };
+
+      // The exit rules start running immediately. A position nobody is
+      // watching is the one that gets rugged.
+      const stop = watchPosition({
+        rpcUrl,
+        dex,
+        pool: p.pool,
+        position,
+        sell: async (pos, decision) => {
+          const quoteBefore = await provider.getBalance(pos.wallet).catch(() => 0n);
+          // Selling needs the TOKEN approved, which buying never required.
+          for (const a of await buildApprovals(rpcUrl, dex, pos.wallet, pos.token, decision.sellTokens)) {
+            const at = await signer.sendTransaction({ to: a.to, data: a.data, value: a.value });
+            await at.wait();
+          }
+          const sellCall = buildV4Swap(dex, {
+            pool: p.pool,
+            amountIn: decision.sellTokens,
+            amountOutMinimum: 0n,
+            sell: true,
+          });
+          const st = await signer.sendTransaction({
+            to: sellCall.to,
+            data: sellCall.data,
+            value: sellCall.value,
+          });
+          await st.wait();
+          const quoteAfter = await provider.getBalance(pos.wallet).catch(() => 0n);
+          // Native mirrors the quote asset on Arc, so the balance delta is
+          // what came back -- less whatever gas the sale itself burned.
+          const gained = quoteAfter > quoteBefore ? quoteAfter - quoteBefore : 0n;
+          return { receivedQuote: gained, txHash: st.hash };
+        },
+        onExit: (pos, decision, txHash) => {
+          const icon = decision.reason === "RUG" ? "🚨" : decision.reason === "LADDER" ? "🪜" : "🛑";
+          void bot.telegram.sendMessage(
+            ctx.chat!.id,
+            [
+              `${icon} ${decision.reason} — ${decision.detail}`,
+              describePosition(pos, { valueQuote: 0n, sellable: true }, dex),
+              txHash ? `${resolveChain(chainKey)?.explorer}/tx/${txHash}` : "",
+            ]
+              .filter(Boolean)
+              .join(NL)
+          );
+        },
+        onError: () => {
+          // One bad tick costs a tick. Reporting every RPC hiccup would bury
+          // the exits this exists to deliver.
+        },
+      });
+      watchers.push(stop);
+
       return ctx.reply(
         [
-          receipt?.status === 1 ? "✅ Bought." : "⚠️ Sent, but the swap reverted.",
+          "✅ Bought, and now watching it.",
           ...sent,
+          "",
+          "Exit rules running: sell half at 2x, then 25% at 5x, 15% at 10x, 10% at 25x.",
+          "Trailing stop 35% off the peak once it is up 50%.",
+          "Rug tripwire: leaves immediately if liquidity is pulled or sells stop working.",
           `${resolveChain(chainKey)?.explorer}/tx/${tx.hash}`,
         ].join(NL)
       );
@@ -525,6 +624,7 @@ export function startMemecoinBot(
     telegram: bot.telegram,
     stop: (reason) => {
       stopWatch?.();
+      for (const stop of watchers) stop();
       bot.stop(reason);
     },
   };

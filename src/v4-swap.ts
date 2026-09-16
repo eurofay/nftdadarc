@@ -248,6 +248,99 @@ export async function pickTradeablePool(
   return null;
 }
 
+const POOL_KEY_TUPLE = [POOL_KEY];
+
+/**
+ * How the PoolManager names a pool: keccak256 of the encoded key.
+ *
+ * Verified against a live pool -- the id computed here equals the one the
+ * chain emitted in that pool's own Swap event.
+ */
+export function poolIdFor(key: PoolKey): string {
+  return keccak256(
+    CODER.encode(POOL_KEY_TUPLE, [[key.currency0, key.currency1, key.fee, key.tickSpacing, key.hooks]])
+  );
+}
+
+const STATE = new Interface(["function extsload(bytes32) view returns (bytes32)"]);
+
+/**
+ * V4 keeps every pool in one mapping, at storage slot 6.
+ *
+ * Confirmed by reading: slot 6 returns a sane sqrtPriceX96 and tick for a live
+ * pool, while 5 and 7 return zero. There is no getter for this -- the
+ * PoolManager exposes raw storage through extsload and expects callers to know
+ * the layout.
+ */
+export const POOLS_SLOT = 6;
+
+export interface PoolState {
+  sqrtPriceX96: bigint;
+  tick: number;
+  /** Zero when the pool was initialized but never funded. */
+  liquidity: bigint;
+}
+
+/** Current price and depth, or null when it cannot be read. */
+export async function readPoolState(
+  rpcUrl: string,
+  dex: DexConfig,
+  poolId: string
+): Promise<PoolState | null> {
+  if (!dex.v4PoolManager) return null;
+  try {
+    const provider = createProvider(rpcUrl);
+    const base = keccak256(CODER.encode(["bytes32", "uint256"], [poolId, POOLS_SLOT]));
+    const read = async (slot: string): Promise<bigint> => {
+      const res = await provider.call({
+        to: getAddress(dex.v4PoolManager!),
+        data: STATE.encodeFunctionData("extsload", [slot]),
+      });
+      return BigInt(STATE.decodeFunctionResult("extsload", res)[0]);
+    };
+
+    const slot0 = await read(base);
+    // slot0 packs sqrtPriceX96 | tick | protocolFee | lpFee. Liquidity sits
+    // three words further on, after the two fee-growth accumulators.
+    const liquiditySlot = "0x" + (BigInt(base) + 3n).toString(16).padStart(64, "0");
+    const liquidity = await read(liquiditySlot).catch(() => 0n);
+
+    const sqrtPriceX96 = slot0 & ((1n << 160n) - 1n);
+    if (sqrtPriceX96 === 0n) return null;
+    // tick is a signed 24-bit field.
+    const raw = Number((slot0 >> 160n) & 0xffffffn);
+    return {
+      sqrtPriceX96,
+      tick: raw >= 0x800000 ? raw - 0x1000000 : raw,
+      liquidity: liquidity & ((1n << 128n) - 1n),
+    };
+  } catch {
+    return null;
+  }
+}
+
+const Q192 = 1n << 192n;
+
+/**
+ * What an amount of the token is worth in the quote asset, at pool price.
+ *
+ * sqrtPriceX96 encodes currency1 per currency0, so which way to divide depends
+ * on which side the token sits -- and getting that backwards produces a number
+ * that is wrong by the square of the price, which on a new token is wrong by
+ * orders of magnitude in the direction that looks like a win.
+ *
+ * This is a MID price: it ignores fees and its own impact, so it is right for
+ * deciding whether a ladder rung has been reached and wrong for promising what
+ * a sale will return. The sale itself is what establishes that.
+ */
+export function quoteValueOf(pool: V4Pool, sqrtPriceX96: bigint, tokenAmount: bigint): bigint {
+  if (sqrtPriceX96 === 0n || tokenAmount === 0n) return 0n;
+  const p = sqrtPriceX96 * sqrtPriceX96;
+  // buyIsZeroForOne means the quote asset is currency0, so the token is
+  // currency1 and one token is worth 1/price of the quote.
+  return pool.buyIsZeroForOne ? (tokenAmount * Q192) / p : (tokenAmount * p) / Q192;
+}
+
 export interface BuildSwapOpts {
   pool: V4Pool;
   /** Quote-asset amount to spend, in the quote token's own decimals. */
