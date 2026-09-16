@@ -40,8 +40,10 @@ import {
   findV4Pools,
   pickTradeablePool,
   poolIdFor,
+  readPoolState,
+  quoteValueOf,
 } from "../v4-swap";
-import { Position } from "../position";
+import { Position, minOutForExit } from "../position";
 import { watchPosition, describePosition } from "../position-watch";
 import { UserStores } from "./user-stores";
 import { cleanToken } from "./token";
@@ -314,6 +316,140 @@ export function startMemecoinBot(
   let pending: { token: string; pool: V4Pool; amountIn: bigint; wallet: string } | null = null;
   let awaitingAmount: string | null = null;
 
+  /**
+   * Run the exit rules on one position until it closes.
+   *
+   * Shared by the buy path and the resume-on-boot path, so a position picked
+   * up after a redeploy is watched by exactly the same code that watched it
+   * before -- rather than by a second implementation that drifts.
+   */
+  const beginWatching = (position: Position, pool: V4Pool, storedId: string, chatId: number): void => {
+    const dex = dexFor(chainKey);
+    if (!dex) return;
+    const rpcUrl = resolveRpcsForChain(chainKey).urls[0];
+    const provider = createProvider(rpcUrl);
+    const store = stores.for(ownerId);
+
+    const stop = watchPosition({
+      rpcUrl,
+      dex,
+      pool,
+      position,
+      sell: async (pos, decision) => {
+        const signer = new Wallet(store.getDecryptedKey(pos.wallet), provider);
+        const quoteBefore = await provider.getBalance(pos.wallet).catch(() => 0n);
+
+        // Selling needs the TOKEN approved, which buying never required.
+        for (const a of await buildApprovals(rpcUrl, dex, pos.wallet, pos.token, decision.sellTokens)) {
+          const at = await signer.sendTransaction({ to: a.to, data: a.data, value: a.value });
+          await at.wait();
+        }
+
+        // A floor on a rung or a stop, and none on a rug -- see
+        // minOutForExit. The expected figure is a mid price, so the slippage
+        // has to cover the fee and the sale's own impact as well.
+        const state = await readPoolState(rpcUrl, dex, poolIdFor(pool.key)).catch(() => null);
+        const expected = state ? quoteValueOf(pool, state.sqrtPriceX96, decision.sellTokens) : 0n;
+
+        const sellCall = buildV4Swap(dex, {
+          pool,
+          amountIn: decision.sellTokens,
+          amountOutMinimum: minOutForExit(decision, expected),
+          sell: true,
+        });
+        const st = await signer.sendTransaction({
+          to: sellCall.to,
+          data: sellCall.data,
+          value: sellCall.value,
+        });
+        await st.wait();
+
+        const quoteAfter = await provider.getBalance(pos.wallet).catch(() => 0n);
+        // Native mirrors the quote asset on Arc, so the balance delta is what
+        // came back -- less whatever gas the sale itself burned.
+        const gained = quoteAfter > quoteBefore ? quoteAfter - quoteBefore : 0n;
+        return { receivedQuote: gained, txHash: st.hash };
+      },
+      onUpdate: (pos) => {
+        // The peak moves without any sale happening, and it is what the
+        // trailing stop measures from -- losing it to a redeploy would
+        // re-arm the stop from scratch.
+        store.updatePosition(storedId, { peakQuote: pos.peakQuote.toString() });
+      },
+      onExit: (pos, decision, txHash) => {
+        // Saved on every partial exit. Without this a restart mid-ladder
+        // would fire the 2x rung again on the next tick.
+        store.updatePosition(storedId, {
+          tokensHeld: pos.tokensHeld.toString(),
+          realisedQuote: pos.realisedQuote.toString(),
+          firedRungs: pos.firedRungs,
+        });
+        if (pos.tokensHeld === 0n) store.closePosition(storedId, decision.reason);
+
+        const icon = decision.reason === "RUG" ? "🚨" : decision.reason === "LADDER" ? "🪜" : "🛑";
+        void bot.telegram.sendMessage(
+          chatId,
+          [
+            `${icon} ${decision.reason} — ${decision.detail}`,
+            describePosition(pos, { valueQuote: 0n, sellable: true }, dex),
+            txHash ? `${resolveChain(chainKey)?.explorer}/tx/${txHash}` : "",
+          ]
+            .filter(Boolean)
+            .join(String.fromCharCode(10))
+        );
+      },
+      onError: () => {
+        // One bad tick costs a tick. Reporting every RPC hiccup would bury
+        // the exits this exists to deliver.
+      },
+    });
+    watchers.push(stop);
+  };
+
+  /**
+   * Pick up every position that was open when the process stopped.
+   *
+   * A hosted bot redeploys routinely, and a position whose watcher died looks
+   * exactly like one that is fine -- right up until it is rugged with nobody
+   * watching. The pool key is stored whole because a V4 pool has no address:
+   * without all five fields there is no way to name the pool again, and
+   * therefore no way to sell.
+   */
+  const resumePositions = (): number => {
+    const open = stores.for(ownerId).listOpenPositions();
+    for (const s of open) {
+      if (s.chainKey !== chainKey) continue;
+      try {
+        beginWatching(
+          {
+            token: s.token,
+            poolId: "",
+            wallet: s.wallet,
+            costQuote: BigInt(s.costQuote),
+            tokensHeld: BigInt(s.tokensHeld),
+            tokensAtEntry: BigInt(s.tokensAtEntry),
+            openedAt: s.openedAt,
+            realisedQuote: BigInt(s.realisedQuote),
+            firedRungs: s.firedRungs,
+            peakQuote: BigInt(s.peakQuote),
+          },
+          {
+            key: s.poolKey,
+            poolId: "",
+            token: s.token,
+            buyIsZeroForOne: s.buyIsZeroForOne,
+            block: 0,
+          },
+          s.id,
+          s.chatId ?? ownerId
+        );
+      } catch {
+        // One unreadable record must not stop the others being resumed.
+      }
+    }
+    return open.length;
+  };
+
   const buyFlow = async (token: string, amountIn: bigint): Promise<string> => {
     const dex = dexFor(chainKey);
     if (!dex) return `No trading venue configured for ${chainKey}.`;
@@ -436,57 +572,30 @@ export function startMemecoinBot(
         peakQuote: p.amountIn,
       };
 
+      // Written down BEFORE the watcher starts. A redeploy between the buy
+      // landing and the record being saved would leave tokens in a wallet
+      // with nothing watching them, which is the one state this must not
+      // produce.
+      const stored = stores.for(ownerId).addPosition({
+        id: `${Date.now().toString(36)}-${p.token.slice(2, 8)}`,
+        chainKey,
+        token: p.token,
+        wallet: p.wallet,
+        poolKey: { ...p.pool.key },
+        buyIsZeroForOne: p.pool.buyIsZeroForOne,
+        costQuote: p.amountIn.toString(),
+        tokensHeld: received.toString(),
+        tokensAtEntry: received.toString(),
+        realisedQuote: "0",
+        peakQuote: p.amountIn.toString(),
+        firedRungs: [],
+        openedAt: Date.now(),
+        chatId: ctx.chat!.id,
+      });
+
       // The exit rules start running immediately. A position nobody is
       // watching is the one that gets rugged.
-      const stop = watchPosition({
-        rpcUrl,
-        dex,
-        pool: p.pool,
-        position,
-        sell: async (pos, decision) => {
-          const quoteBefore = await provider.getBalance(pos.wallet).catch(() => 0n);
-          // Selling needs the TOKEN approved, which buying never required.
-          for (const a of await buildApprovals(rpcUrl, dex, pos.wallet, pos.token, decision.sellTokens)) {
-            const at = await signer.sendTransaction({ to: a.to, data: a.data, value: a.value });
-            await at.wait();
-          }
-          const sellCall = buildV4Swap(dex, {
-            pool: p.pool,
-            amountIn: decision.sellTokens,
-            amountOutMinimum: 0n,
-            sell: true,
-          });
-          const st = await signer.sendTransaction({
-            to: sellCall.to,
-            data: sellCall.data,
-            value: sellCall.value,
-          });
-          await st.wait();
-          const quoteAfter = await provider.getBalance(pos.wallet).catch(() => 0n);
-          // Native mirrors the quote asset on Arc, so the balance delta is
-          // what came back -- less whatever gas the sale itself burned.
-          const gained = quoteAfter > quoteBefore ? quoteAfter - quoteBefore : 0n;
-          return { receivedQuote: gained, txHash: st.hash };
-        },
-        onExit: (pos, decision, txHash) => {
-          const icon = decision.reason === "RUG" ? "🚨" : decision.reason === "LADDER" ? "🪜" : "🛑";
-          void bot.telegram.sendMessage(
-            ctx.chat!.id,
-            [
-              `${icon} ${decision.reason} — ${decision.detail}`,
-              describePosition(pos, { valueQuote: 0n, sellable: true }, dex),
-              txHash ? `${resolveChain(chainKey)?.explorer}/tx/${txHash}` : "",
-            ]
-              .filter(Boolean)
-              .join(NL)
-          );
-        },
-        onError: () => {
-          // One bad tick costs a tick. Reporting every RPC hiccup would bury
-          // the exits this exists to deliver.
-        },
-      });
-      watchers.push(stop);
+      beginWatching(position, p.pool, stored.id, ctx.chat!.id);
 
       return ctx.reply(
         [
@@ -610,6 +719,12 @@ export function startMemecoinBot(
       return ctx.reply(`Could not check that: ${(err as Error)?.message ?? err}`);
     }
   });
+
+  // Resumed before launch rather than after: a position that was open when
+  // the process stopped should be watched again as soon as possible, not
+  // whenever Telegram gets round to answering getMe.
+  const resumed = resumePositions();
+  if (resumed > 0) console.log(`Memecoin (bot 5): resumed ${resumed} open position(s).`);
 
   void bot.launch(() => {
     bot.telegram

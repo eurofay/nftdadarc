@@ -237,6 +237,42 @@ export function evaluatePosition(p: Position, m: MarketState): ExitDecision {
   return { reason: "HOLD", sellTokens: 0n, detail: "holding" };
 }
 
+/**
+ * Slippage allowed on a planned sale.
+ *
+ * Wide, deliberately. The expected figure it is applied to is a MID price read
+ * from the pool: it ignores the fee and it ignores the sale's own impact, and
+ * on a thin new pool the impact of selling half a position is the larger of
+ * the two. A tight floor here does not protect against a bad fill, it just
+ * reverts the sale and leaves the position open -- which on the way down is
+ * the worst of both.
+ */
+export const DEFAULT_SELL_SLIPPAGE_BPS = 1_500;
+
+/**
+ * The floor to put under a sale, or zero to accept any price.
+ *
+ * The distinction this exists to make: a RUG exit must not have a floor. The
+ * whole point of that path is to leave while leaving is still possible, and a
+ * minimum-out turns it into a transaction that reverts precisely when the
+ * price is collapsing -- which is the one moment the position must actually
+ * move. A ladder sell is the opposite case: it is discretionary, there is no
+ * emergency, and accepting any price at all means a sandwich or a dying pool
+ * can take the lot.
+ *
+ * So: floors on the rungs and the stop, no floor on the rug.
+ */
+export function minOutForExit(
+  decision: ExitDecision,
+  expectedQuote: bigint,
+  slippageBps: number = DEFAULT_SELL_SLIPPAGE_BPS
+): bigint {
+  if (decision.reason === "RUG") return 0n;
+  if (expectedQuote <= 0n) return 0n;
+  const bps = BigInt(Math.max(0, Math.min(10_000, Math.floor(slippageBps))));
+  return (expectedQuote * (10_000n - bps)) / 10_000n;
+}
+
 /** Apply a decision to a position, returning the updated one. */
 export function applyExit(p: Position, d: ExitDecision, receivedQuote: bigint): Position {
   const sold = d.sellTokens > p.tokensHeld ? p.tokensHeld : d.sellTokens;

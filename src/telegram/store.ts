@@ -272,9 +272,49 @@ export interface SeedRecord {
   createdAt: number;
 }
 
+/**
+ * An open memecoin position, as it survives a restart.
+ *
+ * Every amount is a DECIMAL STRING, not a bigint: bigints do not survive the
+ * store's plain-JSON round trip, and a position that came back as `null`
+ * after a redeploy would be a position nobody is watching -- which is exactly
+ * the one that gets rugged. The pool key is stored whole because a V4 pool is
+ * not an address: without all five fields there is no way to name the pool
+ * again, and therefore no way to sell.
+ */
+export interface StoredPosition {
+  id: string;
+  chainKey: string;
+  token: string;
+  wallet: string;
+  poolKey: {
+    currency0: string;
+    currency1: string;
+    fee: number;
+    tickSpacing: number;
+    hooks: string;
+  };
+  buyIsZeroForOne: boolean;
+  /** Decimal strings — see the note above. */
+  costQuote: string;
+  tokensHeld: string;
+  tokensAtEntry: string;
+  realisedQuote: string;
+  peakQuote: string;
+  firedRungs: number[];
+  openedAt: number;
+  /** Set when the position is finished, so history is kept rather than erased. */
+  closedAt?: number;
+  /** Which rule closed it. */
+  closedBy?: string;
+  /** Chat to report exits into after a restart. */
+  chatId?: number;
+}
+
 interface StoreData {
   seeds: SeedRecord[];
   scheduled: ScheduledMint[];
+  positions: StoredPosition[];
   wallets: WalletRecord[];
   copyTargets: CopyTarget[];
   mints: MintRecord[];
@@ -378,10 +418,13 @@ export class TelegramStore {
 
   private load(): StoreData {
     if (!fs.existsSync(this.filePath)) {
-      return { seeds: [], scheduled: [], wallets: [], copyTargets: [], mints: [], copyHistory: [], gasHistory: [], smartWallets: [], walletBatches: [], settings: { ...DEFAULT_SETTINGS } };
+      return { seeds: [], scheduled: [], positions: [], wallets: [], copyTargets: [], mints: [], copyHistory: [], gasHistory: [], smartWallets: [], walletBatches: [], settings: { ...DEFAULT_SETTINGS } };
     }
     const raw = JSON.parse(fs.readFileSync(this.filePath, "utf8"));
     return {
+      // Absent on any store written before positions existed, which is every
+      // store that already exists.
+      positions: raw.positions ?? [],
       wallets: raw.wallets ?? [],
       copyTargets: raw.copyTargets ?? [],
       mints: raw.mints ?? [],
@@ -474,6 +517,51 @@ export class TelegramStore {
     const removed = this.data.wallets.length !== before;
     if (removed) this.save();
     return removed;
+  }
+
+  // ── Memecoin positions ────────────────────────────────────────────────
+  //
+  // Persisted for the same reason scheduled mints are: the thing being waited
+  // on outlives the process. A redeploy is routine on a hosted bot, and a
+  // position whose watcher died looks exactly like a position that is fine --
+  // right up until it is rugged with nobody watching.
+
+  addPosition(p: StoredPosition): StoredPosition {
+    this.data.positions.push(p);
+    this.save();
+    return p;
+  }
+
+  /** Open positions only. Closed ones are kept as history, not resumed. */
+  listOpenPositions(): StoredPosition[] {
+    return this.data.positions.filter((p) => p.closedAt === undefined);
+  }
+
+  listPositions(): StoredPosition[] {
+    return [...this.data.positions];
+  }
+
+  /**
+   * Write back what changed after a sale.
+   *
+   * Called on every partial exit, so a restart mid-ladder resumes with the
+   * rungs that already fired recorded -- otherwise the position would sell
+   * its 2x rung again on the next tick after a redeploy.
+   */
+  updatePosition(id: string, patch: Partial<StoredPosition>): StoredPosition | null {
+    const found = this.data.positions.find((p) => p.id === id);
+    if (!found) return null;
+    Object.assign(found, patch);
+    this.save();
+    return found;
+  }
+
+  closePosition(id: string, closedBy: string): void {
+    const found = this.data.positions.find((p) => p.id === id);
+    if (!found) return;
+    found.closedAt = Date.now();
+    found.closedBy = closedBy;
+    this.save();
   }
 
   listWallets(): WalletRecord[] {
@@ -618,6 +706,10 @@ export class TelegramStore {
     this.data = {
       seeds: parsed.seeds ?? [],
       scheduled: parsed.scheduled ?? [],
+      // A snapshot from before positions existed carries none, and an import
+      // must not resurrect the importing store's open positions against a
+      // wallet set that just changed underneath them.
+      positions: parsed.positions ?? [],
       wallets: parsed.wallets,
       copyTargets: parsed.copyTargets ?? [],
       mints: parsed.mints ?? [],
