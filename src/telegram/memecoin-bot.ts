@@ -11,12 +11,18 @@
 // already mined and already public. Being fast to a public event is
 // competing, and nobody is on the other side of it being made worse off.
 //
-// ALERT-ONLY, DELIBERATELY. It cannot spend, sign, or reveal a key -- the
-// same boundary as bots 2, 3 and 4. Buying is a deep link back to bot 1,
-// behind that bot's access control, because two front doors onto a key store
-// is two to guard. That is also the right order of operations for the
-// operator: run it in alert-only mode first and find out whether Arc's flow
-// is worth trading at all before any money is at risk.
+// THIS BOT CAN SPEND, unlike bots 2, 3 and 4. That is a real widening of the
+// boundary and it is fenced accordingly: gated to the owner, never reveals a
+// key, and a buy takes three separate deliberate acts -- press Buy, type an
+// amount, press Confirm on a quote naming the exact figure. Nothing buys on a
+// timer, on an alert, or on a single button press, which is the same rule the
+// paid-mint path in bot 1 follows.
+//
+// Every buy is SIMULATED before it is offered, so a token that cannot be
+// bought is refused at the quote stage -- before a single approval has been
+// paid for. Watching works with no wallet loaded at all, and that is the right
+// way to start: find out whether Arc flow is worth trading before any money is
+// at risk.
 //
 // EVERY ALERT CARRIES A SELL TEST. A launch alert without one is an
 // invitation into a honeypot, and the check costs a few eth_calls against
@@ -25,7 +31,15 @@
 // value.
 
 import { Telegraf, Telegram, Markup } from "telegraf";
-import { formatUnits, getAddress } from "ethers";
+import { Wallet, formatUnits, getAddress, parseUnits } from "ethers";
+import { createProvider } from "../rpc-provider";
+import {
+  V4Pool,
+  buildApprovals,
+  buildV4Swap,
+  findV4Pools,
+  pickTradeablePool,
+} from "../v4-swap";
 import { UserStores } from "./user-stores";
 import { cleanToken } from "./token";
 import { installGuards } from "./bot-guards";
@@ -279,8 +293,155 @@ export function startMemecoinBot(
     return ctx.reply("Send a token address and I will run the sell test on it.");
   });
 
+  // ── Buying ──────────────────────────────────────────────────────────────
+  //
+  // The one thing in this bot that spends money, and it is built so that it
+  // cannot happen by accident. A buy needs three separate deliberate acts:
+  // press Buy, type an amount, then press Confirm on a quote that names the
+  // exact figure. Nothing here fires on a timer, on an alert, or on a button
+  // press alone -- the same rule as the paid-mint boundary in bot 1.
+  //
+  // Every buy is simulated before it is offered. A token that cannot be
+  // bought is refused at the quote stage, before a single approval has been
+  // paid for.
+  let pending: { token: string; pool: V4Pool; amountIn: bigint; wallet: string } | null = null;
+  let awaitingAmount: string | null = null;
+
+  const buyFlow = async (token: string, amountIn: bigint): Promise<string> => {
+    const dex = dexFor(chainKey);
+    if (!dex) return `No trading venue configured for ${chainKey}.`;
+    const wallets = stores.for(ownerId).listWallets();
+    if (wallets.length === 0) return "No wallets are loaded, so there is nothing to buy with.";
+
+    const rpcUrl = resolveRpcsForChain(chainKey).urls[0];
+    const buyer = wallets[0].address;
+
+    const pools = await findV4Pools(rpcUrl, dex, token);
+    if (pools.length === 0) return "No V4 pool exists for that token, so there is nothing to buy from.";
+
+    // Picked by simulating, not by choosing the newest or the friendliest
+    // fee: a pool that was initialised and never funded looks identical to a
+    // real one from its event, and only trying tells them apart.
+    const pool = await pickTradeablePool(rpcUrl, dex, buyer, pools, amountIn);
+    if (!pool) {
+      return (
+        `Found ${pools.length} pool(s) for that token and a buy of this size simulates as a ` +
+        "revert in every one. Nothing was sent and nothing was approved."
+      );
+    }
+
+    pending = { token, pool, amountIn, wallet: buyer };
+    const NL = String.fromCharCode(10);
+    const approvals = await buildApprovals(rpcUrl, dex, buyer, dex.wrappedNative, amountIn);
+    return (
+      [
+        `Buy ${formatUnits(amountIn, dex.quoteDecimals)} ${dex.quoteSymbol} of ${token}`,
+        `Wallet: ${mask(buyer)}`,
+        `Pool: fee ${pool.key.fee} · tickSpacing ${pool.key.tickSpacing}`,
+        approvals.length > 0
+          ? `${approvals.length} one-time approval(s) will be sent first.`
+          : "Approvals already in place.",
+        "",
+        "This simulates clean. Press Confirm to send it for real.",
+      ].join(NL)
+    );
+  };
+
+  bot.action(/^meme:buy:(0x[0-9a-fA-F]{40})$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    awaitingAmount = (ctx.match as RegExpMatchArray)[1];
+    const dex = dexFor(chainKey);
+    return ctx.reply(
+      `How much ${dex?.quoteSymbol ?? "USDC"} do you want to spend? Send a number, or /cancel.`
+    );
+  });
+
+  bot.action("meme:confirm", async (ctx) => {
+    await ctx.answerCbQuery();
+    const p = pending;
+    pending = null;
+    if (!p) return ctx.reply("Nothing is pending. Start again from the token.");
+
+    const dex = dexFor(chainKey);
+    if (!dex) return ctx.reply("No trading venue configured.");
+    const rpcUrl = resolveRpcsForChain(chainKey).urls[0];
+
+    try {
+      const provider = createProvider(rpcUrl);
+      const signer = new Wallet(stores.for(ownerId).getDecryptedKey(p.wallet), provider);
+      const NL = String.fromCharCode(10);
+      const sent: string[] = [];
+
+      // Approvals first, and only the ones actually missing. They are
+      // one-time per wallet, so most buys send none.
+      for (const a of await buildApprovals(rpcUrl, dex, p.wallet, dex.wrappedNative, p.amountIn)) {
+        const tx = await signer.sendTransaction({ to: a.to, data: a.data, value: a.value });
+        await tx.wait();
+        sent.push(`${a.reason}: ${tx.hash}`);
+      }
+
+      const call = buildV4Swap(dex, {
+        pool: p.pool,
+        amountIn: p.amountIn,
+        // Zero floor only because this is a fresh launch with no reliable
+        // quote to size one from. The simulation above is what establishes
+        // the buy works at all; the honeypot check is what establishes it
+        // can be sold again.
+        amountOutMinimum: 0n,
+      });
+      const tx = await signer.sendTransaction({ to: call.to, data: call.data, value: call.value });
+      const receipt = await tx.wait();
+      sent.push(`swap: ${tx.hash}`);
+
+      return ctx.reply(
+        [
+          receipt?.status === 1 ? "✅ Bought." : "⚠️ Sent, but the swap reverted.",
+          ...sent,
+          `${resolveChain(chainKey)?.explorer}/tx/${tx.hash}`,
+        ].join(NL)
+      );
+    } catch (err) {
+      return ctx.reply(`Buy failed: ${(err as Error)?.message ?? err}`);
+    }
+  });
+
+  bot.action("meme:cancelbtn", async (ctx) => {
+    await ctx.answerCbQuery();
+    pending = null;
+    awaitingAmount = null;
+    return ctx.reply("Cancelled. Nothing was sent.", menu());
+  });
+
+  bot.command("cancel", async (ctx) => {
+    pending = null;
+    awaitingAmount = null;
+    return ctx.reply("Cancelled. Nothing was sent.", menu());
+  });
+
   bot.on("text", async (ctx) => {
     const raw = ctx.message.text.trim();
+
+    // An amount, answering a Buy prompt. Checked before the address branch so
+    // a number is never mistaken for anything else.
+    if (awaitingAmount && /^[0-9]*.?[0-9]+$/.test(raw)) {
+      const token = awaitingAmount;
+      awaitingAmount = null;
+      const dex = dexFor(chainKey);
+      if (!dex) return ctx.reply("No trading venue configured.");
+      let amountIn: bigint;
+      try {
+        amountIn = parseUnits(raw, dex.quoteDecimals);
+      } catch {
+        return ctx.reply("That is not an amount I can read.");
+      }
+      if (amountIn <= 0n) return ctx.reply("Amount must be above zero.");
+      await ctx.reply("Quoting and simulating...");
+      const text = await buyFlow(token, amountIn);
+      return pending
+        ? ctx.reply(text, Markup.inlineKeyboard([[Markup.button.callback("✅ Confirm buy", "meme:confirm"), Markup.button.callback("✖️ Cancel", "meme:cancelbtn")]]))
+        : ctx.reply(text, menu());
+    }
+
     if (!/^0x[0-9a-fA-F]{40}$/.test(raw)) return;
     const dex = dexFor(chainKey);
     if (!dex) return ctx.reply(`No trading venue configured for ${chainKey}.`);
@@ -342,6 +503,7 @@ export function startMemecoinBot(
               "🔎 Explorer",
               `${resolveChain(chainKey)?.explorer}/address/${getAddress(raw)}`
             ),
+            Markup.button.callback("💰 Buy", `meme:buy:${getAddress(raw)}`),
           ],
         ]),
       });

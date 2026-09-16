@@ -34,6 +34,26 @@ export interface DexConfig {
   v2Factories: string[];
   /** Universal Router, used for execution. */
   universalRouter?: string;
+  /**
+   * Uniswap V4 PoolManager -- the singleton every V4 pool lives inside.
+   *
+   * This is where the real launches are. The V3 factory saw 138 new pools in
+   * a 42-minute window; the PoolManager saw 1,825 Initialize events in the
+   * same one. V4 pools are not contracts, so they are found by event rather
+   * than by address, and their terms come from Initialize.
+   */
+  v4PoolManager?: string;
+  /** Canonical Permit2. The Universal Router pulls the input token through it. */
+  permit2?: string;
+  /**
+   * ERC20 allowance mapping slot on the wrapped native token.
+   *
+   * Needed only to SIMULATE a buy before sending one, since a simulation has
+   * to fabricate the approval the wallet has not given yet. Found by probing
+   * (see token-safety.findBalanceSlot for the same technique): slot 10 on
+   * Arc's wrapped USDC.
+   */
+  wrappedAllowanceSlot?: number;
   /** Fee tiers worth checking when pricing a token, most liquid first. */
   feeTiers: number[];
 }
@@ -75,6 +95,12 @@ export const DEXES: readonly DexConfig[] = Object.freeze([
     // (command 0x10) as well as V3, so it is the one contract that can reach
     // both venues.
     universalRouter: "0x4fca4a51ab4f23a7447b3284fbd7d73289a89fb1",
+    // Read off a successful swap's own receipt: the contract that emitted the
+    // V4 Swap event. 1,825 Initialize events in a 42-minute window, against
+    // 138 on the V3 factory -- this is where Arc's launches actually are.
+    v4PoolManager: "0x8366a39cc670b4001a1121b8f6a443a643e40951",
+    permit2: "0x000000000022D473030F116dDEE9F6B43aC78BA3",
+    wrappedAllowanceSlot: 10,
     feeTiers: [10_000, 3_000, 500, 100],
   },
 ]);
